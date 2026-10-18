@@ -1,0 +1,56 @@
+@import "tailwindcss";
+@keyframes spotli-playback-feedback {
+  0% {
+    opacity: 0;
+    transform: scale(0.7);
+  }
+
+  25% {
+    opacity: 1;
+    transform: scale(1);
+  }
+
+  100% {
+    opacity: 0;
+    transform: scale(1.15);
+  }
+}
+
+.spotli-playback-feedback {
+  animation: spotli-playback-feedback 650ms ease-out forwards;
+}
+
+/* Spotli double-tap love animation */
+@keyframes spotli-love-pop {
+  0% {
+    opacity: 0;
+    transform: scale(0.25) rotate(-18deg);
+  }
+
+  35% {
+    opacity: 1;
+    transform: scale(1.2) rotate(5deg);
+  }
+
+  55% {
+    opacity: 1;
+    transform: scale(0.95) rotate(0deg);
+  }
+
+  100% {
+    opacity: 0;
+    transform: scale(1.35) rotate(0deg);
+  }
+}
+
+.spotli-love-pop {
+  animation: spotli-love-pop 750ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+  will-change: transform, opacity;
+}
+
+/* Respect users who prefer reduced motion */
+@media (prefers-reduced-motion: reduce) {
+  .spotli-love-pop {
+    animation-duration: 250ms;
+  }
+}
