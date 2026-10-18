@@ -9,6 +9,11 @@ import {
   Share2,
   MoreVertical,
   Play,
+  Pause,
+  Volume2,
+  VolumeX,
+  Settings,
+  Subtitles,
 } from "lucide-react";
 
 const API_ORIGIN = (
@@ -187,6 +192,7 @@ export default function TabletVideoViewer({ posts = [], initialPost, onBack }) {
   const postRefs = useRef({});
 
   const tapTimerRef = useRef(null);
+  const detailsTimerRef = useRef(null);
   const loveTimerRef = useRef({});
 
   const lastTapRef = useRef({ time: 0, postId: null });
@@ -207,6 +213,13 @@ export default function TabletVideoViewer({ posts = [], initialPost, onBack }) {
 
   const [likedPosts, setLikedPosts] = useState({});
   const [likeCounts, setLikeCounts] = useState({});
+  // Refs keep rapid taps and in-flight API requests in sync with the latest intent.
+  const likedPostsRef = useRef({});
+  const likeCountsRef = useRef({});
+  const confirmedLikeCountsRef = useRef({});
+  const likeRequestsRef = useRef(new Set());
+  const userChangedLikesRef = useRef(new Set());
+  const [detailsVisible, setDetailsVisible] = useState(true);
   const [commentsPost, setCommentsPost] = useState(null);
   const [comments, setComments] = useState([]);
   const [commentCounts, setCommentCounts] = useState({});
@@ -218,6 +231,10 @@ export default function TabletVideoViewer({ posts = [], initialPost, onBack }) {
   const [paused, setPaused] = useState(false);
 
   const [progress, setProgress] = useState({});
+  const [videoTimes, setVideoTimes] = useState({});
+  const [videoDurations, setVideoDurations] = useState({});
+  const [videoMuted, setVideoMuted] = useState(true);
+  const [videoVolume, setVideoVolume] = useState(1);
 
   const [photoIndexes, setPhotoIndexes] = useState({});
 
@@ -239,7 +256,17 @@ export default function TabletVideoViewer({ posts = [], initialPost, onBack }) {
           ? response.postIds.map(String)
           : [];
 
-        setLikedPosts(Object.fromEntries(postIds.map((id) => [id, true])));
+        const restored = Object.fromEntries(postIds.map((id) => [id, true]));
+        setLikedPosts((previous) => {
+          const next = { ...restored, ...previous };
+          userChangedLikesRef.current.forEach((id) => {
+            if (Object.prototype.hasOwnProperty.call(previous, id)) {
+              next[id] = previous[id];
+            }
+          });
+          likedPostsRef.current = next;
+          return next;
+        });
       })
       .catch((error) => {
         console.error("Unable to load liked posts:", error.message);
@@ -263,12 +290,52 @@ export default function TabletVideoViewer({ posts = [], initialPost, onBack }) {
         }
       });
 
+      likeCountsRef.current = next;
+      confirmedLikeCountsRef.current = {
+        ...confirmedLikeCountsRef.current,
+        ...Object.fromEntries(
+          Object.entries(next).filter(
+            ([key]) => confirmedLikeCountsRef.current[key] === undefined,
+          ),
+        ),
+      };
       return next;
     });
   }, [posts]);
 
   const commentsPostId = getPostId(commentsPost);
   const activePostId = getPostId(activePost);
+
+  // Show creator details whenever a new post becomes active, then hide them
+  // after five seconds unless the viewer touches the video again.
+  function revealDetails() {
+    setDetailsVisible(true);
+    if (detailsTimerRef.current) {
+      window.clearTimeout(detailsTimerRef.current);
+    }
+    detailsTimerRef.current = window.setTimeout(() => {
+      setDetailsVisible(false);
+      detailsTimerRef.current = null;
+    }, 5000);
+  }
+
+  useEffect(() => {
+    setDetailsVisible(true);
+    if (detailsTimerRef.current) {
+      window.clearTimeout(detailsTimerRef.current);
+    }
+    detailsTimerRef.current = window.setTimeout(() => {
+      setDetailsVisible(false);
+      detailsTimerRef.current = null;
+    }, 5000);
+
+    return () => {
+      if (detailsTimerRef.current) {
+        window.clearTimeout(detailsTimerRef.current);
+        detailsTimerRef.current = null;
+      }
+    };
+  }, [activePostId]);
 
   // Seed comment counts from the feed, then poll the active/visible post so
   // comments made by other people update the icon without refreshing the page.
@@ -480,6 +547,10 @@ export default function TabletVideoViewer({ posts = [], initialPost, onBack }) {
         window.clearTimeout(tapTimerRef.current);
       }
 
+      if (detailsTimerRef.current) {
+        window.clearTimeout(detailsTimerRef.current);
+      }
+
       if (scrollFrameRef.current) {
         cancelAnimationFrame(scrollFrameRef.current);
       }
@@ -493,6 +564,9 @@ export default function TabletVideoViewer({ posts = [], initialPost, onBack }) {
   // Update the active post after scrolling settles near a page boundary.
 
   const handleFeedScroll = useCallback(() => {
+    // Any feed movement should reveal the creator details again.
+    revealDetails();
+
     const feed = feedRef.current;
 
     if (!feed) return;
@@ -524,58 +598,141 @@ export default function TabletVideoViewer({ posts = [], initialPost, onBack }) {
         setPaused(false);
       }
     });
-  }, [posts.length]);
+  }, [posts.length, revealDetails]);
 
   function togglePlayback(postId) {
     const video = videoRefs.current[postId];
-
     if (!video) return;
 
     if (video.paused) {
-      video.play().catch(() => {});
-
-      setPaused(false);
+      video
+        .play()
+        .then(() => setPaused(false))
+        .catch(() => {});
     } else {
       video.pause();
-
       setPaused(true);
+    }
+  }
+
+  function formatVideoTime(value) {
+    if (!Number.isFinite(value) || value < 0) return "0:00";
+    const minutes = Math.floor(value / 60);
+    const seconds = Math.floor(value % 60);
+    return `${minutes}:${String(seconds).padStart(2, "0")}`;
+  }
+
+  function seekVideo(postId, value) {
+    const video = videoRefs.current[postId];
+    if (!video || !Number.isFinite(video.duration)) return;
+    const nextTime = Math.max(0, Math.min(video.duration, Number(value)));
+    video.currentTime = nextTime;
+    setVideoTimes((previous) => ({ ...previous, [postId]: nextTime }));
+    setProgress((previous) => ({
+      ...previous,
+      [postId]: video.duration ? (nextTime / video.duration) * 100 : 0,
+    }));
+  }
+
+  function toggleVideoMute(postId) {
+    const nextMuted = !videoMuted;
+    setVideoMuted(nextMuted);
+    const video = videoRefs.current[postId];
+    if (video) {
+      video.muted = nextMuted;
+      if (!nextMuted && video.volume === 0) video.volume = videoVolume || 1;
+    }
+  }
+
+  function changeVideoVolume(postId, value) {
+    const volume = Math.max(0, Math.min(1, Number(value)));
+    setVideoVolume(volume);
+    setVideoMuted(volume === 0);
+    const video = videoRefs.current[postId];
+    if (video) {
+      video.volume = volume;
+      video.muted = volume === 0;
     }
   }
 
   async function toggleLike(postId) {
     const key = String(postId);
-    const wasLiked = Boolean(likedPosts[key]);
     const post = posts.find((item) => String(getPostId(item)) === key);
+    if (!post || !key || key === "undefined" || key === "null") return;
 
-    if (!post) return;
+    userChangedLikesRef.current.add(key);
 
-    const previousCount =
-      Number(
-        likeCounts[key] ?? post.likesCount ?? post.likeCount ?? post.likes ?? 0,
-      ) || 0;
+    // Read the latest intent, not a possibly stale render closure.
+    const wasLiked = Boolean(likedPostsRef.current[key] ?? likedPosts[key]);
+    const nextLiked = !wasLiked;
+    likedPostsRef.current = { ...likedPostsRef.current, [key]: nextLiked };
+    setLikedPosts((previous) => ({ ...previous, [key]: nextLiked }));
 
-    // Update immediately, then reconcile with the server response.
-    setLikedPosts((previous) => ({ ...previous, [key]: !wasLiked }));
-    setLikeCounts((previous) => ({
-      ...previous,
-      [key]: Math.max(0, previousCount + (wasLiked ? -1 : 1)),
-    }));
+    const rawPostCount = [post.likesCount, post.likeCount, post.likes]
+      .map(Number)
+      .find((value) => Number.isFinite(value) && value >= 0);
+    const displayedCount = likeCountsRef.current[key];
+    const currentCount = Number.isFinite(Number(displayedCount))
+      ? Number(displayedCount)
+      : (rawPostCount ?? 0);
+    const nextCount = Math.max(0, currentCount + (nextLiked ? 1 : -1));
+    likeCountsRef.current = { ...likeCountsRef.current, [key]: nextCount };
+    setLikeCounts((previous) => ({ ...previous, [key]: nextCount }));
 
+    // One request loop per post: rapid taps update the desired state immediately,
+    // and the loop serializes API changes until the server matches that state.
+    if (likeRequestsRef.current.has(key)) return;
+    likeRequestsRef.current.add(key);
+
+    let serverLiked = wasLiked;
     try {
-      const response = wasLiked
-        ? await api.posts.unlike(key)
-        : await api.posts.like(key);
+      while (serverLiked !== Boolean(likedPostsRef.current[key])) {
+        const desiredLiked = Boolean(likedPostsRef.current[key]);
+        const response = desiredLiked
+          ? await api.posts.like(key)
+          : await api.posts.unlike(key);
 
-      if (Number.isFinite(Number(response?.likesCount))) {
-        setLikeCounts((previous) => ({
-          ...previous,
-          [key]: Number(response.likesCount),
-        }));
+        serverLiked = desiredLiked;
+        if (
+          response?.likesCount !== undefined &&
+          response?.likesCount !== null
+        ) {
+          const serverCount = Number(response.likesCount);
+          // Only use a server count when it reflects the latest completed action.
+          if (Number.isFinite(serverCount) && serverCount >= 0) {
+            if (serverLiked === Boolean(likedPostsRef.current[key])) {
+              likeCountsRef.current = {
+                ...likeCountsRef.current,
+                [key]: serverCount,
+              };
+              confirmedLikeCountsRef.current = {
+                ...confirmedLikeCountsRef.current,
+                [key]: serverCount,
+              };
+              setLikeCounts((previous) => ({
+                ...previous,
+                [key]: serverCount,
+              }));
+            }
+          }
+        }
       }
     } catch (error) {
-      setLikedPosts((previous) => ({ ...previous, [key]: wasLiked }));
-      setLikeCounts((previous) => ({ ...previous, [key]: previousCount }));
-      console.error("Unable to update like:", error.message);
+      console.error("Unable to update like:", error?.message || error);
+      // Restore the server-confirmed state after a failed request.
+      likedPostsRef.current = { ...likedPostsRef.current, [key]: serverLiked };
+      setLikedPosts((previous) => ({ ...previous, [key]: serverLiked }));
+      const confirmedCount = confirmedLikeCountsRef.current[key];
+      const fallbackCount = Number.isFinite(Number(confirmedCount))
+        ? Number(confirmedCount)
+        : (rawPostCount ?? 0);
+      likeCountsRef.current = {
+        ...likeCountsRef.current,
+        [key]: fallbackCount,
+      };
+      setLikeCounts((previous) => ({ ...previous, [key]: fallbackCount }));
+    } finally {
+      likeRequestsRef.current.delete(key);
     }
   }
 
@@ -602,19 +759,25 @@ export default function TabletVideoViewer({ posts = [], initialPost, onBack }) {
 
     if (!video?.duration) return;
 
+    setVideoTimes((previous) => ({ ...previous, [postId]: video.currentTime }));
+    setVideoDurations((previous) => ({
+      ...previous,
+      [postId]: video.duration,
+    }));
     setProgress((previous) => ({
       ...previous,
-
       [postId]: (video.currentTime / video.duration) * 100,
     }));
   }
 
   function showLoveAnimation(postId) {
-    setLikedPosts((previous) => ({
-      ...previous,
-
-      [postId]: true,
-    }));
+    if (
+      !Boolean(
+        likedPostsRef.current[String(postId)] ?? likedPosts[String(postId)],
+      )
+    ) {
+      void toggleLike(postId);
+    }
 
     setLoveAnimations((previous) => ({
       ...previous,
@@ -640,6 +803,8 @@ export default function TabletVideoViewer({ posts = [], initialPost, onBack }) {
   }
 
   function handleVideoTap(postId) {
+    if (String(postId) === String(activePostId)) revealDetails();
+
     const now = Date.now();
 
     const previousTap = lastTapRef.current;
@@ -676,6 +841,8 @@ export default function TabletVideoViewer({ posts = [], initialPost, onBack }) {
   }
 
   function handlePhotoTap(postId) {
+    if (String(postId) === String(activePostId)) revealDetails();
+
     const now = Date.now();
 
     const previousTap = lastTapRef.current;
@@ -748,6 +915,7 @@ export default function TabletVideoViewer({ posts = [], initialPost, onBack }) {
       <main
         ref={feedRef}
         onScroll={handleFeedScroll}
+        onTouchStart={revealDetails}
         className="h-full snap-y snap-mandatory overflow-x-hidden overflow-y-auto overscroll-contain scroll-smooth scrollbar-none [&::-webkit-scrollbar]:hidden"
         style={{
           WebkitOverflowScrolling: "touch",
@@ -917,13 +1085,24 @@ export default function TabletVideoViewer({ posts = [], initialPost, onBack }) {
                       src={videoUrl || DEMO_VIDEO}
                       poster={thumbnail || undefined}
                       autoPlay={isActive && !paused}
-                      muted
+                      muted={videoMuted}
                       loop
                       playsInline
                       preload={isActive ? "auto" : "metadata"}
-                      onLoadedMetadata={(event) =>
-                        handleVideoMetadata(postId, event)
-                      }
+                      onLoadedMetadata={(event) => {
+                        handleVideoMetadata(postId, event);
+                        const video = event.currentTarget;
+                        video.muted = videoMuted;
+                        video.volume = videoVolume;
+                        setVideoDurations((previous) => ({
+                          ...previous,
+                          [postId]: video.duration || 0,
+                        }));
+                        setVideoTimes((previous) => ({
+                          ...previous,
+                          [postId]: video.currentTime || 0,
+                        }));
+                      }}
                       onTimeUpdate={() => handleTimeUpdate(postId)}
                       onClick={() => handleVideoTap(postId)}
                       className={`h-full w-full ${
@@ -942,14 +1121,85 @@ export default function TabletVideoViewer({ posts = [], initialPost, onBack }) {
                       </button>
                     )}
 
-                    <div className="pointer-events-none absolute bottom-0 left-0 right-0 h-1 bg-white/20">
+                    {isActive && (
                       <div
-                        className="h-full bg-[#FF2D4A]"
-                        style={{
-                          width: `${progress[postId] || 0}%`,
-                        }}
-                      />
-                    </div>
+                        className="absolute bottom-0 left-0 right-0 z-40 flex items-center gap-3 bg-black/75 px-4 py-3 text-white backdrop-blur-sm"
+                        onPointerDown={(event) => event.stopPropagation()}
+                        onTouchStart={(event) => event.stopPropagation()}
+                        onClick={(event) => event.stopPropagation()}
+                      >
+                        <button
+                          type="button"
+                          onClick={() => togglePlayback(postId)}
+                          aria-label={paused ? "Play video" : "Pause video"}
+                          className="shrink-0"
+                        >
+                          {paused ? (
+                            <Play size={20} fill="currentColor" />
+                          ) : (
+                            <Pause size={20} />
+                          )}
+                        </button>
+                        <span className="shrink-0 whitespace-nowrap text-xs tabular-nums">
+                          {formatVideoTime(videoTimes[postId] || 0)} /{" "}
+                          {formatVideoTime(videoDurations[postId] || 0)}
+                        </span>
+                        <input
+                          type="range"
+                          aria-label="Video timeline"
+                          min="0"
+                          max={videoDurations[postId] || 1}
+                          step="0.1"
+                          value={Math.min(
+                            videoTimes[postId] || 0,
+                            videoDurations[postId] || 1,
+                          )}
+                          onChange={(event) =>
+                            seekVideo(postId, event.target.value)
+                          }
+                          className="h-1 min-w-0 flex-1 cursor-pointer accent-[#FF2D4A]"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => toggleVideoMute(postId)}
+                          aria-label={
+                            videoMuted ? "Unmute video" : "Mute video"
+                          }
+                          className="shrink-0"
+                        >
+                          {videoMuted ? (
+                            <VolumeX size={20} />
+                          ) : (
+                            <Volume2 size={20} />
+                          )}
+                        </button>
+                        <label
+                          className="hidden items-center sm:flex"
+                          aria-label="Volume"
+                        >
+                          <input
+                            type="range"
+                            min="0"
+                            max="1"
+                            step="0.05"
+                            value={videoMuted ? 0 : videoVolume}
+                            onChange={(event) =>
+                              changeVideoVolume(postId, event.target.value)
+                            }
+                            className="w-16 cursor-pointer accent-[#FF2D4A]"
+                          />
+                        </label>
+                        <button
+                          type="button"
+                          aria-label="Video settings"
+                          title="Playback settings"
+                          onClick={(event) => event.currentTarget.blur()}
+                          className="shrink-0"
+                        >
+                          <Settings size={19} />
+                        </button>
+                      </div>
+                    )}
                   </>
                 )}
 
@@ -989,7 +1239,7 @@ export default function TabletVideoViewer({ posts = [], initialPost, onBack }) {
                 </span>
               </header>
 
-              <aside className="absolute bottom-36 right-4 z-40 flex flex-col items-center gap-5">
+              <aside className="absolute right-4 top-1/2 z-40 flex -translate-y-1/2 flex-col items-center gap-5">
                 <button
                   type="button"
                   onClick={() => toggleLike(postId)}
@@ -1065,7 +1315,13 @@ export default function TabletVideoViewer({ posts = [], initialPost, onBack }) {
                 </button>
               </aside>
 
-              <div className="absolute bottom-8 left-5 right-28 z-30 max-w-4xl">
+              <div
+                className={`absolute bottom-20 left-5 right-28 z-30 max-w-4xl transition-opacity duration-300 ${
+                  isActive && detailsVisible
+                    ? "opacity-100"
+                    : "pointer-events-none opacity-0"
+                }`}
+              >
                 <div className="mb-3 flex items-center gap-2">
                   {profilePicture ? (
                     <img
