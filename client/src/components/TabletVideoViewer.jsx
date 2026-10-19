@@ -9,11 +9,6 @@ import {
   Share2,
   MoreVertical,
   Play,
-  Pause,
-  Volume2,
-  VolumeX,
-  Settings,
-  Subtitles,
 } from "lucide-react";
 
 const API_ORIGIN = (
@@ -184,7 +179,29 @@ function formatCount(value) {
   return String(number);
 }
 
-export default function TabletVideoViewer({ posts = [], initialPost, onBack }) {
+export default function TabletVideoViewer({
+  posts: sourcePosts = [],
+  initialPost,
+  onBack,
+}) {
+  // Put the exact post selected on Home/Discover at the beginning of the tablet
+  // viewer, regardless of where it appeared in the homepage feed.
+  const initialPostId = getPostId(initialPost);
+  const matchingInitialPost = sourcePosts.find(
+    (post) => String(getPostId(post)) === String(initialPostId),
+  );
+  const posts =
+    initialPostId == null
+      ? sourcePosts
+      : matchingInitialPost
+        ? [
+            matchingInitialPost,
+            ...sourcePosts.filter(
+              (post) => String(getPostId(post)) !== String(initialPostId),
+            ),
+          ]
+        : [initialPost, ...sourcePosts];
+
   const feedRef = useRef(null);
 
   const videoRefs = useRef({});
@@ -206,7 +223,9 @@ export default function TabletVideoViewer({ posts = [], initialPost, onBack }) {
   const [activeIndex, setActiveIndex] = useState(() => {
     const initialId = getPostId(initialPost);
 
-    const index = posts.findIndex((post) => getPostId(post) === initialId);
+    const index = posts.findIndex(
+      (post) => String(getPostId(post)) === String(initialId),
+    );
 
     return index >= 0 ? index : 0;
   });
@@ -231,10 +250,6 @@ export default function TabletVideoViewer({ posts = [], initialPost, onBack }) {
   const [paused, setPaused] = useState(false);
 
   const [progress, setProgress] = useState({});
-  const [videoTimes, setVideoTimes] = useState({});
-  const [videoDurations, setVideoDurations] = useState({});
-  const [videoMuted, setVideoMuted] = useState(true);
-  const [videoVolume, setVideoVolume] = useState(1);
 
   const [photoIndexes, setPhotoIndexes] = useState({});
 
@@ -506,7 +521,9 @@ export default function TabletVideoViewer({ posts = [], initialPost, onBack }) {
 
     const initialId = getPostId(initialPost);
 
-    const index = posts.findIndex((post) => getPostId(post) === initialId);
+    const index = posts.findIndex(
+      (post) => String(getPostId(post)) === String(initialId),
+    );
 
     const resolvedIndex = index >= 0 ? index : 0;
 
@@ -602,56 +619,17 @@ export default function TabletVideoViewer({ posts = [], initialPost, onBack }) {
 
   function togglePlayback(postId) {
     const video = videoRefs.current[postId];
+
     if (!video) return;
 
     if (video.paused) {
-      video
-        .play()
-        .then(() => setPaused(false))
-        .catch(() => {});
+      video.play().catch(() => {});
+
+      setPaused(false);
     } else {
       video.pause();
+
       setPaused(true);
-    }
-  }
-
-  function formatVideoTime(value) {
-    if (!Number.isFinite(value) || value < 0) return "0:00";
-    const minutes = Math.floor(value / 60);
-    const seconds = Math.floor(value % 60);
-    return `${minutes}:${String(seconds).padStart(2, "0")}`;
-  }
-
-  function seekVideo(postId, value) {
-    const video = videoRefs.current[postId];
-    if (!video || !Number.isFinite(video.duration)) return;
-    const nextTime = Math.max(0, Math.min(video.duration, Number(value)));
-    video.currentTime = nextTime;
-    setVideoTimes((previous) => ({ ...previous, [postId]: nextTime }));
-    setProgress((previous) => ({
-      ...previous,
-      [postId]: video.duration ? (nextTime / video.duration) * 100 : 0,
-    }));
-  }
-
-  function toggleVideoMute(postId) {
-    const nextMuted = !videoMuted;
-    setVideoMuted(nextMuted);
-    const video = videoRefs.current[postId];
-    if (video) {
-      video.muted = nextMuted;
-      if (!nextMuted && video.volume === 0) video.volume = videoVolume || 1;
-    }
-  }
-
-  function changeVideoVolume(postId, value) {
-    const volume = Math.max(0, Math.min(1, Number(value)));
-    setVideoVolume(volume);
-    setVideoMuted(volume === 0);
-    const video = videoRefs.current[postId];
-    if (video) {
-      video.volume = volume;
-      video.muted = volume === 0;
     }
   }
 
@@ -759,13 +737,9 @@ export default function TabletVideoViewer({ posts = [], initialPost, onBack }) {
 
     if (!video?.duration) return;
 
-    setVideoTimes((previous) => ({ ...previous, [postId]: video.currentTime }));
-    setVideoDurations((previous) => ({
-      ...previous,
-      [postId]: video.duration,
-    }));
     setProgress((previous) => ({
       ...previous,
+
       [postId]: (video.currentTime / video.duration) * 100,
     }));
   }
@@ -1085,24 +1059,13 @@ export default function TabletVideoViewer({ posts = [], initialPost, onBack }) {
                       src={videoUrl || DEMO_VIDEO}
                       poster={thumbnail || undefined}
                       autoPlay={isActive && !paused}
-                      muted={videoMuted}
+                      muted
                       loop
                       playsInline
                       preload={isActive ? "auto" : "metadata"}
-                      onLoadedMetadata={(event) => {
-                        handleVideoMetadata(postId, event);
-                        const video = event.currentTarget;
-                        video.muted = videoMuted;
-                        video.volume = videoVolume;
-                        setVideoDurations((previous) => ({
-                          ...previous,
-                          [postId]: video.duration || 0,
-                        }));
-                        setVideoTimes((previous) => ({
-                          ...previous,
-                          [postId]: video.currentTime || 0,
-                        }));
-                      }}
+                      onLoadedMetadata={(event) =>
+                        handleVideoMetadata(postId, event)
+                      }
                       onTimeUpdate={() => handleTimeUpdate(postId)}
                       onClick={() => handleVideoTap(postId)}
                       className={`h-full w-full ${
@@ -1121,85 +1084,14 @@ export default function TabletVideoViewer({ posts = [], initialPost, onBack }) {
                       </button>
                     )}
 
-                    {isActive && (
+                    <div className="pointer-events-none absolute bottom-0 left-0 right-0 h-1 bg-white/20">
                       <div
-                        className="absolute bottom-0 left-0 right-0 z-40 flex items-center gap-3 bg-black/75 px-4 py-3 text-white backdrop-blur-sm"
-                        onPointerDown={(event) => event.stopPropagation()}
-                        onTouchStart={(event) => event.stopPropagation()}
-                        onClick={(event) => event.stopPropagation()}
-                      >
-                        <button
-                          type="button"
-                          onClick={() => togglePlayback(postId)}
-                          aria-label={paused ? "Play video" : "Pause video"}
-                          className="shrink-0"
-                        >
-                          {paused ? (
-                            <Play size={20} fill="currentColor" />
-                          ) : (
-                            <Pause size={20} />
-                          )}
-                        </button>
-                        <span className="shrink-0 whitespace-nowrap text-xs tabular-nums">
-                          {formatVideoTime(videoTimes[postId] || 0)} /{" "}
-                          {formatVideoTime(videoDurations[postId] || 0)}
-                        </span>
-                        <input
-                          type="range"
-                          aria-label="Video timeline"
-                          min="0"
-                          max={videoDurations[postId] || 1}
-                          step="0.1"
-                          value={Math.min(
-                            videoTimes[postId] || 0,
-                            videoDurations[postId] || 1,
-                          )}
-                          onChange={(event) =>
-                            seekVideo(postId, event.target.value)
-                          }
-                          className="h-1 min-w-0 flex-1 cursor-pointer accent-[#FF2D4A]"
-                        />
-                        <button
-                          type="button"
-                          onClick={() => toggleVideoMute(postId)}
-                          aria-label={
-                            videoMuted ? "Unmute video" : "Mute video"
-                          }
-                          className="shrink-0"
-                        >
-                          {videoMuted ? (
-                            <VolumeX size={20} />
-                          ) : (
-                            <Volume2 size={20} />
-                          )}
-                        </button>
-                        <label
-                          className="hidden items-center sm:flex"
-                          aria-label="Volume"
-                        >
-                          <input
-                            type="range"
-                            min="0"
-                            max="1"
-                            step="0.05"
-                            value={videoMuted ? 0 : videoVolume}
-                            onChange={(event) =>
-                              changeVideoVolume(postId, event.target.value)
-                            }
-                            className="w-16 cursor-pointer accent-[#FF2D4A]"
-                          />
-                        </label>
-                        <button
-                          type="button"
-                          aria-label="Video settings"
-                          title="Playback settings"
-                          onClick={(event) => event.currentTarget.blur()}
-                          className="shrink-0"
-                        >
-                          <Settings size={19} />
-                        </button>
-                      </div>
-                    )}
+                        className="h-full bg-[#FF2D4A]"
+                        style={{
+                          width: `${progress[postId] || 0}%`,
+                        }}
+                      />
+                    </div>
                   </>
                 )}
 
@@ -1239,7 +1131,7 @@ export default function TabletVideoViewer({ posts = [], initialPost, onBack }) {
                 </span>
               </header>
 
-              <aside className="absolute right-4 top-1/2 z-40 flex -translate-y-1/2 flex-col items-center gap-5">
+              <aside className="absolute bottom-36 right-4 z-40 flex flex-col items-center gap-5">
                 <button
                   type="button"
                   onClick={() => toggleLike(postId)}
@@ -1316,7 +1208,7 @@ export default function TabletVideoViewer({ posts = [], initialPost, onBack }) {
               </aside>
 
               <div
-                className={`absolute bottom-20 left-5 right-28 z-30 max-w-4xl transition-opacity duration-300 ${
+                className={`absolute bottom-8 left-5 right-28 z-30 max-w-4xl transition-opacity duration-300 ${
                   isActive && detailsVisible
                     ? "opacity-100"
                     : "pointer-events-none opacity-0"
