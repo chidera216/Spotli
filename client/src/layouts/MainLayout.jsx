@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useRef, useState, useEffect } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 
 import Sidebar from "../components/Sidebar";
@@ -13,22 +13,22 @@ import { videoPosts } from "../components/postData";
 function MainLayout() {
   const [selectedPost, setSelectedPost] = useState(null);
   const [viewerPosts, setViewerPosts] = useState([]);
-  const [activePage, setActivePage] = useState("Home");
+  const [fallbackPage, setFallbackPage] = useState("Home");
 
   const location = useLocation();
   const navigate = useNavigate();
 
+  // Derive route-backed pages from the URL instead of syncing them through an effect.
+  const activePage =
+    location.pathname === "/home"
+      ? "Home"
+      : location.pathname === "/create"
+        ? "Create"
+        : fallbackPage;
+
   // Remember the Home feed position when opening a post.
   const homeScrollYRef = useRef(0);
   const hadViewerOpenRef = useRef(false);
-
-  useEffect(() => {
-    if (location.pathname === "/home") {
-      setActivePage("Home");
-    } else if (location.pathname === "/create") {
-      setActivePage("Create");
-    }
-  }, [location.pathname]);
 
   // Open a video or photo without unmounting Home.
   function handleOpenPost(post, feedPosts = []) {
@@ -48,7 +48,7 @@ function MainLayout() {
 
   // Restore the previous Home scroll position after Home becomes visible.
   useEffect(() => {
-    if (selectedPost || !hadViewerOpenRef.current) return;
+    if (selectedPost || !hadViewerOpenRef.current) return undefined;
 
     const savedScrollY = homeScrollYRef.current;
 
@@ -79,7 +79,7 @@ function MainLayout() {
       return;
     }
 
-    setActivePage(page);
+    setFallbackPage(page);
   }
 
   const postsForViewer = viewerPosts.length > 0 ? viewerPosts : videoPosts;

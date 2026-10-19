@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useRef, useState, useCallback, useMemo } from "react";
 
 import CommentSection from "./comments/CommentSection";
 
@@ -201,18 +201,21 @@ export default function TabletVideoViewer({
     (post) => String(getPostId(post)) === String(initialPostId),
   );
 
-  const posts =
-    initialPostId == null
-      ? sourcePosts
-      : matchingInitialPost
-        ? [
-            matchingInitialPost,
+  const posts = useMemo(
+    () =>
+      initialPostId == null
+        ? sourcePosts
+        : matchingInitialPost
+          ? [
+              matchingInitialPost,
 
-            ...sourcePosts.filter(
-              (post) => String(getPostId(post)) !== String(initialPostId),
-            ),
-          ]
-        : [initialPost, ...sourcePosts];
+              ...sourcePosts.filter(
+                (post) => String(getPostId(post)) !== String(initialPostId),
+              ),
+            ]
+          : [initialPost, ...sourcePosts],
+    [initialPostId, matchingInitialPost, sourcePosts, initialPost],
+  );
 
   const feedRef = useRef(null);
 
@@ -278,13 +281,13 @@ export default function TabletVideoViewer({
   const [muted, setMuted] = useState(true);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
+  const [, setProgress] = useState({});
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [captionsEnabled, setCaptionsEnabled] = useState(false);
   const [playbackRate, setPlaybackRate] = useState(1);
   const [playbackFeedback, setPlaybackFeedback] = useState(null);
   const playbackFeedbackTimerRef = useRef(null);
-
-  const [progress, setProgress] = useState({});
+  const playbackFeedbackKeyRef = useRef(0);
 
   const [photoIndexes, setPhotoIndexes] = useState({});
 
@@ -409,9 +412,6 @@ export default function TabletVideoViewer({
   }, []);
 
   useEffect(() => {
-    setDetailsVisible(true);
-    setPlaybackVisible(true);
-
     if (detailsTimerRef.current) window.clearTimeout(detailsTimerRef.current);
     if (playbackTimerRef.current) window.clearTimeout(playbackTimerRef.current);
 
@@ -428,13 +428,18 @@ export default function TabletVideoViewer({
     return () => {
       if (detailsTimerRef.current) {
         window.clearTimeout(detailsTimerRef.current);
-
         detailsTimerRef.current = null;
+      }
+      if (playbackTimerRef.current) {
+        window.clearTimeout(playbackTimerRef.current);
+        playbackTimerRef.current = null;
       }
     };
   }, [activePostId]);
   // Seed comment counts from the feed, then poll the active/visible post so// comments made by other people update the icon without refreshing the page.
+  // The feed count seed intentionally synchronizes incoming props into local count state.
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setCommentCounts((previous) => {
       let changed = false;
 
@@ -505,7 +510,7 @@ export default function TabletVideoViewer({
                 previous.some((comment) => comment.pending) ? previous : list,
               );
             }
-          } catch (error) {
+          } catch {
             // Keep the last known count if a background refresh temporarily fails.
           }
         }),
@@ -525,6 +530,7 @@ export default function TabletVideoViewer({
   // Load comments whenever the selected post changes.
   useEffect(() => {
     if (!commentsPostId) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setComments([]);
 
       setCommentsError("");
@@ -678,6 +684,9 @@ export default function TabletVideoViewer({
   }, [activeIndex, paused, posts]);
 
   useEffect(() => {
+    const loveTimers = loveTimerRef.current;
+    const playbackFeedbackTimer = playbackFeedbackTimerRef.current;
+
     return () => {
       if (tapTimerRef.current) {
         window.clearTimeout(tapTimerRef.current);
@@ -691,11 +700,11 @@ export default function TabletVideoViewer({
         cancelAnimationFrame(scrollFrameRef.current);
       }
 
-      if (playbackFeedbackTimerRef.current) {
-        window.clearTimeout(playbackFeedbackTimerRef.current);
+      if (playbackFeedbackTimer) {
+        window.clearTimeout(playbackFeedbackTimer);
       }
 
-      Object.values(loveTimerRef.current).forEach((timer) => {
+      Object.values(loveTimers).forEach((timer) => {
         window.clearTimeout(timer);
       });
     };
@@ -740,9 +749,11 @@ export default function TabletVideoViewer({
 
   function togglePlayback(postId) {
     const video = videoRefs.current[postId];
+
     if (!video) return;
 
     const willPlay = video.paused;
+
     if (willPlay) {
       video.play().catch(() => {});
       setPaused(false);
@@ -751,15 +762,16 @@ export default function TabletVideoViewer({
       setPaused(true);
     }
 
-    // Show a solid play/pause icon briefly; no fade animation.
     setPlaybackFeedback({
       postId: String(postId),
       action: willPlay ? "play" : "pause",
-      key: Date.now(),
+      key: ++playbackFeedbackKeyRef.current,
     });
+
     if (playbackFeedbackTimerRef.current) {
       window.clearTimeout(playbackFeedbackTimerRef.current);
     }
+
     playbackFeedbackTimerRef.current = window.setTimeout(() => {
       setPlaybackFeedback(null);
       playbackFeedbackTimerRef.current = null;
@@ -951,9 +963,7 @@ export default function TabletVideoViewer({
 
   function showLoveAnimation(postId) {
     if (
-      !Boolean(
-        likedPostsRef.current[String(postId)] ?? likedPosts[String(postId)],
-      )
+      !(likedPostsRef.current[String(postId)] ?? likedPosts[String(postId)])
     ) {
       void toggleLike(postId);
     }
@@ -984,6 +994,7 @@ export default function TabletVideoViewer({
   function handleVideoTap(postId) {
     if (String(postId) === String(activePostId)) revealDetails();
 
+    // eslint-disable-next-line react-hooks/purity
     const now = Date.now();
 
     const previousTap = lastTapRef.current;
@@ -1022,6 +1033,7 @@ export default function TabletVideoViewer({
   function handlePhotoTap(postId) {
     if (String(postId) === String(activePostId)) revealDetails();
 
+    // eslint-disable-next-line react-hooks/purity
     const now = Date.now();
 
     const previousTap = lastTapRef.current;

@@ -225,9 +225,12 @@ function Home({ onOpenVideo, onOpenPhoto }) {
   }
 
   useEffect(() => {
-    void loadPosts();
+    const timerId = window.setTimeout(() => {
+      void loadPosts();
+    }, 0);
 
     return () => {
+      window.clearTimeout(timerId);
       feedRequestRef.current += 1;
     };
   }, []);

@@ -110,7 +110,19 @@ function CreatorAvatar({ post }) {
 }
 
 function PhotoSlide({ image, caption, index }) {
+  const [orientation, setOrientation] = useState("unknown");
+
   const imageUrl = getImageUrl(image, 1600);
+
+  function detectOrientation(event) {
+    const { naturalWidth, naturalHeight } = event.currentTarget;
+
+    if (!naturalWidth || !naturalHeight) return;
+
+    const ratio = naturalWidth / naturalHeight;
+
+    setOrientation(ratio >= 1.5 ? "landscape" : "portrait");
+  }
 
   return (
     <div className="relative aspect-video max-h-[360px] w-full flex-none snap-start overflow-hidden bg-black">
@@ -119,7 +131,10 @@ function PhotoSlide({ image, caption, index }) {
           src={imageUrl}
           alt={`${caption || "Post"} — image ${index + 1}`}
           loading={index === 0 ? "eager" : "lazy"}
-          className="absolute inset-0 h-full w-full object-contain"
+          onLoad={detectOrientation}
+          className={`absolute inset-0 h-full w-full ${
+            orientation === "landscape" ? "object-cover" : "object-contain"
+          }`}
         />
       )}
     </div>
@@ -173,24 +188,6 @@ function PostCard({ post, onOpenVideo, onOpenPhoto }) {
     } else {
       onOpenVideo?.(photoPost);
     }
-  }
-
-  function showPreviousImage(event) {
-    event.stopPropagation();
-
-    if (images.length < 2) return;
-
-    setActiveImageIndex((index) =>
-      index === 0 ? images.length - 1 : index - 1,
-    );
-  }
-
-  function showNextImage(event) {
-    event.stopPropagation();
-
-    if (images.length < 2) return;
-
-    setActiveImageIndex((index) => (index + 1) % images.length);
   }
 
   function handleCarouselScroll(event) {

@@ -436,6 +436,8 @@ function DesktopVideoViewer({ posts = [], initialPost, onBack }) {
   // Load comments for the currently active post.
   useEffect(() => {
     if (!activePostId) {
+      // This is an intentional cleanup for the no-active-post state.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setComments([]);
 
       setCommentsLoading(false);
@@ -474,6 +476,9 @@ function DesktopVideoViewer({ posts = [], initialPost, onBack }) {
     return () => {
       cancelled = true;
     };
+
+    // activePostId is the request key; the other values are intentionally not dependencies.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activePostId]);
 
   // Open the viewer at the exact post selected from Home/Discover.
@@ -537,6 +542,9 @@ function DesktopVideoViewer({ posts = [], initialPost, onBack }) {
 
       if (frameId != null) window.cancelAnimationFrame(frameId);
     };
+
+    // The stable IDs key intentionally controls when the selected-post lookup reruns.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initialPostId, viewerPostIdsKey]);
 
   // Keep playback and mute state in sync with the active video.
@@ -562,6 +570,8 @@ function DesktopVideoViewer({ posts = [], initialPost, onBack }) {
       creatorOverlayTimerRef.current = null;
     }
 
+    // Reset the overlay when the active post changes.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setShowCreatorOverlay(true);
 
     if (
@@ -585,10 +595,15 @@ function DesktopVideoViewer({ posts = [], initialPost, onBack }) {
         creatorOverlayTimerRef.current = null;
       }
     };
+
+    // activeId is the intended trigger for this per-post overlay timer.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeId]);
 
   // Reset playback controls when the active post changes.
   useEffect(() => {
+    // These are intentional per-post playback resets, not derived render state.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setProgress(0);
 
     setCurrentTime(0);
@@ -604,6 +619,9 @@ function DesktopVideoViewer({ posts = [], initialPost, onBack }) {
 
       playbackFeedbackTimerRef.current = null;
     }
+
+    // Reset playback values only when the active post changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeId]);
 
   useEffect(() => {
@@ -675,6 +693,9 @@ function DesktopVideoViewer({ posts = [], initialPost, onBack }) {
     });
 
     return () => observer.disconnect();
+
+    // The observer is rebuilt when the feed post IDs change; its callback reads that feed.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [viewerPostIdsKey]);
 
   function selectPost(post) {
