@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 
 import Sidebar from "../components/Sidebar";
@@ -18,6 +18,10 @@ function MainLayout() {
   const location = useLocation();
   const navigate = useNavigate();
 
+  // Remember the Home feed position when opening a post.
+  const homeScrollYRef = useRef(0);
+  const hadViewerOpenRef = useRef(false);
+
   useEffect(() => {
     if (location.pathname === "/home") {
       setActivePage("Home");
@@ -26,16 +30,41 @@ function MainLayout() {
     }
   }, [location.pathname]);
 
+  // Open a video or photo without unmounting Home.
   function handleOpenPost(post, feedPosts = []) {
     if (!post) return;
+
+    homeScrollYRef.current = window.scrollY;
+    hadViewerOpenRef.current = true;
 
     setViewerPosts(Array.isArray(feedPosts) ? feedPosts : []);
     setSelectedPost(post);
   }
 
+  // Close the viewer and return to Home.
   function closeViewer() {
     setSelectedPost(null);
   }
+
+  // Restore the previous Home scroll position after Home becomes visible.
+  useEffect(() => {
+    if (selectedPost || !hadViewerOpenRef.current) return;
+
+    const savedScrollY = homeScrollYRef.current;
+
+    const frameId = window.requestAnimationFrame(() => {
+      window.scrollTo({
+        top: savedScrollY,
+        behavior: "auto",
+      });
+
+      hadViewerOpenRef.current = false;
+    });
+
+    return () => {
+      window.cancelAnimationFrame(frameId);
+    };
+  }, [selectedPost]);
 
   function navigateTo(page) {
     closeViewer();
@@ -57,25 +86,30 @@ function MainLayout() {
 
   return (
     <>
-      {/* Mobile homepage */}
-      {!selectedPost && activePage === "Home" && (
-        <div className="min-h-screen bg-white text-black md:hidden">
+      {/* MOBILE HOME
+          Keep Home mounted so its shuffled feed is preserved.
+          Hide it completely while a post is open. */}
+      {activePage === "Home" && (
+        <div
+          className="min-h-screen bg-white text-black md:hidden"
+          style={selectedPost ? { display: "none" } : undefined}
+        >
           <Home onOpenVideo={handleOpenPost} onOpenPhoto={handleOpenPost} />
         </div>
       )}
 
-      {/* Mobile Create page */}
+      {/* MOBILE CREATE */}
       {!selectedPost && activePage === "Create" && (
         <div className="min-h-screen bg-white text-black md:hidden">
           <Create />
         </div>
       )}
 
-      {/* Mobile mixed-media viewer */}
+      {/* MOBILE VIDEO / PHOTO VIEWER */}
       {selectedPost && (
         <div className="md:hidden">
           <MobileVideoFeed
-            key={`mobile-${selectedPost.id}`}
+            key={`mobile-${selectedPost.id || selectedPost._id}`}
             initialPost={selectedPost}
             posts={postsForViewer}
             onBack={closeViewer}
@@ -83,14 +117,18 @@ function MainLayout() {
         </div>
       )}
 
-      {/* Persistent sidebar on tablet and desktop */}
+      {/* SIDEBAR */}
       <div className="hidden md:block">
         <Sidebar activePage={activePage} onNavigate={navigateTo} />
       </div>
 
-      {/* Tablet and desktop homepage */}
-      {!selectedPost && activePage === "Home" && (
-        <div className="hidden min-h-screen bg-white text-black md:block">
+      {/* TABLET AND DESKTOP HOME
+          Hide with inline display:none so md:block cannot override it. */}
+      {activePage === "Home" && (
+        <div
+          className="hidden min-h-screen bg-white text-black md:block"
+          style={selectedPost ? { display: "none" } : undefined}
+        >
           <main className="ml-40 min-h-screen px-4 py-3 lg:mr-[250px] lg:px-5">
             <Home onOpenVideo={handleOpenPost} onOpenPhoto={handleOpenPost} />
           </main>
@@ -101,7 +139,7 @@ function MainLayout() {
         </div>
       )}
 
-      {/* Tablet and desktop Create page */}
+      {/* TABLET AND DESKTOP CREATE */}
       {!selectedPost && activePage === "Create" && (
         <div className="hidden min-h-screen bg-white text-black md:block">
           <main className="ml-40 min-h-screen px-4 py-3 lg:px-5">
@@ -110,21 +148,22 @@ function MainLayout() {
         </div>
       )}
 
-      {/* Other navigation pages */}
+      {/* OTHER PAGES */}
       {!selectedPost && activePage !== "Home" && activePage !== "Create" && (
         <div className="min-h-screen bg-white px-6 py-10 text-black md:ml-40">
           <h1 className="text-3xl font-black">{activePage}</h1>
+
           <p className="mt-2 text-gray-500">
             This page has not been implemented yet.
           </p>
         </div>
       )}
 
-      {/* Tablet viewer */}
+      {/* TABLET VIDEO / PHOTO VIEWER */}
       {selectedPost && (
         <div className="hidden md:block lg:hidden">
           <TabletVideoViewer
-            key={`tablet-${selectedPost.id}`}
+            key={`tablet-${selectedPost.id || selectedPost._id}`}
             posts={postsForViewer}
             initialPost={selectedPost}
             onBack={closeViewer}
@@ -132,11 +171,11 @@ function MainLayout() {
         </div>
       )}
 
-      {/* Desktop viewer */}
+      {/* DESKTOP VIDEO / PHOTO VIEWER */}
       {selectedPost && (
         <div className="hidden lg:block">
           <DesktopVideoViewer
-            key={`desktop-${selectedPost.id}`}
+            key={`desktop-${selectedPost.id || selectedPost._id}`}
             posts={postsForViewer}
             initialPost={selectedPost}
             onBack={closeViewer}

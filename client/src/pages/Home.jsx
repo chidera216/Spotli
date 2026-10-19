@@ -189,6 +189,9 @@ function Home({ onOpenVideo, onOpenPhoto }) {
 
   const feedRequestRef = useRef(0);
 
+  // Remember where the user was in the Home feed.
+  const feedScrollYRef = useRef(0);
+
   async function loadPosts() {
     const requestId = ++feedRequestRef.current;
 
@@ -205,6 +208,8 @@ function Home({ onOpenVideo, onOpenPhoto }) {
       if (requestId !== feedRequestRef.current) return;
 
       const normalizedPosts = result.posts.map(normalizePost);
+
+      // Keep the existing shuffle behavior unchanged.
       setPosts(shufflePosts(normalizedPosts));
     } catch (error) {
       if (requestId !== feedRequestRef.current) return;
@@ -254,6 +259,26 @@ function Home({ onOpenVideo, onOpenPhoto }) {
     };
   }, []);
 
+  // Restore the Home feed position after the desktop viewer closes.
+  useEffect(() => {
+    if (desktopVideoPost) return;
+
+    const savedScrollY = feedScrollYRef.current;
+
+    if (savedScrollY <= 0) return;
+
+    const frameId = window.requestAnimationFrame(() => {
+      window.scrollTo({
+        top: savedScrollY,
+        behavior: "auto",
+      });
+    });
+
+    return () => {
+      window.cancelAnimationFrame(frameId);
+    };
+  }, [desktopVideoPost]);
+
   function handleOpenPost(post) {
     if (!post) return;
 
@@ -274,6 +299,8 @@ function Home({ onOpenVideo, onOpenPhoto }) {
     const isDesktop = window.matchMedia("(min-width: 1024px)").matches;
 
     if (isDesktop) {
+      // Save the exact Home feed position before opening the viewer.
+      feedScrollYRef.current = window.scrollY;
       setDesktopVideoPost(post);
       return;
     }

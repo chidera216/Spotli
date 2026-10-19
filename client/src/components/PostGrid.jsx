@@ -1,12 +1,7 @@
 import { useState } from "react";
-import {
-  Heart,
-  MessageCircle,
-  Play,
-  Image as ImageIcon,
-  ChevronLeft,
-  ChevronRight,
-} from "lucide-react";
+
+import { Heart, MessageCircle, Play, Image as ImageIcon } from "lucide-react";
+
 import samplePosts from "./postData";
 
 const API_ORIGIN = (
@@ -52,9 +47,13 @@ function isPhotoPost(post) {
 function getPostImages(post) {
   const rawImages = [
     ...(Array.isArray(post.images) ? post.images : []),
+
     ...(Array.isArray(post.mediaUrls) ? post.mediaUrls : []),
+
     post.image,
+
     post.thumbnailUrl,
+
     isPhotoPost(post) ? post.mediaUrl : "",
   ];
 
@@ -67,19 +66,28 @@ function CreatorAvatar({ post }) {
   const [imageFailed, setImageFailed] = useState(false);
 
   const creatorName = getCreatorName(post.creator);
+
   const avatarUrl = getImageUrl(
     post.creatorAvatar || post.creator?.avatar || "",
+
     64,
+
     64,
   );
 
   const initials =
     creatorName
+
       .split(/\s+/)
+
       .filter(Boolean)
+
       .slice(0, 2)
+
       .map((part) => part[0])
+
       .join("")
+
       .toUpperCase() || "S";
 
   if (avatarUrl && !imageFailed) {
@@ -102,30 +110,16 @@ function CreatorAvatar({ post }) {
 }
 
 function PhotoSlide({ image, caption, index }) {
-  const [orientation, setOrientation] = useState("unknown");
   const imageUrl = getImageUrl(image, 1600);
 
-  function detectOrientation(event) {
-    const { naturalWidth, naturalHeight } = event.currentTarget;
-
-    if (!naturalWidth || !naturalHeight) return;
-
-    const ratio = naturalWidth / naturalHeight;
-
-    setOrientation(ratio >= 1.5 ? "landscape" : "portrait");
-  }
-
   return (
-    <div className="relative aspect-video w-full flex-none snap-start overflow-hidden bg-black">
+    <div className="relative aspect-video max-h-[360px] w-full flex-none snap-start overflow-hidden bg-black">
       {imageUrl && (
         <img
           src={imageUrl}
           alt={`${caption || "Post"} — image ${index + 1}`}
           loading={index === 0 ? "eager" : "lazy"}
-          onLoad={detectOrientation}
-          className={`absolute inset-0 h-full w-full ${
-            orientation === "landscape" ? "object-cover" : "object-contain"
-          }`}
+          className="absolute inset-0 h-full w-full object-contain"
         />
       )}
     </div>
@@ -136,6 +130,7 @@ function PostCard({ post, onOpenVideo, onOpenPhoto }) {
   const [activeImageIndex, setActiveImageIndex] = useState(0);
 
   const isPhoto = isPhotoPost(post);
+
   const isVideo =
     !isPhoto &&
     (post.type === "video" ||
@@ -147,21 +142,29 @@ function PostCard({ post, onOpenVideo, onOpenPhoto }) {
     typeof post.handle === "string" && post.handle ? post.handle : "@creator";
 
   const images = getPostImages(post);
+
   const activeImage = images[activeImageIndex] || "";
 
   function openPost() {
     if (isVideo) {
       onOpenVideo?.(post);
+
       return;
     }
 
     const photoPost = {
       ...post,
+
       type: "photo",
+
       mediaType: "photo",
+
       images,
+
       mediaUrls: images,
+
       image: activeImage || images[0] || "",
+
       mediaUrl: activeImage || images[0] || "",
     };
 
@@ -212,6 +215,7 @@ function PostCard({ post, onOpenVideo, onOpenPhoto }) {
           onKeyDown={(event) => {
             if (event.key === "Enter" || event.key === " ") {
               event.preventDefault();
+
               openPost();
             }
           }}
@@ -221,6 +225,7 @@ function PostCard({ post, onOpenVideo, onOpenPhoto }) {
               className="flex w-full snap-x snap-mandatory overflow-x-auto overscroll-x-contain"
               style={{
                 scrollbarWidth: "none",
+
                 WebkitOverflowScrolling: "touch",
               }}
               onScroll={handleCarouselScroll}
@@ -237,7 +242,7 @@ function PostCard({ post, onOpenVideo, onOpenPhoto }) {
           ) : activeImage ? (
             <PhotoSlide image={activeImage} caption={post.caption} index={0} />
           ) : (
-            <div className="flex aspect-video items-center justify-center text-white">
+            <div className="flex aspect-video max-h-[360px] w-full items-center justify-center text-white">
               <ImageIcon size={32} />
             </div>
           )}
@@ -253,24 +258,6 @@ function PostCard({ post, onOpenVideo, onOpenPhoto }) {
               <span className="pointer-events-none absolute right-3 top-3 rounded-md bg-black/65 px-2 py-1 text-xs font-medium text-white">
                 {activeImageIndex + 1}/{images.length}
               </span>
-
-              <button
-                type="button"
-                aria-label="Previous image"
-                onClick={showPreviousImage}
-                className="absolute left-3 top-1/2 flex h-8 w-8 -translate-y-1/2 items-center justify-center rounded-full bg-black/60 text-white transition hover:bg-black/80"
-              >
-                <ChevronLeft size={19} />
-              </button>
-
-              <button
-                type="button"
-                aria-label="Next image"
-                onClick={showNextImage}
-                className="absolute right-3 top-1/2 flex h-8 w-8 -translate-y-1/2 items-center justify-center rounded-full bg-black/60 text-white transition hover:bg-black/80"
-              >
-                <ChevronRight size={19} />
-              </button>
 
               <div className="pointer-events-none absolute bottom-2 left-0 right-0 flex justify-center gap-1">
                 {images.map((image, index) => (
@@ -295,6 +282,7 @@ function PostCard({ post, onOpenVideo, onOpenPhoto }) {
             <div className="flex items-center gap-4 text-white">
               <span className="flex items-center gap-1.5">
                 <Heart size={19} strokeWidth={2} />
+
                 <span className="text-xs font-semibold sm:text-sm">
                   {post.likes ?? "0"}
                 </span>
@@ -302,6 +290,7 @@ function PostCard({ post, onOpenVideo, onOpenPhoto }) {
 
               <span className="flex items-center gap-1.5">
                 <MessageCircle size={19} strokeWidth={2} />
+
                 <span className="text-xs font-semibold sm:text-sm">
                   {post.comments ?? "0"}
                 </span>
@@ -329,7 +318,9 @@ function PostCard({ post, onOpenVideo, onOpenPhoto }) {
 
   const thumbnail = getImageUrl(
     post.image || post.thumbnailUrl || post.poster,
+
     720,
+
     405,
   );
 
@@ -409,11 +400,13 @@ function PostCard({ post, onOpenVideo, onOpenPhoto }) {
           <div className="mt-1.5 flex items-center gap-3 text-[10px] text-gray-500">
             <span className="flex items-center gap-1">
               <Heart size={12} />
+
               {post.likes ?? "0"}
             </span>
 
             <span className="flex items-center gap-1">
               <MessageCircle size={12} />
+
               {post.comments ?? "0"}
             </span>
           </div>
@@ -429,13 +422,16 @@ function PostGrid({ onOpenVideo, onOpenPhoto, posts: suppliedPosts }) {
   return (
     <section
       aria-label="Discover posts"
-      className="mt-4 grid grid-cols-2 items-start gap-x-3 gap-y-5 pb-6 sm:gap-x-4 lg:grid-cols-3 lg:gap-x-3 lg:gap-y-4"
+      className="mt-4 grid grid-flow-dense grid-cols-2 items-start gap-x-3 gap-y-5 pb-6 sm:gap-x-4 lg:grid-cols-3 lg:gap-x-3 lg:gap-y-4"
     >
       {feedPosts.map((post, index) => {
         const safePost = {
           ...post,
+
           id: post.id || post._id || `post-${index}`,
+
           creator: getCreatorName(post.creator),
+
           creatorAvatar: post.creatorAvatar || post.creator?.avatar || "",
         };
 
