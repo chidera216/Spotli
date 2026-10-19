@@ -22,7 +22,7 @@ const BRAND = "#FF2D4A";
 
 const CHIPS = ["For you", "Following", "ESUT", "Tech", "Travel"];
 
-const hideScrollbar = "[scrollbar-width:none] [&::-webkit-scrollbar]:hidden";
+const hideScrollbar = "scrollbar-none [&::-webkit-scrollbar]:hidden";
 
 const tap = "transition-transform active:scale-95";
 
@@ -218,7 +218,7 @@ function Avatar({ name = "", src, className = "" }) {
 
 function TopBar({ activeChip, onChip, onBack }) {
   return (
-    <header className="pointer-events-none absolute inset-x-0 top-0 z-30 bg-gradient-to-b from-black/80 via-black/45 to-transparent pb-4 pt-[env(safe-area-inset-top)]">
+    <header className="pointer-events-none absolute inset-x-0 top-0 z-30 bg-linear-to-b from-black/80 via-black/45 to-transparent pb-4 pt-[env(safe-area-inset-top)]">
       <div className="pointer-events-auto flex h-12 items-center justify-between px-3">
         <button
           type="button"
@@ -250,7 +250,7 @@ function TopBar({ activeChip, onChip, onBack }) {
               type="button"
               aria-pressed={selected}
               onClick={() => onChip(chip)}
-              className={`h-8 shrink-0 rounded-full px-[14px] text-[13px] font-medium ${selected ? "bg-white text-black" : "border border-white/50 bg-black/20 text-white backdrop-blur-sm"} ${tap}`}
+              className={`h-8 shrink-0 rounded-full px-3.5 text-[13px] font-medium ${selected ? "bg-white text-black" : "border border-white/50 bg-black/20 text-white backdrop-blur-sm"} ${tap}`}
             >
               {chip}
             </button>
@@ -348,7 +348,7 @@ function ActionRail({
 function PostInfo({ post, visible }) {
   return (
     <div
-      className={`pointer-events-none absolute bottom-5 left-4 right-[84px] z-20 text-white ${textShadow} transition-opacity duration-300 ${visible ? "opacity-100" : "opacity-0"}`}
+      className={`pointer-events-none absolute bottom-5 left-4 right-21 z-20 text-white ${textShadow} transition-opacity duration-300 ${visible ? "opacity-100" : "opacity-0"}`}
     >
       <div className="flex min-w-0 items-center gap-2">
         <Avatar
@@ -620,7 +620,7 @@ function Slide({
             onLoadedMetadata={handleVideoMetadata}
             onPlay={() => setPaused(false)}
             onPause={() => setPaused(true)}
-            className="relative z-[2] h-full w-full object-contain bg-black"
+            className="relative z-2 h-full w-full object-contain bg-black"
             style={{ maxWidth: "100%", maxHeight: "100%" }}
           />
         ) : isPhoto && media.poster ? (
@@ -646,7 +646,7 @@ function Slide({
 
       {!isPhoto && showPlaybackIcon && (
         <div className="pointer-events-none absolute inset-0 z-30 grid place-items-center">
-          <span className="grid h-[76px] w-[76px] place-items-center rounded-full bg-black/55 text-white shadow-lg">
+          <span className="grid h-19 w-19 place-items-center rounded-full bg-black/55 text-white shadow-lg">
             {paused ? (
               <Pause size={36} fill="white" />
             ) : (
@@ -668,7 +668,7 @@ function Slide({
         </div>
       )}
 
-      <div className="pointer-events-none absolute inset-x-0 bottom-[44px] z-[1] h-[45%] bg-gradient-to-t from-black/75 via-black/30 to-transparent" />
+      <div className="pointer-events-none absolute inset-x-0 bottom-11 z-1 h-[45%] bg-linear-to-t from-black/75 via-black/30 to-transparent" />
 
       {isPhoto && images.length > 1 && (
         <>
@@ -680,7 +680,7 @@ function Slide({
             {images.map((_, index) => (
               <span
                 key={index}
-                className={`h-[6px] w-[6px] rounded-full ${index === activeImage ? "bg-white" : "bg-white/40"}`}
+                className={`h-1.5 w-1.5 rounded-full ${index === activeImage ? "bg-white" : "bg-white/40"}`}
               />
             ))}
           </div>
@@ -1034,7 +1034,7 @@ export default function MobileVideoFeed({ posts = [], initialPost, onBack }) {
   );
 
   return (
-    <div className="mx-auto flex h-dvh w-full max-w-[430px] flex-col overflow-hidden bg-black text-white">
+    <div className="mx-auto flex h-dvh w-full max-w-107.5 flex-col overflow-hidden bg-black text-white">
       <div className="relative min-h-0 flex-1">
         <TopBar
           activeChip={activeChip}
@@ -1074,7 +1074,7 @@ export default function MobileVideoFeed({ posts = [], initialPost, onBack }) {
       </div>
 
       {commentsPost && (
-        <div className="fixed inset-0 z-[60]">
+        <div className="fixed inset-0 z-60">
           <button
             type="button"
             aria-label="Close comments"
@@ -1082,7 +1082,7 @@ export default function MobileVideoFeed({ posts = [], initialPost, onBack }) {
             onClick={closeComments}
           />
 
-          <div className="absolute inset-x-0 bottom-0 mx-auto w-full max-w-[430px]">
+          <div className="absolute inset-x-0 bottom-0 mx-auto w-full max-w-107.5">
             <CommentSection
               post={commentsPost}
               comments={comments}

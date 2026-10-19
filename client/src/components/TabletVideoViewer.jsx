@@ -1102,7 +1102,7 @@ export default function TabletVideoViewer({
   if (!posts.length || !activePost) return null;
 
   return (
-    <div className="fixed inset-0 z-[100] hidden overflow-hidden bg-[#080808] text-white md:block lg:hidden">
+    <div className="fixed inset-0 z-100 hidden overflow-hidden bg-[#080808] text-white md:block lg:hidden">
       <main
         ref={feedRef}
         onScroll={handleFeedScroll}
@@ -1350,7 +1350,7 @@ export default function TabletVideoViewer({
 
               {isActive && playbackVisible && (
                 <div
-                  className="absolute inset-x-0 bottom-0 z-[60] w-full bg-transparent px-4 pb-[max(12px,env(safe-area-inset-bottom))] pt-2 text-white transition-opacity duration-300"
+                  className="absolute inset-x-0 bottom-0 z-60 w-full bg-transparent px-4 pb-[max(12px,env(safe-area-inset-bottom))] pt-2 text-white transition-opacity duration-300"
                   onClick={(event) => event.stopPropagation()}
                   onTouchStart={(event) => event.stopPropagation()}
                 >
@@ -1400,7 +1400,7 @@ export default function TabletVideoViewer({
                         <Settings size={17} />
                       </button>
                       {settingsOpen && (
-                        <div className="absolute bottom-9 right-0 z-[70] min-w-28 rounded-lg bg-black/95 p-2 shadow-xl">
+                        <div className="absolute bottom-9 right-0 z-70 min-w-28 rounded-lg bg-black/95 p-2 shadow-xl">
                           {[0.5, 0.75, 1, 1.25, 1.5, 2].map((rate) => (
                             <button
                               key={rate}
@@ -1442,9 +1442,9 @@ export default function TabletVideoViewer({
                 </div>
               )}
 
-              <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-28 bg-gradient-to-b from-black/70 to-transparent" />
+              <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-28 bg-linear-to-b from-black/70 to-transparent" />
 
-              <div className="pointer-events-none absolute inset-x-0 bottom-0 z-10 h-72 bg-gradient-to-t from-black/90 via-black/35 to-transparent" />
+              <div className="pointer-events-none absolute inset-x-0 bottom-0 z-10 h-72 bg-linear-to-t from-black/90 via-black/35 to-transparent" />
 
               <header className="absolute left-4 right-4 top-4 z-40 flex items-center gap-3">
                 <button
@@ -1618,11 +1618,11 @@ export default function TabletVideoViewer({
             type="button"
             aria-label="Close comments"
             onClick={() => setCommentsPost(null)}
-            className="fixed inset-0 z-[99] bg-black/45"
+            className="fixed inset-0 z-99 bg-black/45"
           />
 
           <aside
-            className="fixed right-0 top-0 z-[100] h-dvh max-h-dvh overflow-hidden border-l border-black/10 bg-white shadow-2xl"
+            className="fixed right-0 top-0 z-100 h-dvh max-h-dvh overflow-hidden border-l border-black/10 bg-white shadow-2xl"
             style={{ width: "clamp(300px, 42vw, 420px)" }}
           >
             <CommentSection

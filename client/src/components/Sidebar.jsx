@@ -50,7 +50,7 @@ const creators = [
 function Sidebar({ activePage = "Home", onNavigate = () => {} }) {
   return (
     <aside
-      className="fixed inset-y-0 left-0 z-30 w-40 overflow-y-auto border-r border-gray-100 bg-white px-2 py-3 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+      className="fixed inset-y-0 left-0 z-30 w-40 overflow-y-auto border-r border-gray-100 bg-white px-2 py-3 scrollbar-none [&::-webkit-scrollbar]:hidden"
       style={{ msOverflowStyle: "none" }}
     >
       <a

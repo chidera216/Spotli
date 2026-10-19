@@ -56,14 +56,14 @@ function Signup() {
   }
 
   return (
-    <main className="relative min-h-[100svh] overflow-x-hidden bg-[#17171b] text-white md:grid md:h-screen md:min-h-0 md:grid-cols-2 md:overflow-hidden">
+    <main className="relative min-h-svh overflow-x-hidden bg-[#17171b] text-white md:grid md:h-screen md:min-h-0 md:grid-cols-2 md:overflow-hidden">
       {/* Mobile background */}
       <div
         className="absolute inset-0 bg-cover bg-center md:hidden"
         style={{ backgroundImage: `url("${backgroundImage}")` }}
       />
 
-      <div className="absolute inset-0 bg-gradient-to-b from-black/35 via-[#17171b]/75 to-[#17171b]/95 md:hidden" />
+      <div className="absolute inset-0 bg-linear-to-b from-black/35 via-[#17171b]/75 to-[#17171b]/95 md:hidden" />
 
       {/* Left image panel */}
       <section
@@ -71,7 +71,7 @@ function Signup() {
         style={{ backgroundImage: `url("${backgroundImage}")` }}
       >
         <div className="absolute inset-0 bg-black/25" />
-        <div className="absolute inset-0 bg-gradient-to-t from-black/85 via-black/10 to-black/15" />
+        <div className="absolute inset-0 bg-linear-to-t from-black/85 via-black/10 to-black/15" />
 
         <div className="absolute left-10 top-8 z-10 lg:left-14 lg:top-10">
           <Link to="/login" className="inline-flex items-center gap-2">
@@ -105,15 +105,15 @@ function Signup() {
 
       {/* Right form panel */}
       <section
-        className="relative flex min-h-[100svh] items-center justify-center overflow-hidden px-5 py-8 sm:px-10 md:h-screen md:min-h-0 md:px-8 md:py-5 lg:px-14"
+        className="relative flex min-h-svh items-center justify-center overflow-hidden px-5 py-8 sm:px-10 md:h-screen md:min-h-0 md:px-8 md:py-5 lg:px-14"
         style={{
           backgroundImage: `url("${backgroundImage}")`,
           backgroundSize: "cover",
           backgroundPosition: "center",
         }}
       >
-        <div className="absolute inset-0 bg-gradient-to-r from-[#17171b]/65 via-[#17171b]/85 to-[#17171b]/95" />
-        <div className="absolute inset-0 bg-gradient-to-b from-transparent via-transparent to-[#17171b]/45" />
+        <div className="absolute inset-0 bg-linear-to-r from-[#17171b]/65 via-[#17171b]/85 to-[#17171b]/95" />
+        <div className="absolute inset-0 bg-linear-to-b from-transparent via-transparent to-[#17171b]/45" />
 
         <div className="relative z-10 w-full max-w-md">
           {/* Mobile brand */}

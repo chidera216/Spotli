@@ -125,7 +125,7 @@ function PhotoSlide({ image, caption, index }) {
   }
 
   return (
-    <div className="relative aspect-video max-h-[360px] w-full flex-none snap-start overflow-hidden bg-black">
+    <div className="relative aspect-video max-h-90 w-full flex-none snap-start overflow-hidden bg-black">
       {imageUrl && (
         <img
           src={imageUrl}
@@ -239,7 +239,7 @@ function PostCard({ post, onOpenVideo, onOpenPhoto }) {
           ) : activeImage ? (
             <PhotoSlide image={activeImage} caption={post.caption} index={0} />
           ) : (
-            <div className="flex aspect-video max-h-[360px] w-full items-center justify-center text-white">
+            <div className="flex aspect-video max-h-90 w-full items-center justify-center text-white">
               <ImageIcon size={32} />
             </div>
           )}

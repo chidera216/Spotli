@@ -667,7 +667,7 @@ function Create() {
                   </div>
 
                   <div className="min-w-0 flex-1">
-                    <p className="break-words text-sm font-semibold">
+                    <p className="wrap-break-word text-sm font-semibold">
                       {customThumbnail
                         ? customThumbnail.file.name
                         : "Upload a custom cover"}

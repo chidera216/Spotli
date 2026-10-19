@@ -48,7 +48,7 @@ const topics = [
 function RightSidebar() {
   return (
     <aside
-      className="fixed inset-y-0 right-0 z-30 hidden w-[250px] overflow-y-auto border-l border-gray-100 bg-white px-3 py-4 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden lg:block"
+      className="fixed inset-y-0 right-0 z-30 hidden w-62.5 overflow-y-auto border-l border-gray-100 bg-white px-3 py-4 scrollbar-none [&::-webkit-scrollbar]:hidden lg:block"
       style={{ msOverflowStyle: "none" }}
     >
       <section>

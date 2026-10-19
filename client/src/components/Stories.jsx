@@ -34,7 +34,7 @@ function Stories() {
             key={story.name}
             className="flex w-12 shrink-0 flex-col items-center gap-1"
           >
-            <span className="rounded-full bg-gradient-to-tr from-orange-400 via-red-500 to-purple-500 p-[2px]">
+            <span className="rounded-full bg-linear-to-tr from-orange-400 via-red-500 to-purple-500 p-[2px]">
               <img
                 src={`https://images.unsplash.com/${story.image}?auto=format&fit=crop&w=80&h=80&q=80`}
                 alt={story.name}

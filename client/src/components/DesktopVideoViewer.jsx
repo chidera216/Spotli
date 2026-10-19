@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import {
   ArrowLeft,
@@ -282,7 +282,10 @@ function getPostLikeCount(post) {
 }
 
 function DesktopVideoViewer({ posts = [], initialPost, onBack }) {
-  const availablePosts = posts.filter((post) => getPostId(post) != null);
+  const availablePosts = useMemo(
+    () => posts.filter((post) => getPostId(post) != null),
+    [posts],
+  );
 
   const initialPostId = getPostId(initialPost);
 
@@ -292,24 +295,33 @@ function DesktopVideoViewer({ posts = [], initialPost, onBack }) {
 
   // Always put the post clicked on Home/Discover first in this viewer.
   // Keep the remaining posts in their original order after it.
-  const viewerPosts =
-    initialPostId == null
-      ? availablePosts
-      : matchingInitialPost
-        ? [
-            matchingInitialPost,
+  const viewerPosts = useMemo(() => {
+    if (initialPostId == null) return availablePosts;
 
-            ...availablePosts.filter(
-              (post) => String(getPostId(post)) !== String(initialPostId),
-            ),
-          ]
-        : [initialPost, ...availablePosts];
+    if (matchingInitialPost) {
+      return [
+        matchingInitialPost,
+        ...availablePosts.filter(
+          (post) => String(getPostId(post)) !== String(initialPostId),
+        ),
+      ];
+    }
+
+    return initialPost ? [initialPost, ...availablePosts] : availablePosts;
+  }, [availablePosts, initialPost, initialPostId, matchingInitialPost]);
 
   // A stable key prevents effects from rerunning just because the parent
   // creates a fresh `posts` array on each render.
   const viewerPostIdsKey = viewerPosts
     .map((post) => String(getPostId(post)))
     .join("|");
+
+  // Effects keyed by stable post IDs read the latest post objects through this ref.
+  const viewerPostsRef = useRef(viewerPosts);
+
+  useEffect(() => {
+    viewerPostsRef.current = viewerPosts;
+  }, [viewerPosts]);
 
   const firstPostId = initialPostId ?? getPostId(viewerPosts[0]);
 
@@ -403,7 +415,7 @@ function DesktopVideoViewer({ posts = [], initialPost, onBack }) {
         setLikedPosts((previous) => {
           const next = { ...previous, ...likedPostsRef.current };
 
-          viewerPosts.forEach((post) => {
+          viewerPostsRef.current.forEach((post) => {
             const ids = [post.id, post._id].filter(Boolean).map(String);
 
             const key = String(getPostId(post));
@@ -435,23 +447,16 @@ function DesktopVideoViewer({ posts = [], initialPost, onBack }) {
 
   // Load comments for the currently active post.
   useEffect(() => {
-    if (!activePostId) {
-      // This is an intentional cleanup for the no-active-post state.
-      // eslint-disable-next-line react-hooks/set-state-in-effect
-      setComments([]);
-
-      setCommentsLoading(false);
-
-      setCommentsError("");
-
-      return undefined;
-    }
+    if (!activePostId) return undefined;
 
     let cancelled = false;
 
-    setCommentsLoading(true);
-
-    setCommentsError("");
+    // Defer loading-state updates so the effect starts the request first.
+    Promise.resolve().then(() => {
+      if (cancelled) return;
+      setCommentsLoading(true);
+      setCommentsError("");
+    });
 
     api.posts
 
@@ -476,16 +481,11 @@ function DesktopVideoViewer({ posts = [], initialPost, onBack }) {
     return () => {
       cancelled = true;
     };
-
-    // activePostId is the request key; the other values are intentionally not dependencies.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activePostId]);
 
   // Open the viewer at the exact post selected from Home/Discover.
   useEffect(() => {
-    if (!initialPost) return undefined;
-
-    const initialId = getPostId(initialPost);
+    const initialId = initialPostId;
 
     if (initialId == null) return undefined;
 
@@ -525,7 +525,7 @@ function DesktopVideoViewer({ posts = [], initialPost, onBack }) {
 
       setActiveId(
         getPostId(
-          viewerPosts.find(
+          viewerPostsRef.current.find(
             (post) => String(getPostId(post)) === String(initialId),
           ),
         ) ?? initialId,
@@ -542,9 +542,6 @@ function DesktopVideoViewer({ posts = [], initialPost, onBack }) {
 
       if (frameId != null) window.cancelAnimationFrame(frameId);
     };
-
-    // The stable IDs key intentionally controls when the selected-post lookup reruns.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initialPostId, viewerPostIdsKey]);
 
   // Keep playback and mute state in sync with the active video.
@@ -563,6 +560,9 @@ function DesktopVideoViewer({ posts = [], initialPost, onBack }) {
   }, [activeId, paused, muted]);
 
   // Keep creator details visible briefly whenever a new video becomes active.
+  const activePostMediaType = activePost?.mediaType;
+  const activePostType = activePost?.type;
+
   useEffect(() => {
     if (creatorOverlayTimerRef.current) {
       window.clearTimeout(creatorOverlayTimerRef.current);
@@ -570,58 +570,51 @@ function DesktopVideoViewer({ posts = [], initialPost, onBack }) {
       creatorOverlayTimerRef.current = null;
     }
 
-    // Reset the overlay when the active post changes.
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setShowCreatorOverlay(true);
+    let revealFrameId = window.requestAnimationFrame(() => {
+      setShowCreatorOverlay(true);
+      revealFrameId = null;
+    });
 
     if (
-      !activePost ||
-      activePost.mediaType === "photo" ||
-      activePost.type === "photo"
+      !activePostId ||
+      activePostMediaType === "photo" ||
+      activePostType === "photo"
     ) {
-      return undefined;
+      return () => {
+        if (revealFrameId != null) window.cancelAnimationFrame(revealFrameId);
+      };
     }
 
     creatorOverlayTimerRef.current = window.setTimeout(() => {
       setShowCreatorOverlay(false);
-
       creatorOverlayTimerRef.current = null;
     }, 5000);
 
     return () => {
+      if (revealFrameId != null) window.cancelAnimationFrame(revealFrameId);
       if (creatorOverlayTimerRef.current) {
         window.clearTimeout(creatorOverlayTimerRef.current);
-
         creatorOverlayTimerRef.current = null;
       }
     };
+  }, [activeId, activePostId, activePostMediaType, activePostType]);
 
-    // activeId is the intended trigger for this per-post overlay timer.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeId]);
-
-  // Reset playback controls when the active post changes.
+  // Reset playback controls after the active post changes.
   useEffect(() => {
-    // These are intentional per-post playback resets, not derived render state.
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setProgress(0);
-
-    setCurrentTime(0);
-
-    setDuration(0);
-
-    setPaused(false);
-
-    setPlaybackFeedback(null);
+    const frameId = window.requestAnimationFrame(() => {
+      setProgress(0);
+      setCurrentTime(0);
+      setDuration(0);
+      setPaused(false);
+      setPlaybackFeedback(null);
+    });
 
     if (playbackFeedbackTimerRef.current) {
       window.clearTimeout(playbackFeedbackTimerRef.current);
-
       playbackFeedbackTimerRef.current = null;
     }
 
-    // Reset playback values only when the active post changes.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    return () => window.cancelAnimationFrame(frameId);
   }, [activeId]);
 
   useEffect(() => {
@@ -668,7 +661,7 @@ function DesktopVideoViewer({ posts = [], initialPost, onBack }) {
 
         if (postId == null) return;
 
-        const matchingPost = viewerPosts.find(
+        const matchingPost = viewerPostsRef.current.find(
           (post) => String(getPostId(post)) === postId,
         );
 
@@ -693,9 +686,6 @@ function DesktopVideoViewer({ posts = [], initialPost, onBack }) {
     });
 
     return () => observer.disconnect();
-
-    // The observer is rebuilt when the feed post IDs change; its callback reads that feed.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [viewerPostIdsKey]);
 
   function selectPost(post) {
@@ -962,7 +952,10 @@ function DesktopVideoViewer({ posts = [], initialPost, onBack }) {
 
   // Prepare the next two videos in the background. Never preload the whole feed.
   useEffect(() => {
-    const nextPosts = viewerPosts.slice(activeIndex + 1, activeIndex + 3);
+    const nextPosts = viewerPostsRef.current.slice(
+      activeIndex + 1,
+      activeIndex + 3,
+    );
     nextPosts.forEach((post, index) => {
       warmVideo(post, index === 0 ? "auto" : "metadata");
     });
@@ -1021,7 +1014,7 @@ function DesktopVideoViewer({ posts = [], initialPost, onBack }) {
   if (!activePost) return null;
 
   return (
-    <div className="fixed inset-y-0 left-40 right-0 z-[100] overflow-hidden bg-white text-black">
+    <div className="fixed inset-y-0 left-40 right-0 z-100 overflow-hidden bg-white text-black">
       <style>{`
 
         .spotli-double-tap-heart {
@@ -1110,7 +1103,7 @@ function DesktopVideoViewer({ posts = [], initialPost, onBack }) {
         <div className="grid min-h-0 flex-1 grid-cols-[minmax(0,1fr)_minmax(280px,340px)] overflow-hidden">
           <section
             ref={feedRef}
-            className="relative min-h-0 min-w-0 overflow-x-hidden overflow-y-auto snap-y snap-mandatory overscroll-y-contain bg-[#080808] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+            className="relative min-h-0 min-w-0 overflow-x-hidden overflow-y-auto snap-y snap-mandatory overscroll-y-contain bg-[#080808] scrollbar-none [&::-webkit-scrollbar]:hidden"
             style={{
               scrollBehavior: "smooth",
 
@@ -1207,14 +1200,14 @@ function DesktopVideoViewer({ posts = [], initialPost, onBack }) {
                       handleDoubleTapLike(postId, event)
                     }
                     onPointerUp={(event) => handlePointerUp(postId, event)}
-                    className="absolute inset-0 overflow-hidden bg-black [touch-action:manipulation]"
+                    className="absolute inset-0 overflow-hidden bg-black touch-manipulation"
                   >
                     {postIsImage ? (
                       <>
                         <div
                           id={`photo-gallery-${postId}`}
                           onScroll={(event) => handlePhotoScroll(postId, event)}
-                          className="absolute inset-0 snap-x snap-mandatory overflow-x-auto overflow-y-hidden [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+                          className="absolute inset-0 snap-x snap-mandatory overflow-x-auto overflow-y-hidden scrollbar-none [&::-webkit-scrollbar]:hidden"
                         >
                           <div className="flex h-full w-full">
                             {photoSet.map((photo, index) => (
@@ -1323,9 +1316,9 @@ function DesktopVideoViewer({ posts = [], initialPost, onBack }) {
                       </div>
                     )}
 
-                    <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-24 bg-gradient-to-b from-black/15 to-transparent" />
+                    <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-24 bg-linear-to-b from-black/15 to-transparent" />
 
-                    <div className="pointer-events-none absolute inset-x-0 bottom-0 z-10 h-64 bg-gradient-to-t from-black/75 via-black/35 via-45% to-transparent" />
+                    <div className="pointer-events-none absolute inset-x-0 bottom-0 z-10 h-64 bg-linear-to-t from-black/75 via-black/35 via-45% to-transparent" />
 
                     {String(animatedLikePostId) === String(postId) && (
                       <div className="pointer-events-none absolute inset-0 z-40 flex items-center justify-center">
@@ -1583,7 +1576,7 @@ function DesktopVideoViewer({ posts = [], initialPost, onBack }) {
                   </label>
                 </div>
 
-                <div className="min-h-0 flex-1 space-y-3 overflow-y-auto px-3 pb-3 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+                <div className="min-h-0 flex-1 space-y-3 overflow-y-auto px-3 pb-3 scrollbar-none [&::-webkit-scrollbar]:hidden">
                   {viewerPosts
 
                     .filter(
@@ -1600,7 +1593,7 @@ function DesktopVideoViewer({ posts = [], initialPost, onBack }) {
                         onClick={() => selectPost(post)}
                         className="flex w-full gap-2 text-left"
                       >
-                        <div className="relative h-[58px] w-[100px] shrink-0 overflow-hidden rounded-md bg-gray-100">
+                        <div className="relative h-14.5 w-25 shrink-0 overflow-hidden rounded-md bg-gray-100">
                           <UpNextThumbnail
                             post={post}
                             loading={index < 4 ? "eager" : "lazy"}

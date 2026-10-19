@@ -129,7 +129,7 @@ function MainLayout() {
           className="hidden min-h-screen bg-white text-black md:block"
           style={selectedPost ? { display: "none" } : undefined}
         >
-          <main className="ml-40 min-h-screen px-4 py-3 lg:mr-[250px] lg:px-5">
+          <main className="ml-40 min-h-screen px-4 py-3 lg:mr-62.5 lg:px-5">
             <Home onOpenVideo={handleOpenPost} onOpenPhoto={handleOpenPost} />
           </main>
 

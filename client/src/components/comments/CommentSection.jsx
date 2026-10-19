@@ -553,7 +553,7 @@ export default function CommentSection({
             )}
           </p>
 
-          <p className="mt-1 break-words text-sm leading-relaxed text-gray-700">
+          <p className="mt-1 wrap-break-word text-sm leading-relaxed text-gray-700">
             {getText(comment)}
           </p>
 
@@ -688,7 +688,7 @@ export default function CommentSection({
       aria-label={`${title} section`}
       className={`flex min-h-0 flex-col bg-white text-gray-900 ${
         isSheet
-          ? "fixed inset-x-0 bottom-0 z-[100] max-h-[82dvh] rounded-t-2xl shadow-2xl"
+          ? "fixed inset-x-0 bottom-0 z-100 max-h-[82dvh] rounded-t-2xl shadow-2xl"
           : "h-full w-full"
       }`}
     >
@@ -737,7 +737,7 @@ export default function CommentSection({
               <div
                 role="menu"
                 aria-label="Comment sorting options"
-                className="absolute right-0 top-full z-50 mt-1 min-w-[76px] overflow-hidden rounded-md border border-gray-200 bg-white py-1 text-xs shadow-lg"
+                className="absolute right-0 top-full z-50 mt-1 min-w-19 overflow-hidden rounded-md border border-gray-200 bg-white py-1 text-xs shadow-lg"
               >
                 <button
                   type="button"
@@ -780,7 +780,7 @@ export default function CommentSection({
         </div>
       </header>
 
-      <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-4 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+      <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-4 scrollbar-none [&::-webkit-scrollbar]:hidden">
         {loading ? (
           <p className="py-8 text-center text-xs text-gray-500">
             Loading comments…

@@ -66,7 +66,7 @@ function Login() {
         style={{ backgroundImage: `url("${backgroundImage}")` }}
       />
 
-      <div className="absolute inset-0 bg-gradient-to-b from-black/35 via-[#17171b]/75 to-[#17171b]/95 md:hidden" />
+      <div className="absolute inset-0 bg-linear-to-b from-black/35 via-[#17171b]/75 to-[#17171b]/95 md:hidden" />
 
       {/* Left image panel */}
       <section
@@ -74,7 +74,7 @@ function Login() {
         style={{ backgroundImage: `url("${backgroundImage}")` }}
       >
         <div className="absolute inset-0 bg-black/25" />
-        <div className="absolute inset-0 bg-gradient-to-t from-black/85 via-black/10 to-black/15" />
+        <div className="absolute inset-0 bg-linear-to-t from-black/85 via-black/10 to-black/15" />
 
         <div className="absolute left-10 top-8 z-10 lg:left-14 lg:top-10">
           <Link to="/signup" className="inline-flex items-center gap-2">
@@ -115,8 +115,8 @@ function Login() {
           backgroundPosition: "center",
         }}
       >
-        <div className="absolute inset-0 bg-gradient-to-r from-[#17171b]/65 via-[#17171b]/85 to-[#17171b]/95" />
-        <div className="absolute inset-0 bg-gradient-to-b from-transparent via-transparent to-[#17171b]/45" />
+        <div className="absolute inset-0 bg-linear-to-r from-[#17171b]/65 via-[#17171b]/85 to-[#17171b]/95" />
+        <div className="absolute inset-0 bg-linear-to-b from-transparent via-transparent to-[#17171b]/45" />
 
         <div className="relative z-10 w-full max-w-md">
           {/* Mobile brand */}
