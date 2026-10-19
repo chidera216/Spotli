@@ -305,6 +305,12 @@ function DesktopVideoViewer({ posts = [], initialPost, onBack }) {
           ]
         : [initialPost, ...availablePosts];
 
+  // A stable key prevents effects from rerunning just because the parent
+  // creates a fresh `posts` array on each render.
+  const viewerPostIdsKey = viewerPosts
+    .map((post) => String(getPostId(post)))
+    .join("|");
+
   const firstPostId = initialPostId ?? getPostId(viewerPosts[0]);
 
   const [activeId, setActiveId] = useState(firstPostId);
@@ -425,7 +431,7 @@ function DesktopVideoViewer({ posts = [], initialPost, onBack }) {
     return () => {
       cancelled = true;
     };
-  }, [posts]);
+  }, [viewerPostIdsKey]);
 
   // Load comments for the currently active post.
   useEffect(() => {
@@ -531,7 +537,7 @@ function DesktopVideoViewer({ posts = [], initialPost, onBack }) {
 
       if (frameId != null) window.cancelAnimationFrame(frameId);
     };
-  }, [initialPost, posts]);
+  }, [initialPostId, viewerPostIdsKey]);
 
   // Keep playback and mute state in sync with the active video.
   useEffect(() => {
@@ -579,7 +585,7 @@ function DesktopVideoViewer({ posts = [], initialPost, onBack }) {
         creatorOverlayTimerRef.current = null;
       }
     };
-  }, [activeId, activePost]);
+  }, [activeId]);
 
   // Reset playback controls when the active post changes.
   useEffect(() => {
@@ -669,7 +675,7 @@ function DesktopVideoViewer({ posts = [], initialPost, onBack }) {
     });
 
     return () => observer.disconnect();
-  }, [posts]);
+  }, [viewerPostIdsKey]);
 
   function selectPost(post) {
     if (!post) return;
@@ -939,7 +945,7 @@ function DesktopVideoViewer({ posts = [], initialPost, onBack }) {
     nextPosts.forEach((post, index) => {
       warmVideo(post, index === 0 ? "auto" : "metadata");
     });
-  }, [activeIndex, posts]);
+  }, [activeIndex, viewerPostIdsKey]);
 
   async function submitComment(text) {
     if (!activePostId || !text?.trim()) {

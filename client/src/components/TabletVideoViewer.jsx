@@ -295,26 +295,33 @@ export default function TabletVideoViewer({
   // Keep the displayed counts in sync with the counts returned for each post.
   useEffect(() => {
     setLikeCounts((previous) => {
+      let changed = false;
       const next = { ...previous };
 
       posts.forEach((post) => {
-        const key = String(getPostId(post));
+        const rawId = getPostId(post);
+        if (rawId == null) return;
+        const key = String(rawId);
         if (next[key] === undefined) {
           next[key] =
             Number(post.likesCount ?? post.likeCount ?? post.likes ?? 0) || 0;
+          changed = true;
         }
       });
 
-      likeCountsRef.current = next;
+      // A new `posts` array may arrive on every parent render. Returning the
+      // same state object when nothing changed prevents an update loop.
+      const result = changed ? next : previous;
+      likeCountsRef.current = result;
       confirmedLikeCountsRef.current = {
         ...confirmedLikeCountsRef.current,
         ...Object.fromEntries(
-          Object.entries(next).filter(
+          Object.entries(result).filter(
             ([key]) => confirmedLikeCountsRef.current[key] === undefined,
           ),
         ),
       };
-      return next;
+      return result;
     });
   }, [posts]);
 
@@ -323,7 +330,7 @@ export default function TabletVideoViewer({
 
   // Show creator details whenever a new post becomes active, then hide them
   // after five seconds unless the viewer touches the video again.
-  function revealDetails() {
+  const revealDetails = useCallback(() => {
     setDetailsVisible(true);
     if (detailsTimerRef.current) {
       window.clearTimeout(detailsTimerRef.current);
@@ -332,7 +339,7 @@ export default function TabletVideoViewer({
       setDetailsVisible(false);
       detailsTimerRef.current = null;
     }, 5000);
-  }
+  }, []);
 
   useEffect(() => {
     setDetailsVisible(true);
@@ -356,17 +363,21 @@ export default function TabletVideoViewer({
   // comments made by other people update the icon without refreshing the page.
   useEffect(() => {
     setCommentCounts((previous) => {
+      let changed = false;
       const next = { ...previous };
       posts.forEach((post) => {
-        const key = String(getPostId(post));
-        if (key && key !== "undefined" && next[key] === undefined) {
+        const rawId = getPostId(post);
+        if (rawId == null) return;
+        const key = String(rawId);
+        if (next[key] === undefined) {
           next[key] =
             Number(
               post.commentsCount ?? post.commentCount ?? post.comments ?? 0,
             ) || 0;
+          changed = true;
         }
       });
-      return next;
+      return changed ? next : previous;
     });
   }, [posts]);
 
