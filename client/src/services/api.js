@@ -23,9 +23,12 @@ async function request(endpoint, options = {}) {
   }
 
   if (!response.ok) {
-    throw new Error(
+    const error = new Error(
       data.message || `Request failed with status ${response.status}`,
     );
+    error.status = response.status;
+    error.code = data.code;
+    throw error;
   }
 
   return data;
@@ -47,9 +50,63 @@ const api = {
 
     me: () => request("/auth/me"),
 
+    updateProfile: (data) =>
+      request("/auth/me", {
+        method: "PATCH",
+        body:
+          typeof FormData !== "undefined" && data instanceof FormData
+            ? data
+            : JSON.stringify(data),
+      }),
+
+    updatePrivacy: (isPrivate) =>
+      request("/auth/me/privacy", {
+        method: "PATCH",
+        body: JSON.stringify({ isPrivate }),
+      }),
+
     logout: () =>
       request("/auth/logout", {
         method: "POST",
+      }),
+  },
+
+  users: {
+    search: (query) => request(`/users/search?q=${encodeURIComponent(query)}`),
+
+    getProfile: (userId) =>
+      request(`/users/${encodeURIComponent(userId)}/profile`),
+
+    getCreatorPosts: (userId, page = 1, limit = 20) =>
+      request(
+        `/users/${encodeURIComponent(userId)}/posts?page=${page}&limit=${limit}`,
+      ),
+
+    getFollowStats: (userId) =>
+      request(`/users/${encodeURIComponent(userId)}/follow-stats`),
+
+    getFollowList: (userId, type = "followers", page = 1, limit = 20) =>
+      request(
+        `/users/${encodeURIComponent(userId)}/follow-list?type=${encodeURIComponent(type)}&page=${page}&limit=${limit}`,
+      ),
+
+    follow: (userId) =>
+      request(`/users/${encodeURIComponent(userId)}/follow`, {
+        method: "POST",
+      }),
+
+    unfollow: (userId) =>
+      request(`/users/${encodeURIComponent(userId)}/follow`, {
+        method: "DELETE",
+      }),
+
+    getFollowRequests: (page = 1, limit = 20) =>
+      request(`/users/follow-requests/me?page=${page}&limit=${limit}`),
+
+    respondToFollowRequest: (followerId, action) =>
+      request(`/users/me/follow-request/${encodeURIComponent(followerId)}`, {
+        method: "PATCH",
+        body: JSON.stringify({ action }),
       }),
   },
 
@@ -57,57 +114,76 @@ const api = {
     getAll: (page = 1, limit = 20) =>
       request(`/posts?page=${page}&limit=${limit}`),
 
+    // Retained for backward compatibility.
     create: (formData) =>
       request("/posts", {
         method: "POST",
         body: formData,
       }),
 
+    // Request a signed authorization for direct Cloudinary uploads.
+    createUploadSignature: (details) =>
+      request("/posts/upload-signature", {
+        method: "POST",
+        body: JSON.stringify(details),
+      }),
+
+    // Create a post after its media has been uploaded.
+    createWithAssets: (postData) =>
+      request("/posts", {
+        method: "POST",
+        body: JSON.stringify(postData),
+      }),
+
     like: (postId) =>
-      request(`/posts/${postId}/like`, {
+      request(`/posts/${encodeURIComponent(postId)}/like`, {
         method: "POST",
       }),
 
     unlike: (postId) =>
-      request(`/posts/${postId}/like`, {
+      request(`/posts/${encodeURIComponent(postId)}/like`, {
         method: "DELETE",
       }),
 
     getMyLikes: () => request("/posts/likes/me"),
 
-    // Retrieve comments and replies for a post
-    getComments: (postId) => request(`/posts/${postId}/comments`),
+    getComments: (postId) =>
+      request(`/posts/${encodeURIComponent(postId)}/comments`),
 
-    // Add a top-level comment or a reply when parentCommentId is provided
-    addComment: (postId, text, parentCommentId = null) =>
-      request(`/posts/${postId}/comments`, {
+    addComment: (postId, text) =>
+      request(`/posts/${encodeURIComponent(postId)}/comments`, {
         method: "POST",
-        body: JSON.stringify({
-          text,
-          ...(parentCommentId ? { parentCommentId } : {}),
-        }),
+        body: JSON.stringify({ text }),
       }),
+  },
 
-    // Reply to an existing comment
-    replyToComment: (postId, parentCommentId, text) =>
-      request(`/posts/${postId}/comments`, {
-        method: "POST",
-        body: JSON.stringify({
-          text,
-          parentCommentId,
-        }),
-      }),
+  // Restored to fix PostGrid.jsx calling api.bookmarks.getMine().
+  bookmarks: {
+    getMine: () => request("/bookmarks"),
 
-    // Like a comment or reply
-    likeComment: (postId, commentId) =>
-      request(`/posts/${postId}/comments/${commentId}/like`, {
+    add: (postId) =>
+      request(`/bookmarks/${encodeURIComponent(postId)}`, {
         method: "POST",
       }),
 
-    // Unlike a comment or reply
-    unlikeComment: (postId, commentId) =>
-      request(`/posts/${postId}/comments/${commentId}/like`, {
+    remove: (postId) =>
+      request(`/bookmarks/${encodeURIComponent(postId)}`, {
         method: "DELETE",
+      }),
+  },
+
+  notifications: {
+    getMine: (page = 1, limit = 30) =>
+      request(`/notifications?page=${page}&limit=${limit}`),
+
+    markRead: (notificationId) =>
+      request(`/notifications/${encodeURIComponent(notificationId)}/read`, {
+        method: "PATCH",
+      }),
+
+    markAllRead: () =>
+      request("/notifications/read-all", {
+        method: "PATCH",
       }),
   },
 };

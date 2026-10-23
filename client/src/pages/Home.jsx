@@ -1,12 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { Search, Plus, Home as HomeIcon, Wallet, User } from "lucide-react";
-
 import TopBar from "../components/TopBar";
+import BottomNav from "../components/BottomNav";
 import Stories from "../components/Stories";
 import CategoryFilters from "../components/CategoryFilters";
 import PostGrid from "../components/PostGrid";
-import DesktopVideoViewer from "../components/DesktopVideoViewer";
 import api from "../services/api";
 
 const BRAND = "#FF2D4A";
@@ -31,63 +29,6 @@ function shufflePosts(posts) {
   }
 
   return shuffled;
-}
-
-function BottomNav() {
-  const navigate = useNavigate();
-
-  const tabs = [
-    { label: "Home", Icon: HomeIcon, active: true },
-    { label: "Explore", Icon: Search },
-    { label: "Create" },
-    { label: "Wallet", Icon: Wallet },
-    { label: "Profile", Icon: User },
-  ];
-
-  function handleTabClick(label) {
-    if (label === "Create") {
-      navigate("/create");
-    } else if (label === "Home") {
-      navigate("/home");
-    }
-  }
-
-  return (
-    <nav className="fixed inset-x-0 bottom-0 z-50 flex h-16 shrink-0 items-center bg-black px-2 pb-[env(safe-area-inset-bottom)] md:hidden">
-      {tabs.map(({ label, Icon, active }) => (
-        <button
-          key={label}
-          type="button"
-          aria-label={label}
-          onClick={() => handleTabClick(label)}
-          className={`flex h-16 flex-1 flex-col items-center justify-center gap-1 text-[11px] ${
-            active ? "font-semibold text-white" : "text-white/70"
-          }`}
-        >
-          {label === "Create" ? (
-            <>
-              <span
-                className="-mt-3 grid h-12 w-12 place-items-center rounded-full text-white"
-                style={{ backgroundColor: BRAND }}
-              >
-                <Plus size={26} strokeWidth={2.5} />
-              </span>
-              <span className="-mt-1">Create</span>
-            </>
-          ) : (
-            <>
-              <Icon
-                size={24}
-                strokeWidth={active ? 2.5 : 1.8}
-                fill={active ? "white" : "none"}
-              />
-              <span>{label}</span>
-            </>
-          )}
-        </button>
-      ))}
-    </nav>
-  );
 }
 
 function formatCount(value) {
@@ -185,12 +126,7 @@ function Home({ onOpenVideo, onOpenPhoto }) {
   const [posts, setPosts] = useState([]);
   const [isLoading, setIsLoading] = useState(true);
   const [errorMessage, setErrorMessage] = useState("");
-  const [desktopVideoPost, setDesktopVideoPost] = useState(null);
-
   const feedRequestRef = useRef(0);
-
-  // Remember where the user was in the Home feed.
-  const feedScrollYRef = useRef(0);
 
   async function loadPosts() {
     const requestId = ++feedRequestRef.current;
@@ -262,26 +198,6 @@ function Home({ onOpenVideo, onOpenPhoto }) {
     };
   }, []);
 
-  // Restore the Home feed position after the desktop viewer closes.
-  useEffect(() => {
-    if (desktopVideoPost) return;
-
-    const savedScrollY = feedScrollYRef.current;
-
-    if (savedScrollY <= 0) return;
-
-    const frameId = window.requestAnimationFrame(() => {
-      window.scrollTo({
-        top: savedScrollY,
-        behavior: "auto",
-      });
-    });
-
-    return () => {
-      window.cancelAnimationFrame(frameId);
-    };
-  }, [desktopVideoPost]);
-
   function handleOpenPost(post) {
     if (!post) return;
 
@@ -297,29 +213,10 @@ function Home({ onOpenVideo, onOpenPhoto }) {
       return;
     }
 
-    // Desktop opens the mixed-media feed at the selected video.
-    // Mobile and tablet retain their existing viewer callbacks.
-    const isDesktop = window.matchMedia("(min-width: 1024px)").matches;
-
-    if (isDesktop) {
-      // Save the exact Home feed position before opening the viewer.
-      feedScrollYRef.current = window.scrollY;
-      setDesktopVideoPost(post);
-      return;
-    }
-
+    // Open the selected post through MainLayout on every screen size.
+    // Pass the complete shuffled feed so the viewer starts at this exact post
+    // and can continue scrolling through the surrounding posts.
     onOpenVideo?.(post, posts);
-  }
-
-  // Pass the complete feed so photos and videos can appear while scrolling.
-  if (desktopVideoPost) {
-    return (
-      <DesktopVideoViewer
-        posts={posts}
-        initialPost={desktopVideoPost}
-        onBack={() => setDesktopVideoPost(null)}
-      />
-    );
   }
 
   return (

@@ -1,5 +1,7 @@
 import { Router } from "express";
 
+import { createUploadSignature } from "../controllers/cloudinaryController.js";
+
 import {
   getPosts,
   createPost,
@@ -9,12 +11,13 @@ import {
 } from "../controllers/postController.js";
 
 import { protect } from "../middleware/authMiddleware.js";
+import { requirePostAccess } from "../middleware/postPrivacy.js";
 import upload from "../middleware/upload.js";
 import commentRoutes from "./commentRoutes.js";
 
 const router = Router();
 
-router.get("/", getPosts);
+router.get("/", protect, getPosts);
 
 // Comments for a specific post
 router.use("/:postId/comments", commentRoutes);
@@ -32,7 +35,8 @@ router.post(
   createPost,
 );
 
-router.post("/:postId/like", protect, likePost);
-router.delete("/:postId/like", protect, unlikePost);
+router.post("/:postId/like", protect, requirePostAccess, likePost);
+router.delete("/:postId/like", protect, requirePostAccess, unlikePost);
+router.post("/upload-signature", protect, createUploadSignature);
 
 export default router;

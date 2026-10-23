@@ -4,10 +4,13 @@ import { useLocation, useNavigate } from "react-router-dom";
 import Sidebar from "../components/Sidebar";
 import Home from "../pages/Home";
 import Create from "../pages/Create";
+import Profile from "../pages/Profile";
+import PublicProfile from "../pages/PublicProfile";
+import Notifications from "../pages/Notifications";
+import SearchResults from "../pages/SearchResults";
+import Settings from "../pages/Settings";
 import RightSidebar from "../components/RightSidebar";
-import MobileVideoFeed from "../components/MobileVideoFeed";
-import TabletVideoViewer from "../components/TabletVideoViewer";
-import DesktopVideoViewer from "../components/DesktopVideoViewer";
+import VideoViewer from "../components/VideoViewer";
 import { videoPosts } from "../components/postData";
 
 function MainLayout() {
@@ -19,16 +22,39 @@ function MainLayout() {
   const navigate = useNavigate();
 
   // Derive route-backed pages from the URL instead of syncing them through an effect.
-  const activePage =
-    location.pathname === "/home"
+  const publicProfileMatch = location.pathname.match(/^\/profile\/([^/]+)$/);
+  const publicProfileId = publicProfileMatch?.[1] || "";
+
+  const activePage = publicProfileId
+    ? "PublicProfile"
+    : location.pathname === "/home"
       ? "Home"
       : location.pathname === "/create"
         ? "Create"
-        : fallbackPage;
+        : location.pathname === "/profile"
+          ? "Profile"
+          : location.pathname === "/notifications"
+            ? "Notifications"
+            : location.pathname === "/search"
+              ? "Search"
+              : location.pathname === "/settings"
+                ? "Settings"
+                : fallbackPage;
 
   // Remember the Home feed position when opening a post.
   const homeScrollYRef = useRef(0);
   const hadViewerOpenRef = useRef(false);
+
+  useEffect(() => {
+    const postFromNotification = location.state?.openPost;
+    if (!postFromNotification) return;
+
+    setViewerPosts([postFromNotification]);
+    setSelectedPost(postFromNotification);
+    homeScrollYRef.current = 0;
+    hadViewerOpenRef.current = true;
+    navigate("/home", { replace: true, state: {} });
+  }, [location.state, navigate]);
 
   // Open a video or photo without unmounting Home.
   function handleOpenPost(post, feedPosts = []) {
@@ -79,6 +105,26 @@ function MainLayout() {
       return;
     }
 
+    if (page === "Profile") {
+      navigate("/profile");
+      return;
+    }
+
+    if (page === "Notifications") {
+      navigate("/notifications");
+      return;
+    }
+
+    if (page === "Search") {
+      navigate("/search");
+      return;
+    }
+
+    if (page === "Settings") {
+      navigate("/settings");
+      return;
+    }
+
     setFallbackPage(page);
   }
 
@@ -98,22 +144,34 @@ function MainLayout() {
         </div>
       )}
 
+      {/* MOBILE PROFILE */}
+      {activePage === "Profile" && (
+        <div
+          className="min-h-screen bg-white text-black md:hidden"
+          style={selectedPost ? { display: "none" } : undefined}
+        >
+          <Profile onOpenVideo={handleOpenPost} onOpenPhoto={handleOpenPost} />
+        </div>
+      )}
+
+      {/* MOBILE PUBLIC CREATOR PROFILE */}
+      {activePage === "PublicProfile" && (
+        <div
+          className="min-h-screen bg-white text-black md:hidden"
+          style={selectedPost ? { display: "none" } : undefined}
+        >
+          <PublicProfile
+            userId={publicProfileId}
+            onOpenVideo={handleOpenPost}
+            onOpenPhoto={handleOpenPost}
+          />
+        </div>
+      )}
+
       {/* MOBILE CREATE */}
       {!selectedPost && activePage === "Create" && (
         <div className="min-h-screen bg-white text-black md:hidden">
           <Create />
-        </div>
-      )}
-
-      {/* MOBILE VIDEO / PHOTO VIEWER */}
-      {selectedPost && (
-        <div className="md:hidden">
-          <MobileVideoFeed
-            key={`mobile-${selectedPost.id || selectedPost._id}`}
-            initialPost={selectedPost}
-            posts={postsForViewer}
-            onBack={closeViewer}
-          />
         </div>
       )}
 
@@ -139,6 +197,30 @@ function MainLayout() {
         </div>
       )}
 
+      {/* TABLET AND DESKTOP PROFILE */}
+      {activePage === "Profile" && (
+        <div
+          className="hidden min-h-screen bg-white text-black md:block"
+          style={selectedPost ? { display: "none" } : undefined}
+        >
+          <Profile onOpenVideo={handleOpenPost} onOpenPhoto={handleOpenPost} />
+        </div>
+      )}
+
+      {/* TABLET AND DESKTOP PUBLIC CREATOR PROFILE */}
+      {activePage === "PublicProfile" && (
+        <div
+          className="hidden min-h-screen bg-white text-black md:block"
+          style={selectedPost ? { display: "none" } : undefined}
+        >
+          <PublicProfile
+            userId={publicProfileId}
+            onOpenVideo={handleOpenPost}
+            onOpenPhoto={handleOpenPost}
+          />
+        </div>
+      )}
+
       {/* TABLET AND DESKTOP CREATE */}
       {!selectedPost && activePage === "Create" && (
         <div className="hidden min-h-screen bg-white text-black md:block">
@@ -149,38 +231,40 @@ function MainLayout() {
       )}
 
       {/* OTHER PAGES */}
-      {!selectedPost && activePage !== "Home" && activePage !== "Create" && (
-        <div className="min-h-screen bg-white px-6 py-10 text-black md:ml-40">
-          <h1 className="text-3xl font-black">{activePage}</h1>
+      {!selectedPost &&
+        activePage !== "Home" &&
+        activePage !== "Create" &&
+        activePage !== "Profile" &&
+        activePage !== "PublicProfile" && (
+          <div className="min-h-screen bg-white text-black md:ml-40">
+            {activePage === "Notifications" ? (
+              <Notifications />
+            ) : activePage === "Search" ? (
+              <SearchResults
+                onOpenVideo={handleOpenPost}
+                onOpenPhoto={handleOpenPost}
+              />
+            ) : activePage === "Settings" ? (
+              <Settings />
+            ) : (
+              <div className="px-6 py-10">
+                <h1 className="text-3xl font-black">{activePage}</h1>
+                <p className="mt-2 text-gray-500">
+                  This page has not been implemented yet.
+                </p>
+              </div>
+            )}
+          </div>
+        )}
 
-          <p className="mt-2 text-gray-500">
-            This page has not been implemented yet.
-          </p>
-        </div>
-      )}
-
-      {/* TABLET VIDEO / PHOTO VIEWER */}
+      {/* ONE RESPONSIVE VIDEO / PHOTO VIEWER FOR ALL SCREEN SIZES */}
       {selectedPost && (
-        <div className="hidden md:block lg:hidden">
-          <TabletVideoViewer
-            key={`tablet-${selectedPost.id || selectedPost._id}`}
-            posts={postsForViewer}
-            initialPost={selectedPost}
-            onBack={closeViewer}
-          />
-        </div>
-      )}
-
-      {/* DESKTOP VIDEO / PHOTO VIEWER */}
-      {selectedPost && (
-        <div className="hidden lg:block">
-          <DesktopVideoViewer
-            key={`desktop-${selectedPost.id || selectedPost._id}`}
-            posts={postsForViewer}
-            initialPost={selectedPost}
-            onBack={closeViewer}
-          />
-        </div>
+        <VideoViewer
+          key={`viewer-${selectedPost.id || selectedPost._id}`}
+          posts={postsForViewer}
+          initialPost={selectedPost}
+          onBack={closeViewer}
+        />
       )}
     </>
   );

@@ -59,7 +59,7 @@ function Login() {
   }
 
   return (
-    <main className="relative min-h-[100svh] overflow-x-hidden bg-[#17171b] text-white md:grid md:h-screen md:min-h-0 md:grid-cols-2 md:overflow-hidden">
+    <main className="relative min-h-svh overflow-x-hidden bg-[#17171b] text-white md:grid md:h-screen md:min-h-0 md:grid-cols-2 md:overflow-hidden">
       {/* Mobile background */}
       <div
         className="absolute inset-0 bg-cover bg-center md:hidden"
@@ -108,7 +108,7 @@ function Login() {
 
       {/* Right form panel */}
       <section
-        className="relative flex min-h-[100svh] items-center justify-center overflow-hidden px-5 py-8 sm:px-10 md:h-screen md:min-h-0 md:px-8 md:py-5 lg:px-14"
+        className="relative flex min-h-svh items-center justify-center overflow-hidden px-5 py-8 sm:px-10 md:h-screen md:min-h-0 md:px-8 md:py-5 lg:px-14"
         style={{
           backgroundImage: `url("${backgroundImage}")`,
           backgroundSize: "cover",

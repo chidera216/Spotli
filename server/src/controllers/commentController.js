@@ -1,6 +1,8 @@
 import mongoose from "mongoose";
 import Comment from "../models/Comment.js";
 import Post from "../models/Post.js";
+import Notification from "../models/Notification.js";
+import { resolveMentionedUsers } from "../utils/mentions.js";
 
 const userFields = "firstName lastName avatar";
 
@@ -23,7 +25,8 @@ export async function getPostComments(req, res) {
     }
 
     const all = await Comment.find({ post: postId })
-      .populate("user", userFields)
+      .populate("user", `${userFields} username`)
+      .populate("mentions", "_id username firstName lastName avatar")
       .sort({ createdAt: -1 })
       .lean();
 
@@ -146,17 +149,64 @@ export async function createPostComment(req, res) {
       }
     }
 
+    let mentionedUsers = [];
+    try {
+      mentionedUsers = await resolveMentionedUsers(text, req.userId);
+    } catch (mentionError) {
+      console.error("Comment mention lookup error:", mentionError.message);
+    }
+
     const comment = await Comment.create({
       post: postId,
       user: req.userId,
       text,
       parentComment: parentCommentId,
+      mentions: mentionedUsers.map((user) => user._id),
     });
+
+    if (mentionedUsers.length) {
+      try {
+        await Notification.insertMany(
+          mentionedUsers.map((user) => ({
+            recipient: user._id,
+            actor: req.userId,
+            type: "mention",
+            post: post._id,
+            comment: comment._id,
+            message: text.slice(0, 240),
+          })),
+          { ordered: false },
+        );
+      } catch (mentionNotificationError) {
+        console.error(
+          "Comment mention notification error:",
+          mentionNotificationError.message,
+        );
+      }
+    }
 
     await Post.updateOne({ _id: postId }, { $inc: { commentsCount: 1 } });
 
+    const notificationRecipient = parentCommentId
+      ? (await Comment.findById(parentCommentId).select("user"))?.user
+      : post.creator;
+    if (
+      notificationRecipient &&
+      String(notificationRecipient) !== String(req.userId)
+    ) {
+      await Notification.create({
+        recipient: notificationRecipient,
+        actor: req.userId,
+        type: parentCommentId ? "reply" : "comment",
+        post: post._id,
+        comment: comment._id,
+        message: text.slice(0, 240),
+      });
+    }
+
     const populatedComment = await Comment.findById(comment._id)
-      .populate("user", userFields)
+      .populate("user", `${userFields} username`)
+      .populate("mentions", "_id username firstName lastName avatar")
       .lean();
 
     return res.status(201).json({

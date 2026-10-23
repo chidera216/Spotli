@@ -28,9 +28,40 @@ const userSchema = new mongoose.Schema(
       unique: true,
       sparse: true,
     },
+    username: {
+      type: String,
+      trim: true,
+      lowercase: true,
+      sparse: true,
+      unique: true,
+      minlength: 3,
+      maxlength: 24,
+    },
+    bio: {
+      type: String,
+      trim: true,
+      maxlength: 160,
+      default: "",
+    },
+    location: {
+      type: String,
+      trim: true,
+      maxlength: 80,
+      default: "",
+    },
+    website: {
+      type: String,
+      trim: true,
+      maxlength: 200,
+      default: "",
+    },
     avatar: {
       type: String,
       default: "",
+    },
+    isPrivate: {
+      type: Boolean,
+      default: false,
     },
     authProvider: {
       type: String,

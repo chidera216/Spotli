@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
-import { Search, Bell, ChevronDown } from "lucide-react";
+import { useNavigate } from "react-router-dom";
+import { Search, Bell, ChevronDown, Settings } from "lucide-react";
 
 import api from "../services/api";
 
@@ -27,6 +28,7 @@ function getInitials(user) {
 }
 
 function TopBar() {
+  const navigate = useNavigate();
   const [isVisible, setIsVisible] = useState(true);
   const [user, setUser] = useState(null);
   const [imageFailed, setImageFailed] = useState(false);
@@ -102,24 +104,13 @@ function TopBar() {
         Spotli<span style={{ color: BRAND }}>.</span>
       </h1>
 
-      {/* Search input — tablet and desktop */}
-      <div className="hidden h-9 max-w-md flex-1 items-center gap-2 rounded-full bg-gray-100 px-3 md:flex">
-        <Search size={16} className="shrink-0 text-gray-500" />
-
-        <input
-          type="search"
-          placeholder="Search for creators, topics, or anything..."
-          aria-label="Search"
-          className="w-full bg-transparent text-[13px] outline-none placeholder:text-gray-500"
-        />
-      </div>
-
       {/* Search icon and profile */}
       <div className="ml-auto flex shrink-0 items-center gap-3">
         {/* Icon-only search on mobile */}
         <button
           type="button"
           aria-label="Search"
+          onClick={() => navigate("/search")}
           className="grid h-10 w-10 place-items-center rounded-full text-gray-800 transition-colors hover:bg-gray-100"
         >
           <Search size={23} />
@@ -133,6 +124,16 @@ function TopBar() {
         >
           <Bell size={19} />
           <span className="absolute -right-0.5 -top-0.5 h-1.5 w-1.5 rounded-full bg-red-500" />
+        </button>
+
+        <button
+          type="button"
+          aria-label="Settings"
+          title="Settings"
+          onClick={() => navigate("/settings")}
+          className="grid h-10 w-10 place-items-center rounded-full text-gray-700 transition-colors hover:bg-gray-100"
+        >
+          <Settings size={19} />
         </button>
 
         {/* Logged-in user's profile */}

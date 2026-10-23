@@ -20,6 +20,7 @@ const commentSchema = new mongoose.Schema(
       default: null,
       index: true,
     },
+    mentions: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
     text: {
       type: String,
       required: true,

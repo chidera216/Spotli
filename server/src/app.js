@@ -7,6 +7,9 @@ import path from "node:path";
 import connectDB from "./config/db.js";
 import authRoutes from "./routes/authRoutes.js";
 import postRoutes from "./routes/postRoutes.js";
+import followRoutes from "./routes/followRoutes.js";
+import bookmarkRoutes from "./routes/bookmarkRoutes.js";
+import notificationRoutes from "./routes/notificationRoutes.js";
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -31,6 +34,9 @@ app.get("/api/health", (req, res) => {
 app.use("/api/auth", authRoutes);
 app.use("/api/posts", postRoutes);
 app.use("/uploads", express.static(path.resolve("uploads")));
+app.use("/api/users", followRoutes);
+app.use("/api/bookmarks", bookmarkRoutes);
+app.use("/api/notifications", notificationRoutes);
 
 async function startServer() {
   await connectDB();

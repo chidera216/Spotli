@@ -1,6 +1,14 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
-import { Heart, MessageCircle, Play, Image as ImageIcon } from "lucide-react";
+import {
+  Heart,
+  MessageCircle,
+  Play,
+  Image as ImageIcon,
+  Bookmark,
+} from "lucide-react";
+
+import api from "../services/api";
 
 import samplePosts from "./postData";
 
@@ -141,7 +149,13 @@ function PhotoSlide({ image, caption, index }) {
   );
 }
 
-function PostCard({ post, onOpenVideo, onOpenPhoto }) {
+function PostCard({
+  post,
+  onOpenVideo,
+  onOpenPhoto,
+  isBookmarked,
+  onToggleBookmark,
+}) {
   const [activeImageIndex, setActiveImageIndex] = useState(0);
 
   const isPhoto = isPhotoPost(post);
@@ -249,6 +263,20 @@ function PostCard({ post, onOpenVideo, onOpenPhoto }) {
           <span className="pointer-events-none absolute left-3 top-3 rounded-md bg-black/60 p-1.5 text-white">
             <ImageIcon size={16} />
           </span>
+
+          <button
+            type="button"
+            aria-label={isBookmarked ? "Remove bookmark" : "Bookmark photo"}
+            aria-pressed={Boolean(isBookmarked)}
+            title={isBookmarked ? "Remove from saved posts" : "Save post"}
+            onClick={(event) => {
+              event.stopPropagation();
+              onToggleBookmark?.(post);
+            }}
+            className="absolute right-3 top-3 z-10 grid h-9 w-9 place-items-center rounded-full bg-black/65 text-white shadow-lg backdrop-blur-sm transition hover:bg-black/85 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
+          >
+            <Bookmark size={18} fill={isBookmarked ? "currentColor" : "none"} />
+          </button>
 
           {images.length > 1 && (
             <>
@@ -370,6 +398,17 @@ function PostCard({ post, onOpenVideo, onOpenPhoto }) {
             </span>
           )}
         </button>
+
+        <button
+          type="button"
+          aria-label={isBookmarked ? "Remove bookmark" : "Bookmark video"}
+          aria-pressed={Boolean(isBookmarked)}
+          title={isBookmarked ? "Remove from saved posts" : "Save post"}
+          onClick={() => onToggleBookmark?.(post)}
+          className="absolute right-2 top-2 z-10 grid h-9 w-9 place-items-center rounded-full bg-black/65 text-white shadow-lg backdrop-blur-sm transition hover:bg-black/85 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
+        >
+          <Bookmark size={18} fill={isBookmarked ? "currentColor" : "none"} />
+        </button>
       </div>
 
       <div className="mt-2 flex min-w-0 items-start gap-2">
@@ -415,6 +454,62 @@ function PostCard({ post, onOpenVideo, onOpenPhoto }) {
 
 function PostGrid({ onOpenVideo, onOpenPhoto, posts: suppliedPosts }) {
   const feedPosts = suppliedPosts ?? samplePosts;
+  const [bookmarkedIds, setBookmarkedIds] = useState({});
+  const [bookmarkBusyIds, setBookmarkBusyIds] = useState({});
+
+  useEffect(() => {
+    let cancelled = false;
+
+    api.bookmarks
+      .getMine()
+      .then((result) => {
+        if (cancelled) return;
+        const savedPosts = Array.isArray(result?.posts) ? result.posts : [];
+        const next = {};
+        savedPosts.forEach((post) => {
+          const id = post?._id || post?.id;
+          if (id != null) next[String(id)] = true;
+        });
+        setBookmarkedIds(next);
+      })
+      .catch(() => {
+        // Guests or expired sessions can still browse the feed.
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  async function toggleBookmark(post) {
+    const id = post?._id || post?.id;
+    if (id == null) return;
+    const key = String(id);
+    if (bookmarkBusyIds[key]) return;
+
+    const wasBookmarked = Boolean(bookmarkedIds[key]);
+    setBookmarkBusyIds((current) => ({ ...current, [key]: true }));
+    setBookmarkedIds((current) => ({ ...current, [key]: !wasBookmarked }));
+
+    try {
+      if (wasBookmarked) {
+        await api.bookmarks.remove(id);
+      } else {
+        await api.bookmarks.add(id);
+      }
+    } catch (error) {
+      setBookmarkedIds((current) => ({ ...current, [key]: wasBookmarked }));
+      if (typeof window !== "undefined") {
+        window.alert(error?.message || "Please sign in to save posts.");
+      }
+    } finally {
+      setBookmarkBusyIds((current) => {
+        const next = { ...current };
+        delete next[key];
+        return next;
+      });
+    }
+  }
 
   return (
     <section
@@ -443,6 +538,10 @@ function PostGrid({ onOpenVideo, onOpenPhoto, posts: suppliedPosts }) {
               post={safePost}
               onOpenVideo={onOpenVideo}
               onOpenPhoto={onOpenPhoto}
+              isBookmarked={Boolean(
+                bookmarkedIds[String(safePost._id || safePost.id)],
+              )}
+              onToggleBookmark={toggleBookmark}
             />
           </div>
         );

@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import { ChevronDown, Heart, Send, X } from "lucide-react";
 import api from "../../services/api";
+import MentionField from "../MentionField";
+import MentionText from "../MentionText";
 
 const BRAND = "#FF2D4A";
 const INITIAL_VISIBLE_REPLIES = 1;
@@ -554,7 +556,7 @@ export default function CommentSection({
           </p>
 
           <p className="mt-1 wrap-break-word text-sm leading-relaxed text-gray-700">
-            {getText(comment)}
+            <MentionText text={getText(comment)} mentions={comment.mentions} />
           </p>
 
           <div className="mt-1 flex items-center gap-3">
@@ -584,15 +586,15 @@ export default function CommentSection({
               onSubmit={(event) => handleReplySubmit(event, comment)}
               className="mt-2 flex items-center gap-2"
             >
-              <input
+              <MentionField
                 autoFocus
                 value={replyText}
-                onChange={(event) => setReplyText(event.target.value)}
+                onChange={setReplyText}
                 placeholder={`Reply to ${getName(comment)}…`}
                 maxLength={1000}
                 disabled={replySubmitting}
-                className="min-w-0 flex-1 rounded-full bg-gray-100 px-3 py-2 text-xs outline-none focus:ring-1 focus:ring-[#FF2D4A]/40"
-                aria-label="Write a reply"
+                className="w-full rounded-full bg-gray-100 px-3 py-2 text-xs outline-none focus:ring-1 focus:ring-[#FF2D4A]/40"
+                ariaLabel="Write a reply"
               />
 
               <button
@@ -714,7 +716,7 @@ export default function CommentSection({
 
           {post?.caption && (
             <p className="mt-1 line-clamp-1 text-xs text-gray-500">
-              {post.caption}
+              <MentionText text={post.caption} mentions={post.mentions} />
             </p>
           )}
         </div>
@@ -810,16 +812,16 @@ export default function CommentSection({
         onSubmit={handleSubmit}
         className="flex shrink-0 items-center gap-2 border-t border-gray-100 p-3"
       >
-        <input
+        <MentionField
           value={text}
-          onChange={(event) => setText(event.target.value)}
+          onChange={setText}
           placeholder={
             onSubmit ? "Add a comment…" : "Comments are not connected yet"
           }
           disabled={!onSubmit || submitting}
           maxLength={1000}
-          className="min-w-0 flex-1 rounded-full bg-gray-100 px-4 py-2.5 text-sm outline-none focus:ring-1 focus:ring-[#FF2D4A]/40 disabled:cursor-not-allowed disabled:opacity-70"
-          aria-label="Write a comment"
+          className="w-full rounded-full bg-gray-100 px-4 py-2.5 text-sm outline-none focus:ring-1 focus:ring-[#FF2D4A]/40 disabled:cursor-not-allowed disabled:opacity-70"
+          ariaLabel="Write a comment"
         />
 
         <button

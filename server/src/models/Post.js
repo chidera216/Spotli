@@ -16,6 +16,8 @@ const postSchema = new mongoose.Schema(
       default: "",
     },
 
+    mentions: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
+
     mediaUrl: {
       type: String,
       required: true,
@@ -34,6 +36,23 @@ const postSchema = new mongoose.Schema(
     },
 
     thumbnailUrl: {
+      type: String,
+      default: "",
+      trim: true,
+    },
+
+    // Cloudinary asset IDs, used for future asset management.
+    mediaPublicIds: {
+      type: [String],
+      default: [],
+    },
+
+    mediaResourceTypes: {
+      type: [String],
+      default: [],
+    },
+
+    thumbnailPublicId: {
       type: String,
       default: "",
       trim: true,
