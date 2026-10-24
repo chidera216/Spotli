@@ -5,8 +5,8 @@ import Notification from "../models/Notification.js";
 
 async function getCounts(userId) {
   const [followersCount, followingCount] = await Promise.all([
-    Follow.countDocuments({ following: userId, status: { $ne: "pending" } }),
-    Follow.countDocuments({ follower: userId, status: { $ne: "pending" } }),
+    Follow.countDocuments({ following: userId, status: "approved" }),
+    Follow.countDocuments({ follower: userId, status: "approved" }),
   ]);
 
   return { followersCount, followingCount };

@@ -1438,7 +1438,7 @@ function createTabletViewerImplementation() {
                         muted
                         loop
                         playsInline
-                        preload={isActive ? "auto" : "metadata"}
+                        preload={isActive ? "auto" : "none"}
                         onLoadedMetadata={(event) => {
                           handleVideoMetadata(postId, event);
                           if (isActive) {
@@ -2078,7 +2078,7 @@ function createDesktopViewerImplementation() {
             src={videoUrl}
             muted
             playsInline
-            preload="metadata"
+            preload="none"
             crossOrigin="anonymous"
             onLoadedMetadata={(event) => {
               // Seek a tiny amount so the browser paints a representative frame.

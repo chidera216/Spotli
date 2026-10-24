@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowLeft,
   Heart,
@@ -29,6 +29,65 @@ function getMediaUrl(url) {
   if (/^(https?:\/\/|blob:|data:)/i.test(value)) return value;
 
   return `${API_ORIGIN}${value.startsWith("/") ? "" : "/"}${value}`;
+}
+
+function optimizeImage(url, width = 480) {
+  if (
+    !url ||
+    typeof url !== "string" ||
+    !url.includes("res.cloudinary.com") ||
+    !url.includes("/upload/") ||
+    url.includes("/video/upload/") ||
+    /\/upload\/[a-z]{1,3}_[^/]+\//.test(url)
+  ) {
+    return url || "";
+  }
+
+  return url.replace("/upload/", `/upload/f_auto,q_auto,w_${width},c_limit/`);
+}
+
+function getVideoCoverUrl(post) {
+  const explicit = [
+    post?.customThumbnail,
+    post?.thumbnailUrl,
+    post?.thumbnail,
+    post?.posterUrl,
+    post?.poster,
+    post?.previewImage,
+    post?.coverImage,
+  ]
+    .map((value) => {
+      if (typeof value === "string") return value.trim();
+      if (value && typeof value === "object") {
+        return value.url || value.secure_url || value.src || "";
+      }
+      return "";
+    })
+    .find(Boolean);
+
+  if (explicit) return getMediaUrl(explicit);
+
+  const rawVideo =
+    post?.mediaUrl ||
+    post?.videoUrl ||
+    post?.video ||
+    (typeof post?.media === "string" ? post.media : "");
+  const videoUrl =
+    typeof rawVideo === "string"
+      ? rawVideo
+      : rawVideo?.url || rawVideo?.secure_url || "";
+  const marker = "/video/upload/";
+  const index = videoUrl.indexOf(marker);
+
+  if (index < 0) return "";
+
+  const assetPath = videoUrl.slice(index + marker.length).split("?")[0];
+  const withoutExtension = assetPath.replace(
+    /\.(mp4|mov|m4v|webm|avi|mkv)$/i,
+    "",
+  );
+
+  return `${videoUrl.slice(0, index + marker.length)}so_0,w_240,c_limit,q_auto,f_jpg/${withoutExtension}.jpg`;
 }
 
 function getName(user) {
@@ -85,14 +144,13 @@ function getMediaValue(value) {
 }
 
 function getCustomThumbnail(post) {
-  return getMediaUrl(
-    getMediaValue(
-      post.thumbnailUrl ||
-        post.customThumbnail ||
-        post.thumbnail ||
-        post.posterUrl,
-    ),
+  const explicit = getMediaValue(
+    post.thumbnailUrl ||
+      post.customThumbnail ||
+      post.thumbnail ||
+      post.posterUrl,
   );
+  return explicit ? getMediaUrl(explicit) : getVideoCoverUrl(post);
 }
 
 function getVideoUrl(post) {
@@ -128,145 +186,10 @@ function getPhotoUrl(post) {
  * Captures a frame from the video when a custom thumbnail
  * has not been provided.
  */
-function GeneratedVideoThumbnail({ src }) {
-  const [preview, setPreview] = useState("");
-  const [failed, setFailed] = useState(false);
-
-  useEffect(() => {
-    let cancelled = false;
-    let objectUrl = "";
-
-    setPreview("");
-    setFailed(false);
-
-    if (!src) {
-      setFailed(true);
-      return undefined;
-    }
-
-    const video = document.createElement("video");
-
-    video.preload = "auto";
-    video.muted = true;
-    video.playsInline = true;
-    video.crossOrigin = "anonymous";
-
-    const cleanup = () => {
-      video.removeEventListener("loadeddata", captureFrame);
-      video.removeEventListener("seeked", captureFrame);
-      video.removeEventListener("error", handleError);
-      video.removeAttribute("src");
-      video.load();
-
-      if (objectUrl) {
-        URL.revokeObjectURL(objectUrl);
-      }
-    };
-
-    const handleError = () => {
-      if (!cancelled) setFailed(true);
-    };
-
-    const captureFrame = () => {
-      if (cancelled || !video.videoWidth || !video.videoHeight) {
-        return;
-      }
-
-      try {
-        const canvas = document.createElement("canvas");
-
-        canvas.width = video.videoWidth;
-        canvas.height = video.videoHeight;
-
-        const context = canvas.getContext("2d");
-
-        if (!context) {
-          setFailed(true);
-          return;
-        }
-
-        context.drawImage(video, 0, 0, canvas.width, canvas.height);
-
-        const image = canvas.toDataURL("image/jpeg", 0.82);
-
-        if (!cancelled) {
-          setPreview(image);
-          setFailed(false);
-        }
-      } catch (error) {
-        console.warn("Unable to generate video thumbnail:", error);
-
-        if (!cancelled) setFailed(true);
-      }
-    };
-
-    video.addEventListener("loadeddata", captureFrame);
-    video.addEventListener("seeked", captureFrame);
-    video.addEventListener("error", handleError);
-
-    video.addEventListener(
-      "loadedmetadata",
-      () => {
-        if (cancelled) return;
-
-        try {
-          const duration = Number.isFinite(video.duration) ? video.duration : 0;
-
-          // Seek slightly into the video when possible.
-          const targetTime = duration > 1 ? 0.5 : 0;
-
-          if (targetTime > 0) {
-            video.currentTime = targetTime;
-          } else {
-            captureFrame();
-          }
-        } catch {
-          captureFrame();
-        }
-      },
-      { once: true },
-    );
-
-    video.src = src;
-    video.load();
-
-    return () => {
-      cancelled = true;
-      cleanup();
-    };
-  }, [src]);
-
-  if (preview) {
-    return (
-      <img
-        src={preview}
-        alt="Video preview"
-        className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-[1.02]"
-      />
-    );
-  }
-
-  if (failed) {
-    return (
-      <span className="flex h-full w-full items-center justify-center text-gray-400">
-        <ImageIcon size={32} />
-      </span>
-    );
-  }
-
-  return (
-    <span className="flex h-full w-full items-center justify-center text-gray-400">
-      <Play size={32} />
-    </span>
-  );
-}
-
-function PostMedia({ post, photo }) {
+function PostMedia({ post, photo, index = 99 }) {
   const customThumbnail = useMemo(() => getCustomThumbnail(post), [post]);
 
   const photoUrl = useMemo(() => getPhotoUrl(post), [post]);
-
-  const videoUrl = useMemo(() => getVideoUrl(post), [post]);
 
   const [thumbnailFailed, setThumbnailFailed] = useState(false);
   const [photoFailed, setPhotoFailed] = useState(false);
@@ -282,9 +205,11 @@ function PostMedia({ post, photo }) {
     mediaContent =
       photoUrl && !photoFailed ? (
         <img
-          src={photoUrl}
+          src={optimizeImage(photoUrl, 480)}
           alt={post.caption || "Photo post"}
-          loading="lazy"
+          loading={index < 4 ? "eager" : "lazy"}
+          fetchPriority={index < 4 ? "high" : "auto"}
+          decoding="async"
           onError={() => setPhotoFailed(true)}
           className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-[1.02]"
         />
@@ -296,15 +221,21 @@ function PostMedia({ post, photo }) {
   } else if (customThumbnail && !thumbnailFailed) {
     mediaContent = (
       <img
-        src={customThumbnail}
+        src={optimizeImage(customThumbnail, 480)}
         alt={post.caption || "Video thumbnail"}
-        loading="lazy"
+        loading={index < 4 ? "eager" : "lazy"}
+        fetchPriority={index < 4 ? "high" : "auto"}
+        decoding="async"
         onError={() => setThumbnailFailed(true)}
         className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-[1.02]"
       />
     );
   } else {
-    mediaContent = <GeneratedVideoThumbnail src={videoUrl} />;
+    mediaContent = (
+      <span className="flex h-full w-full items-center justify-center text-gray-400">
+        <Play size={32} />
+      </span>
+    );
   }
 
   return (
@@ -436,12 +367,19 @@ export default function PublicProfile({ userId, onOpenVideo, onOpenPhoto }) {
 
   const [creator, setCreator] = useState(null);
   const [posts, setPosts] = useState([]);
+  const [hasMorePosts, setHasMorePosts] = useState(false);
+  const [isLoadingMorePosts, setIsLoadingMorePosts] = useState(false);
+  const pageRef = useRef(1);
+  const loadingMoreRef = useRef(false);
+  const hasMoreRef = useRef(false);
+  const postsSentinelRef = useRef(null);
   const [followersCount, setFollowersCount] = useState(0);
   const [followingCount, setFollowingCount] = useState(0);
   const [isFollowing, setIsFollowing] = useState(false);
   const [isRequested, setIsRequested] = useState(false);
   const [activeTab, setActiveTab] = useState("All Posts");
   const [isLoading, setIsLoading] = useState(true);
+  const [isPostsLoading, setIsPostsLoading] = useState(true);
   const [isFollowLoading, setIsFollowLoading] = useState(false);
   const [error, setError] = useState("");
   const [followListType, setFollowListType] = useState("");
@@ -460,28 +398,29 @@ export default function PublicProfile({ userId, onOpenVideo, onOpenPhoto }) {
 
     async function loadProfile() {
       setIsLoading(true);
+      setIsPostsLoading(true);
       setError("");
       setCreator(null);
       setPosts([]);
 
       try {
-        const [profileResult, statsResult] = await Promise.all([
+        const profileAndStatsPromise = Promise.all([
           api.users.getProfile(userId),
           api.users.getFollowStats(userId),
         ]);
-
-        let postsResult = { posts: [] };
-        try {
-          postsResult = await api.users.getCreatorPosts(userId, 1, 50);
-        } catch (postsError) {
-          if (
-            postsError.status !== 403 &&
-            postsError.code !== "PRIVATE_ACCOUNT"
-          ) {
+        const postsPromise = api.users
+          .getCreatorPosts(userId, 1, 12)
+          .catch((postsError) => {
+            if (
+              postsError.status === 403 ||
+              postsError.code === "PRIVATE_ACCOUNT"
+            ) {
+              return { posts: [] };
+            }
             throw postsError;
-          }
-        }
+          });
 
+        const [profileResult, statsResult] = await profileAndStatsPromise;
         if (!active) return;
 
         setCreator(profileResult.user || null);
@@ -489,7 +428,18 @@ export default function PublicProfile({ userId, onOpenVideo, onOpenPhoto }) {
         setFollowingCount(Number(statsResult.followingCount) || 0);
         setIsFollowing(Boolean(statsResult.isFollowing));
         setIsRequested(Boolean(statsResult.isRequested));
-        setPosts(Array.isArray(postsResult.posts) ? postsResult.posts : []);
+        setIsLoading(false);
+
+        const postsResult = await postsPromise;
+        if (!active) return;
+        const initialPosts = Array.isArray(postsResult.posts)
+          ? postsResult.posts
+          : [];
+        setPosts(initialPosts);
+        pageRef.current = 1;
+        hasMoreRef.current = Boolean(postsResult.pagination?.hasNextPage);
+        setHasMorePosts(hasMoreRef.current);
+        setIsPostsLoading(false);
       } catch (loadError) {
         if (active) {
           setError(
@@ -497,7 +447,10 @@ export default function PublicProfile({ userId, onOpenVideo, onOpenPhoto }) {
           );
         }
       } finally {
-        if (active) setIsLoading(false);
+        if (active) {
+          setIsLoading(false);
+          setIsPostsLoading(false);
+        }
       }
     }
 
@@ -512,6 +465,63 @@ export default function PublicProfile({ userId, onOpenVideo, onOpenPhoto }) {
       active = false;
     };
   }, [userId]);
+
+  useEffect(() => {
+    const element = postsSentinelRef.current;
+    if (!element || !hasMorePosts || isLoading || isLoadingMorePosts) {
+      return undefined;
+    }
+
+    const observer = new IntersectionObserver(
+      async ([entry]) => {
+        if (
+          !entry.isIntersecting ||
+          loadingMoreRef.current ||
+          !hasMoreRef.current
+        ) {
+          return;
+        }
+
+        loadingMoreRef.current = true;
+        setIsLoadingMorePosts(true);
+        const nextPage = pageRef.current + 1;
+
+        try {
+          const result = await api.users.getCreatorPosts(userId, nextPage, 12);
+          if (!Array.isArray(result.posts)) {
+            throw new Error("The server returned an invalid posts response.");
+          }
+
+          setPosts((current) => {
+            const existingIds = new Set(
+              current.map((post) => String(post._id || post.id)),
+            );
+            return [
+              ...current,
+              ...result.posts.filter(
+                (post) => !existingIds.has(String(post._id || post.id)),
+              ),
+            ];
+          });
+          pageRef.current = nextPage;
+          hasMoreRef.current = Boolean(result.pagination?.hasNextPage);
+          setHasMorePosts(hasMoreRef.current);
+        } catch (loadMoreError) {
+          console.error(
+            "Unable to load more creator posts:",
+            loadMoreError.message,
+          );
+        } finally {
+          loadingMoreRef.current = false;
+          setIsLoadingMorePosts(false);
+        }
+      },
+      { rootMargin: "600px" },
+    );
+
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [hasMorePosts, isLoading, isLoadingMorePosts, userId]);
 
   async function openFollowList(type) {
     setFollowListType(type);
@@ -831,50 +841,82 @@ export default function PublicProfile({ userId, onOpenVideo, onOpenPhoto }) {
                 ))}
               </div>
 
-              {visiblePosts.length ? (
-                <div className="mt-4 grid grid-cols-2 gap-2.5 sm:gap-3 md:grid-cols-3 lg:grid-cols-3 xl:grid-cols-3 xl:gap-4">
-                  {visiblePosts.map((post) => {
-                    const photo = isPhoto(post);
-
-                    const openPost = () =>
-                      (photo ? onOpenPhoto : onOpenVideo)?.(post, visiblePosts);
-
-                    return (
-                      <article key={post._id || post.id} className="min-w-0">
-                        <button
-                          type="button"
-                          onClick={openPost}
-                          aria-label={`Open post: ${post.caption || "Spotli post"}`}
-                          className="group relative block aspect-video w-full overflow-hidden rounded-xl bg-stone-100 text-left shadow-[0_8px_30px_rgba(0,0,0,0.06)] transition-transform duration-300 hover:scale-[1.02] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-black sm:rounded-2xl lg:rounded-[20px]"
-                        >
-                          <PostMedia post={post} photo={photo} />
-                        </button>
-
-                        <p
-                          className="mt-2 min-h-5 truncate px-0.5 text-xs text-stone-800"
-                          title={post.caption || ""}
-                        >
-                          <MentionText
-                            text={post.caption || "No caption"}
-                            mentions={post.mentions}
-                          />
-                        </p>
-
-                        <div className="mt-1.5 flex items-center gap-4 px-0.5 text-xs text-stone-500">
-                          <span className="inline-flex items-center gap-1.5">
-                            <Heart size={16} fill="#FF2D4A" color="#FF2D4A" />
-                            {count(post.likesCount ?? post.likes)}
-                          </span>
-
-                          <span className="inline-flex items-center gap-1.5">
-                            <MessageCircle size={16} />
-                            {count(post.commentsCount ?? post.comments)}
-                          </span>
-                        </div>
-                      </article>
-                    );
-                  })}
+              {isPostsLoading ? (
+                <div
+                  className="mt-4 grid grid-cols-2 gap-2.5 sm:gap-3 md:grid-cols-3 lg:grid-cols-3 xl:grid-cols-3 xl:gap-4"
+                  role="status"
+                  aria-label="Loading posts"
+                >
+                  {Array.from({ length: 6 }, (_, index) => (
+                    <div
+                      key={index}
+                      className="aspect-video animate-pulse rounded-xl bg-neutral-100 sm:rounded-2xl"
+                    />
+                  ))}
                 </div>
+              ) : visiblePosts.length ? (
+                <>
+                  <div className="mt-4 grid grid-cols-2 gap-2.5 sm:gap-3 md:grid-cols-3 lg:grid-cols-3 xl:grid-cols-3 xl:gap-4">
+                    {visiblePosts.map((post, index) => {
+                      const photo = isPhoto(post);
+
+                      const openPost = () =>
+                        (photo ? onOpenPhoto : onOpenVideo)?.(
+                          post,
+                          visiblePosts,
+                        );
+
+                      return (
+                        <article key={post._id || post.id} className="min-w-0">
+                          <button
+                            type="button"
+                            onClick={openPost}
+                            aria-label={`Open post: ${post.caption || "Spotli post"}`}
+                            className="group relative block aspect-video w-full overflow-hidden rounded-xl bg-stone-100 text-left shadow-[0_8px_30px_rgba(0,0,0,0.06)] transition-transform duration-300 hover:scale-[1.02] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-black sm:rounded-2xl lg:rounded-[20px]"
+                          >
+                            <PostMedia
+                              post={post}
+                              photo={photo}
+                              index={index}
+                            />
+                          </button>
+
+                          <p
+                            className="mt-2 min-h-5 truncate px-0.5 text-xs text-stone-800"
+                            title={post.caption || ""}
+                          >
+                            <MentionText
+                              text={post.caption || "No caption"}
+                              mentions={post.mentions}
+                            />
+                          </p>
+
+                          <div className="mt-1.5 flex items-center gap-4 px-0.5 text-xs text-stone-500">
+                            <span className="inline-flex items-center gap-1.5">
+                              <Heart size={16} fill="#FF2D4A" color="#FF2D4A" />
+                              {count(post.likesCount ?? post.likes)}
+                            </span>
+
+                            <span className="inline-flex items-center gap-1.5">
+                              <MessageCircle size={16} />
+                              {count(post.commentsCount ?? post.comments)}
+                            </span>
+                          </div>
+                        </article>
+                      );
+                    })}
+                  </div>
+                  {hasMorePosts && (
+                    <div
+                      ref={postsSentinelRef}
+                      className="h-px"
+                      aria-hidden="true"
+                    />
+                  )}
+                  {isLoadingMorePosts && (
+                    <div className="h-4" aria-hidden="true" />
+                  )}
+                </>
               ) : (
                 <div className="mt-4 flex min-h-64 flex-col items-center justify-center px-5 text-center">
                   <div className="grid h-12 w-12 place-items-center rounded-full bg-neutral-100 text-neutral-800">

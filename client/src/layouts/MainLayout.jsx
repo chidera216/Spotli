@@ -17,6 +17,19 @@ function MainLayout() {
   const [selectedPost, setSelectedPost] = useState(null);
   const [viewerPosts, setViewerPosts] = useState([]);
   const [fallbackPage, setFallbackPage] = useState("Home");
+  const [isMobileViewport, setIsMobileViewport] = useState(
+    () =>
+      typeof window !== "undefined" &&
+      window.matchMedia("(max-width: 767px)").matches,
+  );
+
+  useEffect(() => {
+    const mediaQuery = window.matchMedia("(max-width: 767px)");
+    const updateViewport = (event) => setIsMobileViewport(event.matches);
+    setIsMobileViewport(mediaQuery.matches);
+    mediaQuery.addEventListener("change", updateViewport);
+    return () => mediaQuery.removeEventListener("change", updateViewport);
+  }, []);
 
   const location = useLocation();
   const navigate = useNavigate();
@@ -135,7 +148,7 @@ function MainLayout() {
       {/* MOBILE HOME
           Keep Home mounted so its shuffled feed is preserved.
           Hide it completely while a post is open. */}
-      {activePage === "Home" && (
+      {activePage === "Home" && isMobileViewport && (
         <div
           className="min-h-screen bg-white text-black md:hidden"
           style={selectedPost ? { display: "none" } : undefined}
@@ -145,7 +158,7 @@ function MainLayout() {
       )}
 
       {/* MOBILE PROFILE */}
-      {activePage === "Profile" && (
+      {activePage === "Profile" && isMobileViewport && (
         <div
           className="min-h-screen bg-white text-black md:hidden"
           style={selectedPost ? { display: "none" } : undefined}
@@ -155,7 +168,7 @@ function MainLayout() {
       )}
 
       {/* MOBILE PUBLIC CREATOR PROFILE */}
-      {activePage === "PublicProfile" && (
+      {activePage === "PublicProfile" && isMobileViewport && (
         <div
           className="min-h-screen bg-white text-black md:hidden"
           style={selectedPost ? { display: "none" } : undefined}
@@ -169,20 +182,22 @@ function MainLayout() {
       )}
 
       {/* MOBILE CREATE */}
-      {!selectedPost && activePage === "Create" && (
+      {!selectedPost && activePage === "Create" && isMobileViewport && (
         <div className="min-h-screen bg-white text-black md:hidden">
           <Create />
         </div>
       )}
 
       {/* SIDEBAR */}
-      <div className="hidden md:block">
-        <Sidebar activePage={activePage} onNavigate={navigateTo} />
-      </div>
+      {!isMobileViewport && (
+        <div className="hidden md:block">
+          <Sidebar activePage={activePage} onNavigate={navigateTo} />
+        </div>
+      )}
 
       {/* TABLET AND DESKTOP HOME
           Hide with inline display:none so md:block cannot override it. */}
-      {activePage === "Home" && (
+      {activePage === "Home" && !isMobileViewport && (
         <div
           className="hidden min-h-screen bg-white text-black md:block"
           style={selectedPost ? { display: "none" } : undefined}
@@ -198,7 +213,7 @@ function MainLayout() {
       )}
 
       {/* TABLET AND DESKTOP PROFILE */}
-      {activePage === "Profile" && (
+      {activePage === "Profile" && !isMobileViewport && (
         <div
           className="hidden min-h-screen bg-white text-black md:block"
           style={selectedPost ? { display: "none" } : undefined}
@@ -208,7 +223,7 @@ function MainLayout() {
       )}
 
       {/* TABLET AND DESKTOP PUBLIC CREATOR PROFILE */}
-      {activePage === "PublicProfile" && (
+      {activePage === "PublicProfile" && !isMobileViewport && (
         <div
           className="hidden min-h-screen bg-white text-black md:block"
           style={selectedPost ? { display: "none" } : undefined}
@@ -222,7 +237,7 @@ function MainLayout() {
       )}
 
       {/* TABLET AND DESKTOP CREATE */}
-      {!selectedPost && activePage === "Create" && (
+      {!selectedPost && activePage === "Create" && !isMobileViewport && (
         <div className="hidden min-h-screen bg-white text-black md:block">
           <main className="ml-40 min-h-screen px-4 py-3 lg:px-5">
             <Create />

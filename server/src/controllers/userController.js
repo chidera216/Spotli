@@ -172,9 +172,12 @@ export async function getCreatorPosts(req, res) {
     );
     const [posts, totalPosts] = await Promise.all([
       Post.find({ creator: userId })
+        .select(
+          "_id creator caption mentions mediaUrl mediaUrls mediaType thumbnailUrl likesCount commentsCount viewsCount createdAt",
+        )
         .populate("creator", "firstName lastName username avatar")
         .populate("mentions", "_id username firstName lastName avatar")
-        .sort({ createdAt: -1 })
+        .sort({ createdAt: -1, _id: -1 })
         .skip((page - 1) * limit)
         .limit(limit)
         .lean(),

@@ -1,37 +1,93 @@
 const API_BASE_URL =
   import.meta.env.VITE_API_URL || "http://localhost:5000/api";
 
+const inFlightGetRequests = new Map();
+const shortGetCache = new Map();
+const NOTIFICATION_CACHE_TTL_MS = 3000;
+
+function isNotificationListRequest(method, endpoint) {
+  return method === "GET" && /^\/notifications(?:\?|$)/.test(endpoint);
+}
+
+function clearNotificationCache() {
+  for (const key of shortGetCache.keys()) {
+    if (key.startsWith("GET:/notifications")) shortGetCache.delete(key);
+  }
+}
+
 async function request(endpoint, options = {}) {
-  const isFormData =
-    typeof FormData !== "undefined" && options.body instanceof FormData;
+  const method = String(options.method || "GET").toUpperCase();
+  const requestKey = `${method}:${endpoint}`;
 
-  const response = await fetch(`${API_BASE_URL}${endpoint}`, {
-    ...options,
-    credentials: "include",
-    headers: {
-      ...(isFormData ? {} : { "Content-Type": "application/json" }),
-      ...options.headers,
-    },
-  });
+  // Share concurrent GET requests for the same endpoint.
+  if (method === "GET" && inFlightGetRequests.has(requestKey)) {
+    return inFlightGetRequests.get(requestKey);
+  }
 
-  let data;
+  // React development effect replays can trigger the same notification query
+  // immediately after the first request resolves. Reuse that result briefly.
+  if (isNotificationListRequest(method, endpoint)) {
+    const cached = shortGetCache.get(requestKey);
+    if (cached && cached.expiresAt > Date.now()) return cached.data;
+    if (cached) shortGetCache.delete(requestKey);
+  }
 
+  if (method !== "GET" && endpoint.startsWith("/notifications")) {
+    clearNotificationCache();
+  }
+  if (["/auth/logout", "/auth/login", "/auth/register"].includes(endpoint)) {
+    shortGetCache.clear();
+  }
+
+  const fetchPromise = (async () => {
+    const isFormData =
+      typeof FormData !== "undefined" && options.body instanceof FormData;
+
+    const response = await fetch(`${API_BASE_URL}${endpoint}`, {
+      ...options,
+      credentials: "include",
+      headers: {
+        ...(isFormData ? {} : { "Content-Type": "application/json" }),
+        ...options.headers,
+      },
+    });
+
+    let data;
+    try {
+      data = await response.json();
+    } catch {
+      data = {};
+    }
+
+    if (!response.ok) {
+      const error = new Error(
+        data.message || `Request failed with status ${response.status}`,
+      );
+      error.status = response.status;
+      error.code = data.code;
+      throw error;
+    }
+
+    return data;
+  })();
+
+  if (method !== "GET") return fetchPromise;
+
+  inFlightGetRequests.set(requestKey, fetchPromise);
   try {
-    data = await response.json();
-  } catch {
-    data = {};
+    const data = await fetchPromise;
+    if (isNotificationListRequest(method, endpoint)) {
+      shortGetCache.set(requestKey, {
+        data,
+        expiresAt: Date.now() + NOTIFICATION_CACHE_TTL_MS,
+      });
+    }
+    return data;
+  } finally {
+    if (inFlightGetRequests.get(requestKey) === fetchPromise) {
+      inFlightGetRequests.delete(requestKey);
+    }
   }
-
-  if (!response.ok) {
-    const error = new Error(
-      data.message || `Request failed with status ${response.status}`,
-    );
-    error.status = response.status;
-    error.code = data.code;
-    throw error;
-  }
-
-  return data;
 }
 
 const api = {

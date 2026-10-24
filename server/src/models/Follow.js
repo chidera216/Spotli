@@ -26,6 +26,10 @@ const followSchema = new mongoose.Schema(
   },
 );
 
+// Compound indexes support the two profile-count queries without scanning all follows.
+followSchema.index({ following: 1, status: 1 });
+followSchema.index({ follower: 1, status: 1 });
+
 // A user can follow another user only once.
 followSchema.index({ follower: 1, following: 1 }, { unique: true });
 

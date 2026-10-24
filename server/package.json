@@ -6,7 +6,8 @@
   "main": "src/app.js",
   "scripts": {
     "start": "node src/app.js",
-    "dev": "nodemon src/app.js"
+    "dev": "nodemon src/app.js",
+    "indexes:follow": "node src/scripts/ensureFollowIndexes.js"
   },
   "dependencies": {
     "bcryptjs": "^3.0.3",

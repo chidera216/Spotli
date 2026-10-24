@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { useNavigate } from "react-router-dom";
 
@@ -38,6 +38,85 @@ function getMediaUrl(url) {
   if (/^https?:\/\//i.test(url)) return url;
 
   return `${API_ORIGIN}${url.startsWith("/") ? "" : "/"}${url}`;
+}
+
+function optimizeImage(url, width = 480) {
+  if (!url || typeof url !== "string") return "";
+
+  // Only transform Cloudinary image/auto assets. Keep video URLs and other
+  // storage providers untouched so their URLs continue to work as before.
+  if (
+    !/res\.cloudinary\.com\//i.test(url) ||
+    !/\/(?:image|auto)\/upload\//i.test(url) ||
+    /\.(?:mp4|mov|m4v|webm|avi|mkv|m3u8)(?:$|\?)/i.test(url)
+  ) {
+    return url;
+  }
+
+  const uploadMarker = /\/(image|auto)\/upload\//i;
+  const match = url.match(uploadMarker);
+  if (!match) return url;
+
+  // Avoid repeatedly transforming URLs that already specify image delivery
+  // settings. This also prevents malformed/doubled Cloudinary transformations.
+  const afterUpload = url.slice(match.index + match[0].length);
+  const firstPathSegment = afterUpload.split("/")[0];
+  if (
+    /^(?:f_auto|q_auto|w_\d+|h_\d+|c_fill|c_limit|c_scale|g_auto|ar_\d+)(?:,|$)/i.test(
+      firstPathSegment,
+    )
+  ) {
+    return url;
+  }
+
+  return url.replace(
+    uploadMarker,
+    `/$1/upload/f_auto,q_auto,w_${width},c_limit/`,
+  );
+}
+
+function getVideoCoverUrl(post) {
+  const explicit = [
+    post?.customThumbnail,
+    post?.thumbnailUrl,
+    post?.thumbnail,
+    post?.posterUrl,
+    post?.poster,
+    post?.previewImage,
+    post?.coverImage,
+  ]
+    .map((value) => {
+      if (typeof value === "string") return value.trim();
+      if (value && typeof value === "object") {
+        return value.url || value.secure_url || value.src || "";
+      }
+      return "";
+    })
+    .find(Boolean);
+
+  if (explicit) return getMediaUrl(explicit);
+
+  const rawVideo =
+    post?.mediaUrl ||
+    post?.videoUrl ||
+    post?.video ||
+    (typeof post?.media === "string" ? post.media : "");
+  const videoUrl =
+    typeof rawVideo === "string"
+      ? rawVideo
+      : rawVideo?.url || rawVideo?.secure_url || "";
+  const marker = "/video/upload/";
+  const index = videoUrl.indexOf(marker);
+
+  if (index < 0) return "";
+
+  const assetPath = videoUrl.slice(index + marker.length).split("?")[0];
+  const withoutExtension = assetPath.replace(
+    /\.(mp4|mov|m4v|webm|avi|mkv)$/i,
+    "",
+  );
+
+  return `${videoUrl.slice(0, index + marker.length)}so_0,w_240,c_limit,q_auto,f_jpg/${withoutExtension}.jpg`;
 }
 
 function formatCount(value) {
@@ -126,17 +205,22 @@ function getPostMedia(post) {
     ...(Array.isArray(post.photos) ? post.photos : []),
   ];
 
+  // Video cards must use an image thumbnail, never the actual video URL.
+  // Passing a .webm URL to <img> triggers a media download but cannot render a cover.
+  if (!isPhoto) {
+    const thumbnail = thumbnailCandidates.map(extractMediaValue).find(Boolean);
+    return thumbnail ? getMediaUrl(thumbnail) : getVideoCoverUrl(post);
+  }
+
   const mediaCandidates = [
     ...thumbnailCandidates,
-
-    ...(isPhoto ? [post.mediaUrl, post.media] : []),
-
+    post.mediaUrl,
+    post.media,
     ...collectionCandidates,
   ];
 
   const media = mediaCandidates.map(extractMediaValue).find(Boolean);
-
-  return getMediaUrl(media);
+  return media ? getMediaUrl(media) : "";
 }
 
 function getPostVideoUrl(post) {
@@ -173,10 +257,8 @@ function getInitials(name) {
   );
 }
 
-function ProfilePostCard({ post, onOpenPost, onRemoveBookmark }) {
+function ProfilePostCard({ post, onOpenPost, onRemoveBookmark, index = 99 }) {
   const media = getPostMedia(post);
-
-  const videoMedia = getPostVideoUrl(post);
 
   const isPhoto = isPhotoPost(post);
 
@@ -188,11 +270,6 @@ function ProfilePostCard({ post, onOpenPost, onRemoveBookmark }) {
 
   const [thumbnailFailed, setThumbnailFailed] = useState(false);
 
-  const [videoFailed, setVideoFailed] = useState(false);
-
-  const showVideoFallback =
-    !isPhoto && (!media || thumbnailFailed) && videoMedia && !videoFailed;
-
   return (
     <article className="min-w-0">
       <button
@@ -203,20 +280,13 @@ function ProfilePostCard({ post, onOpenPost, onRemoveBookmark }) {
       >
         {media && !thumbnailFailed ? (
           <img
-            src={media}
+            src={optimizeImage(media, 320)}
             alt={caption || "Post media"}
-            loading="lazy"
+            loading={index < 4 ? "eager" : "lazy"}
+            fetchPriority={index < 4 ? "high" : "auto"}
+            decoding="async"
             onError={() => setThumbnailFailed(true)}
             className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-[1.02]"
-          />
-        ) : showVideoFallback ? (
-          <video
-            src={videoMedia}
-            muted
-            playsInline
-            preload="metadata"
-            onError={() => setVideoFailed(true)}
-            className="h-full w-full object-cover"
           />
         ) : isPhoto && media ? (
           <span className="flex h-full items-center justify-center text-gray-400">
@@ -423,9 +493,15 @@ export default function Profile({ onOpenVideo, onOpenPhoto }) {
 
   const [bookmarkError, setBookmarkError] = useState("");
 
-  const [followersCount, setFollowersCount] = useState(0);
+  // Use counts already present in the authenticated user payload immediately,
+  // then refresh them from the follow-stats endpoint in the background.
+  const [followersCount, setFollowersCount] = useState(
+    Number(user?.followersCount ?? user?.followers ?? 0) || 0,
+  );
 
-  const [followingCount, setFollowingCount] = useState(0);
+  const [followingCount, setFollowingCount] = useState(
+    Number(user?.followingCount ?? user?.following ?? 0) || 0,
+  );
 
   const [followListType, setFollowListType] = useState("");
 
@@ -440,6 +516,12 @@ export default function Profile({ onOpenVideo, onOpenPhoto }) {
   const [errorMessage, setErrorMessage] = useState("");
 
   const [activeTab, setActiveTab] = useState("All Posts");
+  const [hasMorePosts, setHasMorePosts] = useState(false);
+  const [isLoadingMorePosts, setIsLoadingMorePosts] = useState(false);
+  const pageRef = useRef(1);
+  const loadingMoreRef = useRef(false);
+  const hasMoreRef = useRef(false);
+  const sentinelRef = useRef(null);
 
   const [avatarFailed, setAvatarFailed] = useState(false);
 
@@ -478,6 +560,14 @@ export default function Profile({ onOpenVideo, onOpenPhoto }) {
   const navigate = useNavigate();
 
   useEffect(() => {
+    // Keep displayed counts in sync if auth restores or refreshes the user.
+    setFollowersCount(
+      Number(user?.followersCount ?? user?.followers ?? 0) || 0,
+    );
+    setFollowingCount(
+      Number(user?.followingCount ?? user?.following ?? 0) || 0,
+    );
+
     const userId = String(user?._id || user?.id || "");
 
     if (!userId) return undefined;
@@ -514,7 +604,7 @@ export default function Profile({ onOpenVideo, onOpenPhoto }) {
     "creator"
   ).replace(/^@/, "");
 
-  const avatar = getMediaUrl(user?.avatar);
+  const avatar = optimizeImage(getMediaUrl(user?.avatar), 256);
 
   function openEditProfile() {
     setEditForm({
@@ -647,6 +737,10 @@ export default function Profile({ onOpenVideo, onOpenPhoto }) {
     async function loadPosts() {
       setIsLoading(true);
       setErrorMessage("");
+      setHasMorePosts(false);
+      hasMoreRef.current = false;
+      pageRef.current = 1;
+      loadingMoreRef.current = false;
 
       if (!userId) {
         setPosts([]);
@@ -656,12 +750,17 @@ export default function Profile({ onOpenVideo, onOpenPhoto }) {
 
       try {
         // Fetch this creator's posts directly instead of downloading 100 global posts.
-        const result = await api.users.getCreatorPosts(userId, 1, 100);
+        const result = await api.users.getCreatorPosts(userId, 1, 6);
 
         if (!Array.isArray(result.posts))
           throw new Error("The server returned an invalid posts response.");
 
-        if (active) setPosts(result.posts);
+        if (active) {
+          setPosts(result.posts);
+          pageRef.current = 1;
+          hasMoreRef.current = Boolean(result.pagination?.hasNextPage);
+          setHasMorePosts(hasMoreRef.current);
+        }
       } catch (error) {
         if (active)
           setErrorMessage(error.message || "Unable to load your posts.");
@@ -792,6 +891,63 @@ export default function Profile({ onOpenVideo, onOpenPhoto }) {
     return ownPosts;
   }, [activeTab, ownPosts, savedPosts]);
 
+  useEffect(() => {
+    const element = sentinelRef.current;
+    if (!element || !hasMorePosts || isLoading || isLoadingMorePosts) {
+      return undefined;
+    }
+
+    const observer = new IntersectionObserver(
+      async ([entry]) => {
+        if (
+          !entry.isIntersecting ||
+          loadingMoreRef.current ||
+          !hasMoreRef.current
+        ) {
+          return;
+        }
+
+        const userId = String(user?._id || user?.id || "");
+        if (!userId) return;
+
+        loadingMoreRef.current = true;
+        setIsLoadingMorePosts(true);
+        const nextPage = pageRef.current + 1;
+
+        try {
+          const result = await api.users.getCreatorPosts(userId, nextPage, 6);
+          if (!Array.isArray(result.posts)) {
+            throw new Error("The server returned an invalid posts response.");
+          }
+
+          setPosts((current) => {
+            const existingIds = new Set(
+              current.map((post) => String(post._id || post.id)),
+            );
+            return [
+              ...current,
+              ...result.posts.filter(
+                (post) => !existingIds.has(String(post._id || post.id)),
+              ),
+            ];
+          });
+          pageRef.current = nextPage;
+          hasMoreRef.current = Boolean(result.pagination?.hasNextPage);
+          setHasMorePosts(hasMoreRef.current);
+        } catch (error) {
+          console.error("Unable to load more profile posts:", error.message);
+        } finally {
+          loadingMoreRef.current = false;
+          setIsLoadingMorePosts(false);
+        }
+      },
+      { rootMargin: "250px" },
+    );
+
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [hasMorePosts, isLoading, isLoadingMorePosts, user?._id, user?.id]);
+
   const photoCount = ownPosts.filter(isPhotoPost).length;
 
   const videoCount = ownPosts.length - photoCount;
@@ -869,8 +1025,10 @@ export default function Profile({ onOpenVideo, onOpenPhoto }) {
               <div className="relative mx-auto h-24 w-24 shrink-0 rounded-full bg-neutral-100 sm:mx-0 sm:h-28 sm:w-28 lg:h-44 lg:w-44">
                 {avatar && !avatarFailed ? (
                   <img
-                    src={avatar}
+                    src={optimizeImage(avatar, 360)}
                     alt={`${fullName}'s profile`}
+                    fetchPriority="high"
+                    decoding="async"
                     onError={() => setAvatarFailed(true)}
                     className="h-full w-full rounded-full object-cover"
                   />
@@ -1036,24 +1194,30 @@ export default function Profile({ onOpenVideo, onOpenPhoto }) {
               </button>
             </div>
           ) : visiblePosts.length ? (
-            <div className="mt-4 grid grid-cols-2 gap-1.5 md:grid-cols-3 sm:gap-2.5 lg:gap-3">
-              {visiblePosts.map((post) => (
-                <ProfilePostCard
-                  key={post._id || post.id}
-                  post={post}
-                  onRemoveBookmark={
-                    activeTab === "Bookmarks" ? removeSavedPost : undefined
-                  }
-                  onOpenPost={() =>
-                    (isPhotoPost(post) ? onOpenPhoto : onOpenVideo)?.(
-                      post,
-
-                      activeTab === "Bookmarks" ? savedPosts : ownPosts,
-                    )
-                  }
-                />
-              ))}
-            </div>
+            <>
+              <div className="mt-4 grid grid-cols-2 gap-1.5 md:grid-cols-3 sm:gap-2.5 lg:gap-3">
+                {visiblePosts.map((post, index) => (
+                  <ProfilePostCard
+                    key={post._id || post.id}
+                    post={post}
+                    index={index}
+                    onRemoveBookmark={
+                      activeTab === "Bookmarks" ? removeSavedPost : undefined
+                    }
+                    onOpenPost={() =>
+                      (isPhotoPost(post) ? onOpenPhoto : onOpenVideo)?.(
+                        post,
+                        activeTab === "Bookmarks" ? savedPosts : ownPosts,
+                      )
+                    }
+                  />
+                ))}
+              </div>
+              {hasMorePosts && (
+                <div ref={sentinelRef} className="h-px" aria-hidden="true" />
+              )}
+              {isLoadingMorePosts && <div className="h-4" aria-hidden="true" />}
+            </>
           ) : (
             <div className="mt-4 flex min-h-64 flex-col items-center justify-center px-5 text-center">
               <div className="grid h-12 w-12 place-items-center rounded-full bg-neutral-100 text-neutral-800">
