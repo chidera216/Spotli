@@ -6,6 +6,10 @@ import Stories from "../components/Stories";
 import CategoryFilters from "../components/CategoryFilters";
 import PostGrid from "../components/PostGrid";
 import api from "../services/api";
+import {
+  getCloudinaryVideoThumbnailUrl,
+  isVideoMediaUrl,
+} from "../services/media";
 
 const BRAND = "#FF2D4A";
 
@@ -99,7 +103,10 @@ function normalizePost(post) {
   const isPhoto = mediaType === "photo" || mediaType === "image";
 
   const mediaUrl = getMediaUrl(post.mediaUrl);
-  const thumbnailUrl = getMediaUrl(post.thumbnailUrl);
+  const storedThumbnailUrl = getMediaUrl(post.thumbnailUrl);
+  const thumbnailUrl =
+    (isVideoMediaUrl(storedThumbnailUrl) ? "" : storedThumbnailUrl) ||
+    getCloudinaryVideoThumbnailUrl(mediaUrl);
 
   return {
     ...post,

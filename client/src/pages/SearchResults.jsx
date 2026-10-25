@@ -15,6 +15,7 @@ import {
   LoaderCircle,
 } from "lucide-react";
 import api from "../services/api";
+import { getCloudinaryVideoThumbnailUrl } from "../services/media";
 
 const API_ORIGIN = (
   import.meta.env.VITE_API_URL || "http://localhost:5000/api"
@@ -115,12 +116,15 @@ function Avatar({ person, size = "h-12 w-12" }) {
 
 function PostTile({ post, query, onOpen }) {
   const photo = isPhoto(post);
+  const video = mediaUrl(post.mediaUrl || post.mediaUrls?.[0]);
   const image = mediaUrl(
     photo
       ? post.mediaUrls?.[0] || post.mediaUrl || post.imageUrl
-      : post.thumbnailUrl || post.thumbnail || post.previewUrl || "",
+      : post.thumbnailUrl ||
+          post.thumbnail ||
+          post.previewUrl ||
+          getCloudinaryVideoThumbnailUrl(video, 720, 720),
   );
-  const video = mediaUrl(post.mediaUrl || post.mediaUrls?.[0]);
   const creator = post.creator || post.user || {};
   const likes = postLikes(post);
   const comments = postComments(post);
@@ -160,7 +164,7 @@ function PostTile({ post, query, onOpen }) {
                 src={video}
                 muted
                 playsInline
-                preload="metadata"
+                preload="none"
                 className="h-full w-full object-cover"
               />
             ) : (

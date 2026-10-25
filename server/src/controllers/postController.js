@@ -9,6 +9,33 @@ import Notification from "../models/Notification.js";
 import Follow from "../models/Follow.js";
 import { createMentionNotifications } from "../utils/mentions.js";
 import cloudinary from "../config/cloudinary.js";
+import { queueCloudinaryHls } from "../utils/cloudinaryHls.js";
+
+function getCloudinaryVideoThumbnailUrl(videoUrl) {
+  if (typeof videoUrl !== "string" || !videoUrl.trim()) return "";
+
+  const marker = "/video/upload/";
+  const markerIndex = videoUrl.indexOf(marker);
+  if (
+    markerIndex === -1 ||
+    !/^https?:\/\/res\.cloudinary\.com\//i.test(videoUrl)
+  ) {
+    return "";
+  }
+
+  const assetPath = videoUrl
+    .slice(markerIndex + marker.length)
+    .split(/[?#]/, 1)[0];
+  if (!assetPath || assetPath.split("/")[0].includes(",")) return "";
+
+  const assetPathWithoutExtension = assetPath.replace(
+    /\.(mp4|mov|m4v|webm|avi|mkv)$/i,
+    "",
+  );
+  if (!assetPathWithoutExtension) return "";
+
+  return `${videoUrl.slice(0, markerIndex + marker.length)}so_0,w_720,h_405,c_fill,q_auto,f_jpg/${assetPathWithoutExtension}.jpg`;
+}
 
 export async function getPosts(req, res) {
   try {
@@ -305,6 +332,13 @@ export async function createPost(req, res) {
       thumbnailUrl = thumbnailFile ? `/uploads/${thumbnailFile.filename}` : "";
     }
 
+    // Every Cloudinary video gets a lightweight poster URL even when the
+    // creator did not upload a custom thumbnail. This is a URL transformation,
+    // not another upload or a backend video-processing job.
+    if (mediaType === "video" && !thumbnailUrl && mediaUrls[0]) {
+      thumbnailUrl = getCloudinaryVideoThumbnailUrl(mediaUrls[0]);
+    }
+
     if (caption.length > 2000) {
       return res.status(400).json({
         success: false,
@@ -323,6 +357,24 @@ export async function createPost(req, res) {
       mediaResourceTypes,
       thumbnailPublicId,
     });
+
+    // Queue adaptive HLS generation for newly published Cloudinary videos.
+    // Do not await this job: post publishing and the Home feed stay responsive
+    // while Cloudinary prepares the master playlist and media segments.
+    if (mediaType === "video" && mediaPublicIds[0]) {
+      void queueCloudinaryHls(mediaPublicIds[0])
+        .then(() => {
+          console.info(
+            `Cloudinary HLS preparation queued for ${mediaPublicIds[0]}`,
+          );
+        })
+        .catch((hlsError) => {
+          console.error(
+            `Cloudinary HLS preparation failed for ${mediaPublicIds[0]}:`,
+            hlsError.message,
+          );
+        });
+    }
 
     try {
       const mentionedUsers = await createMentionNotifications({

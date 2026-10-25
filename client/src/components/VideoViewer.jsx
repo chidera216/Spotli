@@ -61,6 +61,1255 @@ function getSavedPlaybackPreference(key, fallback) {
   }
 }
 
+// Request a browser-friendly, bandwidth-conscious Cloudinary rendition for playback.
+// Non-Cloudinary media URLs are left unchanged.
+function getOptimizedPlaybackUrl(value) {
+  if (typeof value !== "string" || !value) return value;
+
+  const marker = "/video/upload/";
+  const markerIndex = value.indexOf(marker);
+  if (markerIndex === -1 || !/https?:\/\/res\.cloudinary\.com\//i.test(value)) {
+    return value;
+  }
+
+  const pathStart = markerIndex + marker.length;
+  const remainder = value.slice(pathStart);
+  const firstSegment = remainder.split("/")[0];
+
+  // Avoid stacking transformations on URLs that are already transformed.
+  if (firstSegment.includes(",")) return value;
+
+  // This is only a fallback when adaptive HLS cannot be used or is still being
+  // prepared. Keep it light on constrained links so a missing HLS manifest does
+  // not force a large progressive MP4 to download before the first frame.
+  const profile = getNetworkPlaybackProfile();
+  const width =
+    profile.startupHeight <= 240
+      ? 426
+      : profile.startupHeight <= 360
+        ? 640
+        : 960;
+  const bitrate =
+    profile.startupHeight <= 240
+      ? "350k"
+      : profile.startupHeight <= 360
+        ? "600k"
+        : "900k";
+  const quality = profile.constrained ? "q_auto:eco" : "q_auto:good";
+  const transformation = `c_limit,w_${width},br_${bitrate},vc_h264,${quality},f_mp4`;
+  return `${value.slice(0, pathStart)}${transformation}/${remainder}`;
+}
+
+// Return the same lightweight Cloudinary first-frame thumbnail used by the
+// Home grid. Reusing the exact URL lets the browser's image cache carry the
+// preview into the viewer while the HLS stream is attaching and buffering.
+function getCloudinaryVideoThumbnailUrl(value, width = 720, height = 405) {
+  if (typeof value !== "string" || !value.trim()) return "";
+
+  const url = value.trim();
+  if (!/^https?:\/\/res\.cloudinary\.com\//i.test(url)) return "";
+
+  const marker = "/video/upload/";
+  const markerIndex = url.indexOf(marker);
+  if (markerIndex < 0) return "";
+
+  const pathStart = markerIndex + marker.length;
+  let assetPath = url.slice(pathStart).split(/[?#]/, 1)[0];
+  const firstSegment = assetPath.split("/")[0];
+
+  // Strip any existing transformation segment rather than stacking another.
+  if (firstSegment.includes(",")) {
+    assetPath = assetPath.slice(firstSegment.length).replace(/^\/+/, "");
+  }
+
+  assetPath = assetPath.replace(/\.(mp4|mov|m4v|webm|avi|mkv)$/i, "");
+  if (!assetPath || !assetPath.includes("/")) return "";
+
+  return `${url.slice(0, pathStart)}so_0,w_${width},h_${height},c_fill,q_auto,f_jpg/${assetPath}.jpg`;
+}
+
+function getExplicitPostThumbnail(post) {
+  const candidates = [
+    post?.customThumbnail,
+    post?.thumbnailUrl,
+    post?.thumbnail,
+    post?.posterUrl,
+    post?.poster,
+    post?.previewImage,
+    post?.coverImage,
+    post?.imageUrl,
+    post?.image,
+  ];
+
+  for (const value of candidates) {
+    const candidate =
+      typeof value === "string"
+        ? value
+        : value && typeof value === "object"
+          ? value.url ||
+            value.src ||
+            value.imageUrl ||
+            value.secure_url ||
+            value.path ||
+            ""
+          : "";
+
+    if (typeof candidate !== "string" || !candidate.trim()) continue;
+    // Never mistake an MP4/MOV/WebM source URL for a still-image poster.
+    if (/\.(mp4|mov|m4v|webm|avi|mkv)(?:[?#]|$)/i.test(candidate)) continue;
+    return candidate.trim();
+  }
+
+  return "";
+}
+
+function getCloudinaryHlsUrl(value) {
+  if (
+    typeof value !== "string" ||
+    !/^https?:\/\/res\.cloudinary\.com\//i.test(value)
+  ) {
+    return "";
+  }
+
+  const marker = "/video/upload/";
+  const markerIndex = value.indexOf(marker);
+  if (markerIndex < 0) return "";
+
+  const pathStart = markerIndex + marker.length;
+  let assetPath = value.slice(pathStart).split(/[?#]/, 1)[0];
+  const firstSegment = assetPath.split("/")[0];
+
+  // Match the eagerly generated HLS stream prepared while the post is
+  // published. This avoids asking Cloudinary to build sp_auto renditions on
+  // the viewer's first request, which caused the first-open delay.
+  if (firstSegment.includes(",")) {
+    assetPath = assetPath.slice(firstSegment.length).replace(/^\/+/, "");
+  }
+
+  assetPath = assetPath.replace(/\.(mp4|mov|m4v|webm|avi|mkv)$/i, "");
+  if (!assetPath || !assetPath.includes("/")) return "";
+
+  return `${value.slice(0, pathStart)}sp_full_hd/${assetPath}.m3u8`;
+}
+
+// Choose a network-aware first rendition for Auto playback. The player can
+// improve quality after the first fragment is buffered; manually selected quality
+// remains respected and is not silently downgraded.
+function getNetworkPlaybackProfile() {
+  const connection =
+    typeof navigator !== "undefined"
+      ? navigator.connection ||
+        navigator.mozConnection ||
+        navigator.webkitConnection
+      : null;
+  const effectiveType = String(connection?.effectiveType || "").toLowerCase();
+  const downlink = Number(connection?.downlink);
+  const hasDownlink = Number.isFinite(downlink) && downlink > 0;
+  const saveData = connection?.saveData === true;
+  const touchDevice =
+    typeof navigator !== "undefined" &&
+    ((Number(navigator.maxTouchPoints) || 0) > 0 ||
+      (typeof window !== "undefined" &&
+        typeof window.matchMedia === "function" &&
+        window.matchMedia("(pointer: coarse)").matches));
+
+  const verySlow =
+    saveData ||
+    effectiveType === "slow-2g" ||
+    effectiveType === "2g" ||
+    (hasDownlink && downlink < 0.65);
+  const knownWeakLink = hasDownlink && downlink < 1.2;
+  const slow =
+    verySlow ||
+    (effectiveType === "3g" && knownWeakLink) ||
+    (hasDownlink && downlink < 1.8);
+
+  // Start Auto at the clearest rendition that fits a conservative share of
+  // the reported connection. Even very slow links may be able to sustain an
+  // efficient 360p rendition; limiting every weak connection to 240p made the
+  // feed look needlessly blurry. Auto ABR can still step down if real throughput
+  // proves insufficient, and a manual quality choice remains locked.
+  const unknownMobileLink = touchDevice && !hasDownlink;
+  const startupHeight = slow || unknownMobileLink ? 360 : 480;
+
+  let defaultBandwidthEstimate = touchDevice ? 350_000 : 550_000;
+  if (verySlow) {
+    defaultBandwidthEstimate = 180_000;
+  } else if (knownWeakLink) {
+    defaultBandwidthEstimate = Math.max(
+      200_000,
+      Math.min(360_000, downlink * 500_000),
+    );
+  } else if (hasDownlink) {
+    defaultBandwidthEstimate = Math.max(
+      350_000,
+      Math.min(1_600_000, downlink * 750_000),
+    );
+  }
+
+  // Network Information's downlink is an estimate, not a guarantee. Use most
+  // of it for the opening fragment so we don't default to the smallest variant;
+  // HLS.js starts adapting from measured fragment throughput immediately after.
+  const startupBandwidthBudget = hasDownlink
+    ? Math.max(180_000, Math.min(3_500_000, downlink * 1_000_000 * 0.85))
+    : defaultBandwidthEstimate * (slow ? 1.45 : 1.55);
+
+  return {
+    touchDevice,
+    startupHeight,
+    startupBandwidthBudget,
+    constrained: slow,
+    defaultBandwidthEstimate,
+  };
+}
+
+// Warm only the master playlist and lightweight rendition playlist before a video
+// is opened. Never prefetch media segments in the background by default: on slow
+// networks those downloads can monopolize bandwidth and delay active playback.
+const hlsManifestPreloads = new Map();
+const hlsManifestPreloadControllers = new Map();
+const hlsManifestPreloadCompleted = new Set();
+const hlsManifestPreloadStartedAt = new Map();
+
+// Share HLS playlist/segment bytes between the lightweight Home prewarmer and
+// the real HLS.js player. Without this, fetch() can download a first segment
+// and HLS.js immediately downloads the same segment again (especially when
+// DevTools has Disable cache enabled). Keep the cache small for mobile devices.
+const hlsWarmResourceCache = new Map();
+const hlsWarmResourcePromises = new Map();
+let hlsWarmResourceCacheBytes = 0;
+const HLS_WARM_CACHE_MAX_BYTES = 4 * 1024 * 1024;
+const HLS_WARM_CACHE_MAX_ENTRY_BYTES = 2 * 1024 * 1024;
+
+function getWarmResource(url, type) {
+  const entry = hlsWarmResourceCache.get(url);
+  if (!entry || entry.type !== type) return null;
+  // Refresh insertion order for simple LRU eviction.
+  hlsWarmResourceCache.delete(url);
+  hlsWarmResourceCache.set(url, entry);
+  return entry.data;
+}
+
+function setWarmResource(url, type, data) {
+  const size = type === "text" ? data.length * 2 : data?.byteLength || 0;
+
+  // Avoid retaining unusually large fragments in memory. They can still be
+  // passed directly to a player already waiting on the shared promise.
+  if (
+    !Number.isFinite(size) ||
+    size <= 0 ||
+    size > HLS_WARM_CACHE_MAX_ENTRY_BYTES
+  ) {
+    return;
+  }
+
+  const previous = hlsWarmResourceCache.get(url);
+  if (previous) {
+    hlsWarmResourceCacheBytes -= previous.size;
+    hlsWarmResourceCache.delete(url);
+  }
+
+  while (
+    hlsWarmResourceCache.size &&
+    hlsWarmResourceCacheBytes + size > HLS_WARM_CACHE_MAX_BYTES
+  ) {
+    const oldestKey = hlsWarmResourceCache.keys().next().value;
+    const oldest = hlsWarmResourceCache.get(oldestKey);
+    hlsWarmResourceCache.delete(oldestKey);
+    hlsWarmResourceCacheBytes -= oldest?.size || 0;
+  }
+
+  hlsWarmResourceCache.set(url, { type, data, size });
+  hlsWarmResourceCacheBytes += size;
+}
+
+function getOrLoadWarmResource(url, type, loader) {
+  const cached = getWarmResource(url, type);
+  if (cached != null) return Promise.resolve(cached);
+
+  const inFlight = hlsWarmResourcePromises.get(url);
+  if (inFlight?.type === type) return inFlight.promise;
+
+  const startedAt =
+    typeof performance !== "undefined" ? performance.now() : Date.now();
+  const promise = Promise.resolve()
+    .then(loader)
+    .then((data) => {
+      const finishedAt =
+        typeof performance !== "undefined" ? performance.now() : Date.now();
+      setWarmResource(url, type, data);
+      const durationMs = Math.max(1, finishedAt - startedAt);
+      const entry = hlsWarmResourceCache.get(url);
+      if (entry) entry.durationMs = durationMs;
+      return data;
+    })
+    .finally(() => {
+      if (hlsWarmResourcePromises.get(url)?.promise === promise) {
+        hlsWarmResourcePromises.delete(url);
+      }
+    });
+
+  hlsWarmResourcePromises.set(url, { type, promise });
+  return promise;
+}
+// Keep a tiny cache of prepared starts. A whole feed's worth of media preloads
+// competes with the active stream on slow mobile connections.
+const HLS_PREFETCH_CACHE_LIMIT = 2;
+
+// When a video opens, stop unfinished background preloads so they do not
+// compete with the active stream. Keep completed resources for the active video;
+// the browser may reuse them from HTTP cache when caching is enabled.
+function cancelCloudinaryVideoPreloadsExcept(activeHlsUrl) {
+  const keepPrefix = `${activeHlsUrl}::`;
+  for (const [key, controller] of hlsManifestPreloadControllers) {
+    // Keep the current video's playlist/segment preparation alive even if it is
+    // still in flight. Aborting it on tap throws away the head start and can
+    // force the same resources to be requested again. Cancel only other videos.
+    if (key.startsWith(keepPrefix)) continue;
+
+    controller.abort();
+    hlsManifestPreloadControllers.delete(key);
+    hlsManifestPreloads.delete(key);
+    hlsManifestPreloadCompleted.delete(key);
+    hlsManifestPreloadStartedAt.delete(key);
+  }
+}
+
+async function fetchCachedText(url, signal) {
+  return getOrLoadWarmResource(url, "text", async () => {
+    const response = await fetch(url, {
+      method: "GET",
+      mode: "cors",
+      credentials: "omit",
+      cache: "force-cache",
+      signal,
+    });
+    if (!response.ok)
+      throw new Error(`HLS preload failed (${response.status})`);
+    return response.text();
+  });
+}
+
+async function warmCachedResource(url, signal) {
+  return getOrLoadWarmResource(url, "arraybuffer", async () => {
+    const response = await fetch(url, {
+      method: "GET",
+      mode: "cors",
+      credentials: "omit",
+      cache: "force-cache",
+      signal,
+    });
+    if (!response.ok) {
+      throw new Error(`HLS segment preload failed (${response.status})`);
+    }
+    return response.arrayBuffer();
+  });
+}
+
+// HLS.js normally has its own XHR/fetch loader, which cannot reuse an in-flight
+// fetch() started by the Home prewarmer. Wrap its default loader so the actual
+// player consumes the prewarmer's cached/in-flight response when URLs match.
+// If there is no matching warm resource, this falls through immediately to the
+// standard loader without waiting for unrelated background work.
+function createWarmCacheLoader(Hls) {
+  const DefaultLoader = Hls?.DefaultConfig?.loader;
+  if (typeof DefaultLoader !== "function") return undefined;
+
+  return class WarmCacheLoader extends DefaultLoader {
+    constructor(config) {
+      super(config);
+      this.warmRequestAborted = false;
+    }
+
+    load(context, config, callbacks) {
+      const url = context?.url;
+      const type =
+        context?.responseType === "arraybuffer" ? "arraybuffer" : "text";
+
+      // Byte-range requests cannot safely use a cached whole-resource body.
+      if (!url || context.rangeStart != null || context.rangeEnd != null) {
+        return super.load(context, config, callbacks);
+      }
+
+      const cachedData = getWarmResource(url, type);
+      const inFlight = hlsWarmResourcePromises.get(url);
+      const sharedPromise =
+        cachedData != null
+          ? Promise.resolve(cachedData)
+          : inFlight?.type === type
+            ? inFlight.promise
+            : null;
+
+      if (!sharedPromise) return super.load(context, config, callbacks);
+
+      this.warmRequestAborted = false;
+      const startedAt =
+        typeof performance !== "undefined" ? performance.now() : Date.now();
+      sharedPromise
+        .then((data) => {
+          if (this.warmRequestAborted) return;
+
+          const finishedAt =
+            typeof performance !== "undefined" ? performance.now() : Date.now();
+          const byteLength =
+            type === "text" ? data.length * 2 : data?.byteLength || 0;
+          const cacheEntry = hlsWarmResourceCache.get(url);
+          const measuredDuration = cacheEntry?.durationMs || 0;
+          // Don't report a near-zero load time for memory hits: that can trick ABR
+          // into overestimating the real network and choosing an oversized rendition.
+          const effectiveDuration =
+            measuredDuration > 0
+              ? measuredDuration
+              : Math.max(50, ((byteLength * 8) / 350_000) * 1000);
+          const loadStart = Math.max(0, finishedAt - effectiveDuration);
+          const stats = {
+            aborted: false,
+            loaded: byteLength,
+            total: byteLength,
+            retry: 0,
+            chunkCount: 1,
+            bwEstimate: Math.max(
+              100_000,
+              Math.round((byteLength * 8 * 1000) / effectiveDuration),
+            ),
+            loading: { start: loadStart, first: loadStart, end: finishedAt },
+            parsing: { start: 0, end: 0 },
+            buffering: { start: 0, first: 0, end: 0 },
+          };
+
+          callbacks.onSuccess(
+            {
+              url,
+              data: type === "arraybuffer" ? data.slice(0) : data,
+              code: 200,
+            },
+            stats,
+            context,
+            null,
+          );
+        })
+        .catch(() => {
+          if (!this.warmRequestAborted) super.load(context, config, callbacks);
+        });
+    }
+
+    abort() {
+      this.warmRequestAborted = true;
+      super.abort();
+    }
+
+    destroy() {
+      this.warmRequestAborted = true;
+      super.destroy();
+    }
+  };
+}
+
+function resolvePlaylistUri(uri, baseUrl) {
+  try {
+    return new URL(uri.trim(), baseUrl).href;
+  } catch {
+    return "";
+  }
+}
+
+function parseHlsVariants(playlistText, playlistUrl) {
+  const lines = playlistText.split(/\r?\n/).map((line) => line.trim());
+  const variants = [];
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (!line.startsWith("#EXT-X-STREAM-INF:")) continue;
+
+    let uriIndex = index + 1;
+    while (
+      uriIndex < lines.length &&
+      (!lines[uriIndex] || lines[uriIndex].startsWith("#"))
+    ) {
+      uriIndex += 1;
+    }
+    if (uriIndex >= lines.length) continue;
+
+    const resolution = line.match(/RESOLUTION=(\d+)x(\d+)/i);
+    const bandwidth = line.match(/(?:AVERAGE-BANDWIDTH|BANDWIDTH)=(\d+)/i);
+    variants.push({
+      url: resolvePlaylistUri(lines[uriIndex], playlistUrl),
+      width: resolution ? Number(resolution[1]) : 0,
+      height: resolution ? Number(resolution[2]) : 0,
+      bandwidth: bandwidth ? Number(bandwidth[1]) : 0,
+    });
+  }
+
+  return variants.filter((variant) => variant.url);
+}
+
+function parseFirstMediaResources(playlistText, playlistUrl) {
+  const resources = [];
+  const mapMatch = playlistText.match(/#EXT-X-MAP:[^\r\n]*URI="([^"]+)"/i);
+  if (mapMatch) resources.push(resolvePlaylistUri(mapMatch[1], playlistUrl));
+
+  const lines = playlistText.split(/\r?\n/).map((line) => line.trim());
+  let expectingSegment = false;
+  for (const line of lines) {
+    if (line.startsWith("#EXTINF:")) {
+      expectingSegment = true;
+      continue;
+    }
+    if (expectingSegment && line && !line.startsWith("#")) {
+      resources.push(resolvePlaylistUri(line, playlistUrl));
+      break;
+    }
+  }
+
+  // Some playlists omit EXTINF on a partially generated initial response.
+  if (resources.length === 0) {
+    const firstMediaLine = lines.find((line) => line && !line.startsWith("#"));
+    if (firstMediaLine)
+      resources.push(resolvePlaylistUri(firstMediaLine, playlistUrl));
+  }
+
+  return [...new Set(resources.filter(Boolean))].slice(0, 2);
+}
+
+export function preloadCloudinaryVideoStream(
+  value,
+  preferredQuality = "auto",
+  options = {},
+) {
+  if (typeof window === "undefined" || typeof fetch !== "function") return;
+
+  const hlsUrl = getCloudinaryHlsUrl(value);
+  if (!hlsUrl) return;
+
+  // Home prewarming and active playback must target the same startup rendition
+  // in Auto mode so a ready resource can be reused instead of downloading a
+  // larger first fragment that the connection cannot sustain.
+  const parsedQuality =
+    preferredQuality === "auto" || preferredQuality == null
+      ? "auto"
+      : String(
+          Number.parseInt(String(preferredQuality).replace(/[^0-9]/g, ""), 10),
+        );
+  const qualityKey = parsedQuality === "NaN" ? "auto" : parsedQuality;
+  // Playlist-only prewarming by default. A large first segment can take many seconds
+  // on 3G and compete with the active stream; the active HLS player owns segments.
+  const includeFirstSegment = options?.includeFirstSegment === true;
+  const cacheKey = `${hlsUrl}::${qualityKey}::${includeFirstSegment ? "segment" : "playlist"}`;
+
+  if (hlsManifestPreloads.has(cacheKey)) {
+    return hlsManifestPreloads.get(cacheKey);
+  }
+
+  const controller =
+    typeof AbortController === "function" ? new AbortController() : null;
+  if (controller) hlsManifestPreloadControllers.set(cacheKey, controller);
+  hlsManifestPreloadStartedAt.set(cacheKey, Date.now());
+  const signal = controller?.signal;
+
+  const request = (async () => {
+    const masterText = await fetchCachedText(hlsUrl, signal);
+    const variants = parseHlsVariants(masterText, hlsUrl);
+
+    let startupVariant;
+
+    if (qualityKey !== "auto") {
+      const requestedHeight = Number(qualityKey);
+      const exact = variants
+        .filter((variant) => variant.height === requestedHeight)
+        .sort((a, b) => b.bandwidth - a.bandwidth)[0];
+      const lower = variants
+        .filter(
+          (variant) => variant.height > 0 && variant.height < requestedHeight,
+        )
+        .sort((a, b) => b.height - a.height || b.bandwidth - a.bandwidth)[0];
+      const any = variants
+        .filter((variant) => variant.height > 0)
+        .sort(
+          (a, b) =>
+            Math.abs(a.height - requestedHeight) -
+              Math.abs(b.height - requestedHeight) ||
+            a.height - b.height ||
+            b.bandwidth - a.bandwidth,
+        )[0];
+      startupVariant = exact || lower || any;
+    } else {
+      // Match the player's network-aware startup selection: prefer a 360p/480p
+      // variant within the startup bandwidth budget, rather than always warming
+      // the lowest-bitrate stream (which left Auto playback visibly blurry).
+      const profile = getNetworkPlaybackProfile();
+      const usableVariants = variants.filter((variant) => variant.height > 0);
+      const withinHeight = usableVariants.filter(
+        (variant) => variant.height <= profile.startupHeight,
+      );
+      const pool = withinHeight.length ? withinHeight : usableVariants;
+      const withinBudget = pool.filter(
+        (variant) =>
+          !variant.bandwidth ||
+          variant.bandwidth <= profile.startupBandwidthBudget,
+      );
+      startupVariant =
+        [...withinBudget].sort(
+          (a, b) => b.height - a.height || b.bandwidth - a.bandwidth,
+        )[0] ||
+        [...pool].sort(
+          (a, b) =>
+            (a.bandwidth || Number.POSITIVE_INFINITY) -
+              (b.bandwidth || Number.POSITIVE_INFINITY) || a.height - b.height,
+        )[0] ||
+        [...variants].sort(
+          (a, b) => a.height - b.height || a.bandwidth - b.bandwidth,
+        )[0];
+    }
+
+    if (!startupVariant) {
+      // A manifest-only prewarm is enough for off-screen mobile cards. Do not
+      // download a video segment for cards the viewer may never open.
+      if (includeFirstSegment) {
+        const resources = parseFirstMediaResources(masterText, hlsUrl);
+        await Promise.allSettled(
+          resources.map((url) => warmCachedResource(url, signal)),
+        );
+      }
+      hlsManifestPreloadCompleted.add(cacheKey);
+      return;
+    }
+
+    const mediaPlaylistText = await fetchCachedText(startupVariant.url, signal);
+    if (includeFirstSegment) {
+      const resources = parseFirstMediaResources(
+        mediaPlaylistText,
+        startupVariant.url,
+      );
+      await Promise.allSettled(
+        resources.map((url) => warmCachedResource(url, signal)),
+      );
+    }
+    // On success, preserve this prewarm when the active HLS player takes over.
+    hlsManifestPreloadCompleted.add(cacheKey);
+  })()
+    .catch(() => {
+      // Prefetch must never block playback; the active player retries normally.
+      // Do not let an older aborted task delete a newer request for the same URL.
+      hlsManifestPreloadCompleted.delete(cacheKey);
+      if (
+        !controller?.signal.aborted &&
+        hlsManifestPreloadControllers.get(cacheKey) === controller
+      ) {
+        hlsManifestPreloads.delete(cacheKey);
+      }
+    })
+    .finally(() => {
+      if (
+        controller &&
+        hlsManifestPreloadControllers.get(cacheKey) === controller
+      ) {
+        hlsManifestPreloadControllers.delete(cacheKey);
+        hlsManifestPreloadStartedAt.delete(cacheKey);
+      }
+    });
+
+  hlsManifestPreloads.set(cacheKey, request);
+
+  while (hlsManifestPreloads.size > HLS_PREFETCH_CACHE_LIMIT) {
+    const oldestKey = hlsManifestPreloads.keys().next().value;
+    if (!oldestKey || oldestKey === cacheKey) break;
+    hlsManifestPreloadControllers.get(oldestKey)?.abort();
+    hlsManifestPreloadControllers.delete(oldestKey);
+    hlsManifestPreloadCompleted.delete(oldestKey);
+    hlsManifestPreloadStartedAt.delete(oldestKey);
+    hlsManifestPreloads.delete(oldestKey);
+  }
+
+  return request;
+}
+
+let hlsLibraryPromise = null;
+
+function browserCanUseHlsJs() {
+  if (typeof window === "undefined") return false;
+  // hls.js uses MediaSource or ManagedMediaSource. Native-HLS-only browsers
+  // should not wait for, or download, the JavaScript HLS engine.
+  return (
+    typeof window.MediaSource !== "undefined" ||
+    typeof window.ManagedMediaSource !== "undefined"
+  );
+}
+
+function loadHlsLibrary() {
+  if (typeof window === "undefined") return Promise.resolve(null);
+  if (hlsLibraryPromise) return hlsLibraryPromise;
+
+  // Bundle hls.js with the app and request its split chunk while the Home feed
+  // is loading. This removes the extra third-party CDN round trip from the
+  // tap-to-play path on slower mobile/tablet connections.
+  hlsLibraryPromise = import("hls.js")
+    .then((module) => module.default || module)
+    .catch(() => {
+      hlsLibraryPromise = null;
+      return null;
+    });
+
+  return hlsLibraryPromise;
+}
+
+// Open the Cloudinary connection before a creator opens a video.
+if (typeof document !== "undefined") {
+  const origin = "https://res.cloudinary.com";
+  const alreadyLinked = [
+    ...document.querySelectorAll('link[rel="preconnect"]'),
+  ].some((link) => link.href === origin || link.href === `${origin}/`);
+  if (!alreadyLinked) {
+    const link = document.createElement("link");
+    link.rel = "preconnect";
+    link.href = origin;
+    link.crossOrigin = "anonymous";
+    document.head.appendChild(link);
+  }
+}
+
+// Start loading the local HLS chunk while the Home feed is visible. Skip it on
+// browsers that can only play native HLS, to avoid spending mobile bandwidth
+// on a library those browsers cannot use.
+if (browserCanUseHlsJs()) {
+  loadHlsLibrary();
+}
+
+function attachCloudinaryAdaptiveStream(
+  video,
+  originalUrl,
+  fallbackUrl,
+  shouldPlay,
+  onAutoplayNeedsMute,
+  onQualityOptionsChange,
+  onQualityControllerChange,
+  initialQuality = "auto",
+  resumeTime = 0,
+  onRememberPosition = null,
+) {
+  if (!video || !originalUrl || !fallbackUrl) return () => {};
+
+  const hlsUrl = getCloudinaryHlsUrl(originalUrl);
+  if (!hlsUrl) return () => {};
+
+  const initialQualityKey =
+    initialQuality === "auto" || initialQuality == null
+      ? "auto"
+      : String(
+          Number.parseInt(String(initialQuality).replace(/[^0-9]/g, ""), 10),
+        );
+  // Stop unfinished background work immediately on open. Waiting for an
+  // in-flight preloader made the viewer wait for the whole first segment (which
+  // took 17.8 seconds in the user's Network screenshot). Completed cacheable
+  // resources are kept; the active HLS player starts its own load right away.
+  cancelCloudinaryVideoPreloadsExcept(hlsUrl);
+
+  let cancelled = false;
+  let hls = null;
+  let networkRetries = 0;
+  let mediaRetries = 0;
+  let manualRecoveryAttempts = 0;
+  let hlsReadinessRetries = 0;
+  let hlsReadinessRetryTimer = null;
+  let selectedStreamQuality =
+    initialQualityKey === "NaN" ? "auto" : initialQualityKey;
+  let streamHasPlayed = false;
+  let streamLoadStarted = false;
+  // Start Auto at a network-aware low level, then re-enable adaptation once the
+  // first fragment is buffered. Auto can move up or down according to real
+  // throughput; manual quality selection remains fixed by selectedStreamQuality.
+  let autoStartupLevelPending = false;
+  const savedResumeTime = Number.isFinite(Number(resumeTime))
+    ? Math.max(0, Number(resumeTime))
+    : 0;
+  let resumePositionApplied = savedResumeTime < 0.5;
+
+  const rememberPosition = () => {
+    const time = Number(video.currentTime);
+    if (Number.isFinite(time) && time >= 0) onRememberPosition?.(time);
+  };
+
+  // Each post keeps its own playhead when the user scrolls away and comes back.
+  // HLS is reattached for the active post only, so restore the saved position
+  // once the new media element exposes metadata/seekability.
+  const restoreResumePosition = () => {
+    if (cancelled || resumePositionApplied || savedResumeTime < 0.5) return;
+    if (video.readyState < 1) return;
+
+    if (Number.isFinite(video.duration) && video.duration > 0) {
+      if (savedResumeTime >= video.duration - 0.35) {
+        resumePositionApplied = true;
+        return;
+      }
+    }
+
+    try {
+      if (Math.abs((Number(video.currentTime) || 0) - savedResumeTime) > 0.75) {
+        video.currentTime = savedResumeTime;
+      }
+      resumePositionApplied = true;
+    } catch {
+      // Retry on canplay/durationchange if the stream is not seekable yet.
+    }
+  };
+
+  const onVideoPlaying = () => {
+    streamHasPlayed = true;
+    if (hlsReadinessRetryTimer != null) {
+      clearTimeout(hlsReadinessRetryTimer);
+      hlsReadinessRetryTimer = null;
+    }
+    rememberPosition();
+  };
+  video.addEventListener("playing", onVideoPlaying);
+  video.addEventListener("timeupdate", rememberPosition);
+  video.addEventListener("loadedmetadata", restoreResumePosition);
+  video.addEventListener("durationchange", restoreResumePosition);
+  video.addEventListener("canplay", restoreResumePosition);
+
+  const playIfRequested = () => {
+    if (cancelled || !shouldPlay()) return;
+
+    // Keep autoplay inline and set the DOM property too: the HLS source is
+    // attached after React renders, so the initial autoPlay attribute alone
+    // cannot start playback.
+    video.autoplay = true;
+    video.playsInline = true;
+
+    let playPromise;
+    try {
+      playPromise = video.play();
+    } catch {
+      return;
+    }
+
+    if (playPromise && typeof playPromise.catch === "function") {
+      playPromise.catch((error) => {
+        if (cancelled || !shouldPlay()) return;
+
+        // Browsers may reject autoplay when the saved sound preference is on.
+        // Retry silently and sync the viewer's mute control to the real state.
+        if (error?.name === "NotAllowedError" && !video.muted) {
+          video.muted = true;
+          onAutoplayNeedsMute?.();
+          video.play().catch(() => {});
+        }
+      });
+    }
+  };
+
+  const onMediaReady = () => playIfRequested();
+
+  video.addEventListener("loadeddata", onMediaReady);
+  video.addEventListener("canplay", onMediaReady);
+
+  const useProgressiveFallback = () => {
+    if (cancelled) return;
+    if (hls) {
+      hls.destroy();
+      hls = null;
+    }
+    onQualityControllerChange?.(null);
+    onQualityOptionsChange?.([]);
+    video.src = fallbackUrl;
+    video.load();
+    playIfRequested();
+  };
+
+  const onNativeHlsError = () => useProgressiveFallback();
+
+  const startNativeHls = () => {
+    if (cancelled) return;
+    onQualityControllerChange?.(null);
+    onQualityOptionsChange?.([]);
+    video.preload = "auto";
+    video.addEventListener("error", onNativeHlsError, { once: true });
+    video.src = hlsUrl;
+    video.load();
+    playIfRequested();
+  };
+
+  const start = async () => {
+    const nativeHlsSupported = Boolean(
+      video.canPlayType("application/vnd.apple.mpegurl"),
+    );
+
+    // iPhone/iPad Safari without MSE already has a native HLS decoder. Attach
+    // its source immediately instead of waiting for hls.js to download and then
+    // discovering that hls.js cannot run on this device.
+    if (!browserCanUseHlsJs() && nativeHlsSupported) {
+      startNativeHls();
+      return;
+    }
+
+    // Never wait on a speculative preload before playback. A completed Home
+    // prewarm can be reused via browser cache; if it is still incomplete, the
+    // active HLS player starts its own requests immediately.
+
+    // hls.js is requested from the app's own split bundle early during Home
+    // startup, so this should usually already be resolved when the user taps.
+    const Hls = await loadHlsLibrary();
+    if (cancelled) return;
+
+    if (!Hls || !Hls.isSupported()) {
+      // Native fallback remains available on Safari; it does not expose custom
+      // quality levels, which is also true for the previous native fallback.
+      if (nativeHlsSupported) {
+        startNativeHls();
+        return;
+      }
+
+      useProgressiveFallback();
+      return;
+    }
+
+    const networkProfile = getNetworkPlaybackProfile();
+    hls = new Hls({
+      loader: createWarmCacheLoader(Hls),
+      enableWorker: true,
+      startLevel: -1,
+      // Be deliberately conservative before HLS has a reliable bandwidth
+      // sample. This prevents a high first fragment from creating a long wait.
+      // Respect the actual conservative estimate. Forcing a 900 kbps starting
+      // estimate and a 550 kbps minimum made HLS choose 480p even on a ~0.59 Mbps
+      // connection, producing a 1.4 MB segment that took 17.8 seconds to download.
+      abrEwmaDefaultEstimate: networkProfile.defaultBandwidthEstimate,
+      abrBandWidthFactor: networkProfile.constrained ? 0.88 : 0.92,
+      abrBandWidthUpFactor: networkProfile.constrained ? 0.84 : 0.9,
+      maxStarvationDelay: networkProfile.constrained ? 2 : 3,
+      maxLoadingDelay: networkProfile.constrained ? 3 : 4,
+      startFragPrefetch: true,
+      // Wait until the manifest is parsed so the first level can be selected
+      // deliberately. Auto starts from the same small rendition warmed by the
+      // Home-card preloader, rather than guessing a high level on the click path.
+      autoStartLoad: false,
+      // Cloudinary can supply renditions up to 1080p when the source supports
+      // it. Do not cap to the rendered element size, which can override a
+      // viewer's explicit manual quality choice on smaller screens.
+      capLevelToPlayerSize: false,
+      maxBufferLength: networkProfile.touchDevice
+        ? 6
+        : networkProfile.constrained
+          ? 8
+          : 14,
+      maxMaxBufferLength: networkProfile.touchDevice
+        ? 12
+        : networkProfile.constrained
+          ? 14
+          : 24,
+      backBufferLength: networkProfile.touchDevice ? 3 : 6,
+      manifestLoadingMaxRetry: 2,
+      levelLoadingMaxRetry: 2,
+      fragLoadingMaxRetry: 3,
+    });
+
+    const publishQualityOptions = () => {
+      if (cancelled || !hls) return;
+      const bestLevelByHeight = new Map();
+      hls.levels.forEach((level, index) => {
+        const height = Number(level.height) || 0;
+        const bitrate = Number(level.bitrate) || 0;
+        if (!height) return;
+        const existing = bestLevelByHeight.get(height);
+        if (!existing || bitrate > existing.bitrate) {
+          bestLevelByHeight.set(height, {
+            height,
+            bitrate,
+            index,
+            label: `${height}p`,
+          });
+        }
+      });
+      const options = [...bestLevelByHeight.values()].sort(
+        (a, b) => a.height - b.height,
+      );
+      onQualityOptionsChange?.(options);
+    };
+
+    const getLevelForRequestedQuality = (requestedQuality) => {
+      if (!hls?.levels?.length) return null;
+
+      const available = hls.levels
+        .map((level, index) => ({
+          index,
+          height: Number(level.height) || 0,
+          bitrate: Number(level.bitrate) || 0,
+        }))
+        .filter((level) => level.height > 0);
+
+      if (!available.length) return null;
+
+      if (requestedQuality === "auto" || requestedQuality == null) {
+        // Choose the clearest available rendition within the network-aware
+        // startup budget. The same rule is used by preloadCloudinaryVideoStream
+        // so the cached first fragment matches the active player request.
+        const withinHeight = available.filter(
+          (level) => level.height <= networkProfile.startupHeight,
+        );
+        const pool = withinHeight.length ? withinHeight : available;
+        const withinBudget = pool.filter(
+          (level) =>
+            !level.bitrate ||
+            level.bitrate <= networkProfile.startupBandwidthBudget,
+        );
+        return (
+          [...withinBudget].sort(
+            (a, b) => b.height - a.height || b.bitrate - a.bitrate,
+          )[0] ||
+          [...pool].sort(
+            (a, b) =>
+              (a.bitrate || Number.POSITIVE_INFINITY) -
+                (b.bitrate || Number.POSITIVE_INFINITY) || a.height - b.height,
+          )[0] ||
+          [...available].sort((a, b) => a.bitrate - b.bitrate)[0]
+        );
+      }
+
+      const requestedHeight = Number(requestedQuality);
+      const exact = available
+        .filter((level) => level.height === requestedHeight)
+        .sort((a, b) => b.bitrate - a.bitrate);
+      const below = available
+        .filter((level) => level.height < requestedHeight)
+        .sort((a, b) => b.height - a.height || b.bitrate - a.bitrate);
+      return (
+        exact[0] ||
+        below[0] ||
+        available.sort(
+          (a, b) => a.height - b.height || b.bitrate - a.bitrate,
+        )[0]
+      );
+    };
+
+    onQualityControllerChange?.({
+      selectQuality: (requestedQuality) => {
+        // Store the user's choice even before the manifest arrives. MANIFEST_PARSED
+        // uses it to choose the initial rendition before any segment is requested.
+        selectedStreamQuality =
+          requestedQuality === "auto" || requestedQuality == null
+            ? "auto"
+            : String(requestedQuality);
+
+        if (!hls) return;
+        hls.capLevelToPlayerSize = false;
+        hls.autoLevelCapping = -1;
+
+        const target = getLevelForRequestedQuality(selectedStreamQuality);
+        if (!target) return;
+
+        if (!streamLoadStarted) {
+          hls.startLevel = target.index;
+          // Setting loadLevel locks hls.js to the user's selected rendition;
+          // Auto mode alone is allowed to adapt down when bandwidth falls.
+          hls.loadLevel = selectedStreamQuality === "auto" ? -1 : target.index;
+          return;
+        }
+
+        if (selectedStreamQuality === "auto") {
+          autoStartupLevelPending = false;
+          hls.currentLevel = -1;
+          return;
+        }
+
+        autoStartupLevelPending = false;
+
+        // Do not let player dimensions or a previous auto cap downgrade a
+        // viewer's explicit quality selection. While playing, nextLevel switches
+        // at the earliest safe boundary without flushing the current buffer.
+        if (video.paused) {
+          if (hls.currentLevel !== target.index)
+            hls.currentLevel = target.index;
+        } else if (hls.nextLevel !== target.index) {
+          hls.nextLevel = target.index;
+        }
+      },
+    });
+
+    hls.on(Hls.Events.MEDIA_ATTACHED, () => {
+      // Do not await a background preload here. The active player must request
+      // the master playlist immediately; unfinished preloads were a multi-second
+      // gate on poor Airtel connections.
+      if (!cancelled && hls) hls.loadSource(hlsUrl);
+    });
+
+    hls.on(Hls.Events.MANIFEST_PARSED, () => {
+      publishQualityOptions();
+      if (cancelled || !hls) return;
+
+      // Do not set a 480p minimum in Auto mode. A hard quality floor can force
+      // multi-megabyte first fragments on a weak mobile connection and delay the
+      // first frame. Auto starts conservatively and may improve after buffering;
+      // an explicit user-selected quality remains locked as requested.
+      const startupLevel = getLevelForRequestedQuality(selectedStreamQuality);
+      if (startupLevel) {
+        hls.startLevel = startupLevel.index;
+        // In Auto mode, use this small first fragment to get playback started;
+        // ABR is re-enabled after it is buffered below and may improve quality.
+        // An explicit user quality is honored from the very first fragment.
+        if (selectedStreamQuality === "auto") {
+          hls.loadLevel = startupLevel.index;
+          autoStartupLevelPending = true;
+        } else {
+          hls.loadLevel = startupLevel.index;
+          autoStartupLevelPending = false;
+        }
+      }
+      // Do not wait for any speculative preload here. On slow mobile links,
+      // that promise can take several seconds because it fetches a playlist and
+      // segment sequentially. Start the active player's media requests as soon
+      // as the master manifest and startup level are ready.
+      if (cancelled || !hls) return;
+      streamLoadStarted = true;
+      hls.startLoad(savedResumeTime >= 0.5 ? savedResumeTime : -1);
+      restoreResumePosition();
+      playIfRequested();
+    });
+
+    hls.on(Hls.Events.LEVELS_UPDATED, publishQualityOptions);
+
+    hls.on(Hls.Events.FRAG_BUFFERED, () => {
+      // A successfully buffered fragment means transient errors have recovered.
+      networkRetries = 0;
+      mediaRetries = 0;
+      manualRecoveryAttempts = 0;
+
+      // Switch Auto mode back to ABR after the first low-bitrate fragment is
+      // safely buffered. This is intentionally one-shot, not a quality lock.
+      if (autoStartupLevelPending && selectedStreamQuality === "auto" && hls) {
+        autoStartupLevelPending = false;
+        // Release both the explicit startup level and load-level override. This
+        // lets HLS.js use measured fragment throughput to move up to 480p/720p
+        // where sustainable, instead of lingering at the startup rendition.
+        hls.startLevel = -1;
+        hls.loadLevel = -1;
+      }
+    });
+
+    hls.on(Hls.Events.ERROR, (_event, data) => {
+      if (cancelled || !data?.fatal) return;
+
+      // Cloudinary can temporarily report 404/423 while an asynchronously
+      // generated HLS rendition is still becoming available. hls.js performs
+      // its own request retries first; give the manifest/level one final,
+      // bounded retry before switching to the progressive MP4 fallback. Reload
+      // the master playlist rather than calling startLoad(), which cannot
+      // recover a manifest that never loaded successfully.
+      const responseCode = Number(data.response?.code);
+      const isHlsPlaylistError = /manifest|level/i.test(
+        String(data.details || ""),
+      );
+      const cloudinaryHlsNotReady =
+        !streamHasPlayed &&
+        isHlsPlaylistError &&
+        (responseCode === 404 || responseCode === 423);
+
+      if (cloudinaryHlsNotReady && hlsReadinessRetries < 1) {
+        hlsReadinessRetries += 1;
+        if (hlsReadinessRetryTimer != null) {
+          clearTimeout(hlsReadinessRetryTimer);
+        }
+        hlsReadinessRetryTimer = setTimeout(
+          () => {
+            hlsReadinessRetryTimer = null;
+            if (cancelled || !hls) return;
+            networkRetries = 0;
+            hls.loadSource(hlsUrl);
+          },
+          responseCode === 423 ? 500 : 300,
+        );
+        return;
+      }
+
+      if (data.type === Hls.ErrorTypes.NETWORK_ERROR && networkRetries < 2) {
+        networkRetries += 1;
+        hls?.startLoad();
+        return;
+      }
+
+      if (data.type === Hls.ErrorTypes.MEDIA_ERROR && mediaRetries < 1) {
+        mediaRetries += 1;
+        hls?.recoverMediaError();
+        return;
+      }
+
+      // A manual quality choice is a lock, not a suggestion. Never silently
+      // replace it with the low-bitrate MP4 fallback, even if the first HLS
+      // segment has not played yet. Reapply the requested HLS level during
+      // recovery; a weak network may buffer, but the picture will not downgrade.
+      if (selectedStreamQuality !== "auto" && hls) {
+        const fixedTarget = getLevelForRequestedQuality(selectedStreamQuality);
+        if (fixedTarget) {
+          hls.autoLevelCapping = -1;
+          hls.startLevel = fixedTarget.index;
+          hls.loadLevel = fixedTarget.index;
+        }
+
+        if (manualRecoveryAttempts < 8) {
+          manualRecoveryAttempts += 1;
+          if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+            hls.recoverMediaError();
+          } else {
+            hls.startLoad();
+          }
+        }
+        return;
+      }
+
+      useProgressiveFallback();
+    });
+
+    hls.attachMedia(video);
+  };
+
+  start().catch(() => {
+    // Don't silently downgrade a fixed quality if initialization fails.
+    // Native HLS may still honor the stream on Safari; otherwise report the
+    // limitation and leave the selected stream intact for a retry.
+    if (cancelled) return;
+    if (selectedStreamQuality !== "auto") {
+      const nativeHlsSupported = Boolean(
+        video.canPlayType("application/vnd.apple.mpegurl"),
+      );
+      if (nativeHlsSupported) {
+        startNativeHls();
+      } else {
+        console.error(
+          "Spotli could not initialize HLS for the manually selected quality.",
+        );
+      }
+      return;
+    }
+    useProgressiveFallback();
+  });
+
+  return () => {
+    cancelled = true;
+    if (hlsReadinessRetryTimer != null) {
+      clearTimeout(hlsReadinessRetryTimer);
+      hlsReadinessRetryTimer = null;
+    }
+    rememberPosition();
+    video.removeEventListener("error", onNativeHlsError);
+    video.removeEventListener("loadeddata", onMediaReady);
+    video.removeEventListener("canplay", onMediaReady);
+    video.removeEventListener("playing", onVideoPlaying);
+    video.removeEventListener("timeupdate", rememberPosition);
+    video.removeEventListener("loadedmetadata", restoreResumePosition);
+    video.removeEventListener("durationchange", restoreResumePosition);
+    video.removeEventListener("canplay", restoreResumePosition);
+    if (hls) {
+      hls.destroy();
+      hls = null;
+    }
+    onQualityControllerChange?.(null);
+    onQualityOptionsChange?.([]);
+    video.pause();
+    if (video.isConnected) {
+      video.removeAttribute("src");
+      video.load();
+    }
+  };
+}
+
 function createTabletViewerImplementation() {
   // Keep the original tablet viewer's imports scoped to its implementation.
   const useEffect = tablet_useEffect;
@@ -210,7 +1459,7 @@ function createTabletViewerImplementation() {
     ];
   }
 
-  function getVideoUrl(post) {
+  function getOriginalVideoUrl(post) {
     return resolveMediaUrl(
       post?.videoUrl ||
         post?.video ||
@@ -219,6 +1468,10 @@ function createTabletViewerImplementation() {
         post?.url ||
         "",
     );
+  }
+
+  function getVideoUrl(post) {
+    return getOptimizedPlaybackUrl(getOriginalVideoUrl(post));
   }
 
   function isPhotoPost(post) {
@@ -291,6 +1544,7 @@ function createTabletViewerImplementation() {
     const feedRef = useRef(null);
 
     const videoRefs = useRef({});
+    const playbackPositionsRef = useRef(new Map());
 
     const postRefs = useRef({});
 
@@ -306,6 +1560,7 @@ function createTabletViewerImplementation() {
     const activeIndexRef = useRef(0);
 
     const scrollFrameRef = useRef(null);
+    const lastFeedScrollTopRef = useRef(0);
 
     const initialScrollDoneRef = useRef(false);
 
@@ -353,6 +1608,9 @@ function createTabletViewerImplementation() {
     const [followedCreators, setFollowedCreators] = useState({});
 
     const [paused, setPaused] = useState(false);
+    // Keep the poster over the video surface until the browser reports that
+    // real playback has begun. This avoids a black flash while HLS initializes.
+    const [playingVideoPostId, setPlayingVideoPostId] = useState(null);
     const [muted, setMuted] = useState(() =>
       Boolean(getSavedPlaybackPreference("startMuted", true)),
     );
@@ -360,6 +1618,11 @@ function createTabletViewerImplementation() {
     const [duration, setDuration] = useState(0);
     const [, setProgress] = useState({});
     const [settingsOpen, setSettingsOpen] = useState(false);
+    const [qualityOptions, setQualityOptions] = useState([]);
+    const [selectedQuality, setSelectedQuality] = useState("auto");
+    const qualityControllerRef = useRef(null);
+    const selectedQualityRef = useRef("auto");
+    selectedQualityRef.current = selectedQuality;
     const [captionsEnabled, setCaptionsEnabled] = useState(false);
     const [playbackRate, setPlaybackRate] = useState(
       () => Number(getSavedPlaybackPreference("playbackRate", "1")) || 1,
@@ -374,7 +1637,210 @@ function createTabletViewerImplementation() {
 
     const [loveAnimations, setLoveAnimations] = useState({});
 
+    const feedPreloadPostIdsKey = posts
+      .map((post) => String(getPostId(post)))
+      .join("|");
+
     const activePost = posts[activeIndex];
+    const activePostId = getPostId(activePost);
+    useEffect(() => {
+      // Every newly selected post should show its poster until its own video
+      // emits `playing`; don't reuse the previous video's ready state.
+      setPlayingVideoPostId(null);
+    }, [activePostId]);
+    const activeOriginalVideoUrl = getOriginalVideoUrl(activePost);
+    const activePostIsPhoto = isPhotoPost(activePost);
+    const shouldPlayActiveVideoRef = useRef(!paused);
+    shouldPlayActiveVideoRef.current = !paused;
+
+    // Prefer adaptive HLS delivery for the active Cloudinary video. The helper
+    // falls back to a small progressive MP4 if HLS is unavailable or fails.
+    useEffect(() => {
+      qualityControllerRef.current = null;
+      setQualityOptions([]);
+
+      if (!activePostId || activePostIsPhoto || !activeOriginalVideoUrl) {
+        return undefined;
+      }
+
+      const video = videoRefs.current[activePostId];
+      if (!video || !getCloudinaryHlsUrl(activeOriginalVideoUrl)) {
+        return undefined;
+      }
+
+      return attachCloudinaryAdaptiveStream(
+        video,
+        activeOriginalVideoUrl,
+        getOptimizedPlaybackUrl(activeOriginalVideoUrl),
+        () => shouldPlayActiveVideoRef.current,
+        () => setMuted(true),
+        (levels) => {
+          setQualityOptions(levels);
+          if (selectedQualityRef.current !== "auto") {
+            qualityControllerRef.current?.selectQuality(
+              selectedQualityRef.current,
+            );
+          }
+        },
+        (controller) => {
+          qualityControllerRef.current = controller;
+          if (controller) {
+            controller.selectQuality(selectedQualityRef.current);
+          }
+        },
+        selectedQualityRef.current,
+        playbackPositionsRef.current.get(String(activePostId)) || 0,
+        (time) => {
+          if (Number.isFinite(time) && time >= 0) {
+            playbackPositionsRef.current.set(String(activePostId), time);
+          }
+        },
+      );
+    }, [activePostId, activeOriginalVideoUrl, activePostIsPhoto]);
+
+    // While the current video plays, warm only the next feed item's HLS playlists.
+    // Downloading its media segment can compete with the active video on slow links. Rebuild this observer when the
+    // active index changes: otherwise a farther card can enter the expanded
+    // root first, be skipped as "not next", and never fire again while it stays
+    // intersecting. Keep only one next stream warm to avoid competing with the
+    // active video on mobile data.
+    useEffect(() => {
+      const feed = feedRef.current;
+      if (!feed || typeof IntersectionObserver === "undefined") {
+        return undefined;
+      }
+
+      const candidateByElement = new Map();
+      posts.forEach((post, index) => {
+        const element = postRefs.current[getPostId(post)];
+        if (element) candidateByElement.set(element, { post, index });
+      });
+      if (!candidateByElement.size) return undefined;
+
+      const observer = new IntersectionObserver(
+        (entries) => {
+          for (const entry of entries) {
+            if (!entry.isIntersecting) continue;
+
+            const candidate = candidateByElement.get(entry.target);
+            if (!candidate) {
+              observer.unobserve(entry.target);
+              continue;
+            }
+
+            const currentIndex = activeIndexRef.current;
+            if (candidate.index <= currentIndex) {
+              observer.unobserve(entry.target);
+              continue;
+            }
+
+            // Only prewarm the immediate next post. More than one media stream
+            // can compete with the video currently playing on mobile data.
+            if (candidate.index !== currentIndex + 1) continue;
+
+            observer.unobserve(entry.target);
+            if (isPhotoPost(candidate.post)) continue;
+
+            const nextUrl = getOriginalVideoUrl(candidate.post);
+            if (getCloudinaryHlsUrl(nextUrl)) {
+              preloadCloudinaryVideoStream(
+                nextUrl,
+                selectedQualityRef.current,
+                { includeFirstSegment: false },
+              );
+            }
+          }
+        },
+        {
+          root: feed,
+          // Start warming the next snap page before it enters the visible area.
+          rootMargin: "0px 0px 130% 0px",
+          threshold: 0.01,
+        },
+      );
+
+      candidateByElement.forEach(({ index }, element) => {
+        if (index > activeIndex) observer.observe(element);
+      });
+
+      return () => observer.disconnect();
+    }, [feedPreloadPostIdsKey, activeIndex]);
+
+    // Keep the next playlist ready, but do not download its media segment while
+    // the current video's startup fragment is still establishing playback. On
+    // slow links, simultaneous first fragments compete and delay the active video.
+    useEffect(() => {
+      if (
+        !activePostId ||
+        String(playingVideoPostId) !== String(activePostId)
+      ) {
+        return undefined;
+      }
+
+      const activeVideo = videoRefs.current[activePostId];
+      if (!activeVideo) return undefined;
+
+      let nextUrl = "";
+      for (let index = activeIndex + 1; index < posts.length; index += 1) {
+        const candidate = posts[index];
+        if (isPhotoPost(candidate)) continue;
+        const candidateUrl = getOriginalVideoUrl(candidate);
+        if (getCloudinaryHlsUrl(candidateUrl)) {
+          nextUrl = candidateUrl;
+          break;
+        }
+      }
+      if (!nextUrl) return undefined;
+
+      preloadCloudinaryVideoStream(nextUrl, "auto", {
+        includeFirstSegment: false,
+      });
+
+      let segmentPreloaded = false;
+      const cleanupListeners = () => {
+        activeVideo.removeEventListener("timeupdate", maybePreloadNextSegment);
+        activeVideo.removeEventListener("progress", maybePreloadNextSegment);
+        activeVideo.removeEventListener("playing", maybePreloadNextSegment);
+      };
+      const maybePreloadNextSegment = () => {
+        if (segmentPreloaded || activeVideo.paused || activeVideo.ended) return;
+        const currentTime = Number(activeVideo.currentTime) || 0;
+        if (currentTime < 0.5 || !activeVideo.buffered?.length) return;
+
+        let bufferedAhead = 0;
+        for (let index = 0; index < activeVideo.buffered.length; index += 1) {
+          const start = activeVideo.buffered.start(index);
+          const end = activeVideo.buffered.end(index);
+          if (currentTime >= start - 0.15 && currentTime <= end + 0.15) {
+            bufferedAhead = Math.max(0, end - currentTime);
+            break;
+          }
+        }
+
+        // Leave at least ~1.5 seconds of current playback buffered before
+        // spending bandwidth on the next video's first segment.
+        if (bufferedAhead < 1.5) return;
+        segmentPreloaded = true;
+        cleanupListeners();
+        preloadCloudinaryVideoStream(nextUrl, "auto", {
+          includeFirstSegment: true,
+        });
+      };
+
+      activeVideo.addEventListener("timeupdate", maybePreloadNextSegment);
+      activeVideo.addEventListener("progress", maybePreloadNextSegment);
+      activeVideo.addEventListener("playing", maybePreloadNextSegment);
+      maybePreloadNextSegment();
+
+      return cleanupListeners;
+    }, [feedPreloadPostIdsKey, activeIndex, activePostId, playingVideoPostId]);
+
+    function changeVideoQuality(quality) {
+      const value = quality === "auto" ? "auto" : String(quality);
+      selectedQualityRef.current = value;
+      setSelectedQuality(value);
+      qualityControllerRef.current?.selectQuality(value);
+    }
 
     useEffect(() => {
       let cancelled = false;
@@ -535,8 +2001,6 @@ function createTabletViewerImplementation() {
     }, [posts]);
 
     const commentsPostId = getPostId(commentsPost);
-
-    const activePostId = getPostId(activePost);
     // Show creator details whenever a new post becomes active, then hide them// after five seconds unless the viewer touches the video again.
     const revealDetails = useCallback(() => {
       setDetailsVisible(true);
@@ -614,70 +2078,10 @@ function createTabletViewerImplementation() {
       });
     }, [posts]);
 
-    useEffect(() => {
-      let cancelled = false;
+    // Avoid polling full comment threads every three seconds while videos play.
+    // Feed counts are seeded above; opening the comments panel loads the thread,
+    // and submitComment updates the count immediately.
 
-      const refreshCounts = async () => {
-        const ids = [
-          ...new Set(
-            [activePostId, commentsPostId].filter(Boolean).map(String),
-          ),
-        ];
-
-        await Promise.all(
-          ids.map(async (postId) => {
-            try {
-              const result = await api.posts.getComments(postId);
-
-              if (cancelled) return;
-
-              const list = Array.isArray(result?.comments)
-                ? result.comments
-                : Array.isArray(result?.data?.comments)
-                  ? result.data.comments
-                  : Array.isArray(result)
-                    ? result
-                    : null;
-
-              const rawCount =
-                result?.commentsCount ?? result?.count ?? result?.total;
-
-              const count =
-                Number.isFinite(Number(rawCount)) && rawCount !== null
-                  ? Number(rawCount)
-                  : list?.length;
-
-              if (count !== undefined) {
-                setCommentCounts((previous) => ({
-                  ...previous,
-
-                  [postId]: count,
-                }));
-              }
-
-              if (commentsPostId && String(commentsPostId) === postId && list) {
-                setComments((previous) =>
-                  previous.some((comment) => comment.pending) ? previous : list,
-                );
-              }
-            } catch {
-              // Keep the last known count if a background refresh temporarily fails.
-            }
-          }),
-        );
-      };
-
-      refreshCounts();
-
-      const intervalId = setInterval(refreshCounts, 3000);
-
-      return () => {
-        cancelled = true;
-
-        clearInterval(intervalId);
-      };
-    }, [activePostId, commentsPostId]);
-    // Load comments whenever the selected post changes.
     useEffect(() => {
       if (!commentsPostId) {
         // eslint-disable-next-line react-hooks/set-state-in-effect
@@ -702,7 +2106,20 @@ function createTabletViewerImplementation() {
 
         .then((result) => {
           if (!cancelled) {
-            setComments(Array.isArray(result?.comments) ? result.comments : []);
+            const fetchedComments = Array.isArray(result?.comments)
+              ? result.comments
+              : [];
+            setComments(fetchedComments);
+            const rawCount =
+              result?.commentsCount ?? result?.count ?? result?.total;
+            const count =
+              Number.isFinite(Number(rawCount)) && rawCount != null
+                ? Number(rawCount)
+                : fetchedComments.length;
+            setCommentCounts((previous) => ({
+              ...previous,
+              [String(commentsPostId)]: count,
+            }));
           }
         })
 
@@ -817,6 +2234,7 @@ function createTabletViewerImplementation() {
       setActiveIndex(resolvedIndex);
 
       feed.scrollTop = target.offsetTop;
+      lastFeedScrollTopRef.current = feed.scrollTop;
     }, [initialPost, posts]);
     // Play only the active video; do not change the feed scroll position here.
     useEffect(() => {
@@ -877,15 +2295,20 @@ function createTabletViewerImplementation() {
 
         if (!currentFeed || !currentFeed.clientHeight) return;
 
-        const nextIndex = Math.max(
-          0,
+        const scrollTop = currentFeed.scrollTop;
+        const pagePosition = scrollTop / currentFeed.clientHeight;
+        const lowerPage = Math.floor(pagePosition);
+        const pageFraction = pagePosition - lowerPage;
+        const movingDown = scrollTop >= lastFeedScrollTopRef.current;
+        lastFeedScrollTopRef.current = scrollTop;
 
-          Math.min(
-            Math.round(currentFeed.scrollTop / currentFeed.clientHeight),
-
-            posts.length - 1,
-          ),
-        );
+        // Switch to the next item after ~35% of a downward swipe, rather than
+        // waiting until 60% of the next card is visible. On an upward swipe,
+        // switch back after ~35% toward the previous item.
+        const resolvedPage = movingDown
+          ? lowerPage + (pageFraction >= 0.35 ? 1 : 0)
+          : lowerPage + (pageFraction > 0.65 ? 1 : 0);
+        const nextIndex = Math.max(0, Math.min(resolvedPage, posts.length - 1));
 
         if (nextIndex !== activeIndexRef.current) {
           activeIndexRef.current = nextIndex;
@@ -1295,11 +2718,15 @@ function createTabletViewerImplementation() {
 
             const isLandscape = orientation === "landscape";
 
-            const thumbnail =
-              currentImage ||
-              resolveMediaUrl(
-                post?.thumbnailUrl || post?.imageUrl || post?.image || "",
-              );
+            const explicitThumbnail = resolveMediaUrl(
+              getExplicitPostThumbnail(post),
+            );
+            // For videos, don't use mediaUrls[0] as a poster: older posts often
+            // put the actual MP4 there, which the browser cannot render as an image.
+            const thumbnail = photoPost
+              ? currentImage || explicitThumbnail
+              : explicitThumbnail ||
+                getCloudinaryVideoThumbnailUrl(getOriginalVideoUrl(post));
 
             const profilePicture = getAvatarUrl(post);
 
@@ -1431,7 +2858,11 @@ function createTabletViewerImplementation() {
                         ref={(node) => {
                           videoRefs.current[postId] = node;
                         }}
-                        src={videoUrl || DEMO_VIDEO}
+                        src={
+                          getCloudinaryHlsUrl(getOriginalVideoUrl(post))
+                            ? undefined
+                            : videoUrl || DEMO_VIDEO
+                        }
                         poster={thumbnail || undefined}
                         autoPlay={isActive && !paused}
                         controls={false}
@@ -1468,10 +2899,38 @@ function createTabletViewerImplementation() {
                             );
                         }}
                         onClick={() => handleVideoTap(postId)}
+                        onLoadedData={(event) => {
+                          // Reveal the first decoded video frame as soon as it exists,
+                          // instead of waiting for the later `playing` event. This
+                          // avoids leaving the thumbnail over a frame that's already ready.
+                          if (isActive && !paused) {
+                            setPlayingVideoPostId(String(postId));
+                          }
+                        }}
+                        onPlaying={() => setPlayingVideoPostId(String(postId))}
                         className={`h-full w-full ${
                           isLandscape ? "object-contain" : "object-cover"
                         }`}
                       />
+                      {thumbnail &&
+                        !isActive &&
+                        String(playingVideoPostId) !== String(postId) && (
+                          <img
+                            src={thumbnail}
+                            alt=""
+                            aria-hidden="true"
+                            draggable={false}
+                            loading={isActive ? "eager" : "lazy"}
+                            fetchPriority={isActive ? "high" : "low"}
+                            decoding="async"
+                            onError={(event) => {
+                              event.currentTarget.style.display = "none";
+                            }}
+                            className={`pointer-events-none absolute inset-0 z-10 h-full w-full ${
+                              isLandscape ? "object-contain" : "object-cover"
+                            }`}
+                          />
+                        )}
                     </>
                   )}
 
@@ -1560,7 +3019,10 @@ function createTabletViewerImplementation() {
                           <Settings size={17} />
                         </button>
                         {settingsOpen && (
-                          <div className="absolute bottom-9 right-0 z-70 min-w-28 rounded-lg bg-black/95 p-2 shadow-xl">
+                          <div className="absolute bottom-9 right-0 z-70 max-h-72 min-w-40 max-w-48 overflow-y-auto rounded-lg bg-black/95 p-2 text-white shadow-xl">
+                            <p className="px-3 pb-1 pt-1 text-[10px] font-semibold uppercase tracking-wide text-white/55">
+                              Playback speed
+                            </p>
                             {[0.5, 0.75, 1, 1.25, 1.5, 2].map((rate) => (
                               <button
                                 key={rate}
@@ -1571,6 +3033,44 @@ function createTabletViewerImplementation() {
                                 {rate === 1 ? "Normal" : `${rate}x`}
                               </button>
                             ))}
+                            <div className="my-1 border-t border-white/15 pt-1">
+                              <p className="px-3 pb-1 pt-1 text-[10px] font-semibold uppercase tracking-wide text-white/55">
+                                Video quality
+                              </p>
+                              <button
+                                type="button"
+                                aria-pressed={selectedQuality === "auto"}
+                                onClick={() => changeVideoQuality("auto")}
+                                className={`block w-full rounded px-3 py-2 text-left text-xs ${selectedQuality === "auto" ? "text-[#FF2D4A]" : "text-white"}`}
+                              >
+                                Auto {selectedQuality === "auto" ? "✓" : ""}
+                              </button>
+                              {qualityOptions.length > 0 ? (
+                                [...qualityOptions].reverse().map((quality) => (
+                                  <button
+                                    key={quality.height}
+                                    type="button"
+                                    aria-pressed={
+                                      selectedQuality === String(quality.height)
+                                    }
+                                    onClick={() =>
+                                      changeVideoQuality(quality.height)
+                                    }
+                                    className={`block w-full rounded px-3 py-2 text-left text-xs ${selectedQuality === String(quality.height) ? "text-[#FF2D4A]" : "text-white"}`}
+                                  >
+                                    {quality.label}{" "}
+                                    {selectedQuality === String(quality.height)
+                                      ? "✓"
+                                      : ""}
+                                  </button>
+                                ))
+                              ) : (
+                                <p className="px-3 py-2 text-[11px] leading-snug text-white/55">
+                                  Manual quality is unavailable for this
+                                  video/browser.
+                                </p>
+                              )}
+                            </div>
                           </div>
                         )}
                       </div>
@@ -1991,7 +3491,7 @@ function createDesktopViewerImplementation() {
     return url;
   }
 
-  function getVideoUrl(post) {
+  function getOriginalVideoUrl(post) {
     // The API may return the uploaded video as a string or as a media object.
     // Normalize both formats before resolving the backend URL.
     const toMediaUrl = (value) => {
@@ -2030,6 +3530,10 @@ function createDesktopViewerImplementation() {
     }
 
     return "";
+  }
+
+  function getVideoUrl(post) {
+    return getOptimizedPlaybackUrl(getOriginalVideoUrl(post));
   }
 
   function getPostImage(post, width = 1200) {
@@ -2202,6 +3706,14 @@ function createDesktopViewerImplementation() {
     );
 
     const [paused, setPaused] = useState(false);
+    const [playingVideoPostId, setPlayingVideoPostId] = useState(null);
+
+    const [settingsOpen, setSettingsOpen] = useState(false);
+    const [qualityOptions, setQualityOptions] = useState([]);
+    const [selectedQuality, setSelectedQuality] = useState("auto");
+    const qualityControllerRef = useRef(null);
+    const selectedQualityRef = useRef("auto");
+    selectedQualityRef.current = selectedQuality;
 
     const [playbackFeedback, setPlaybackFeedback] = useState(null);
 
@@ -2217,11 +3729,10 @@ function createDesktopViewerImplementation() {
 
     const creatorOverlayTimerRef = useRef(null);
 
-    const warmedVideoUrlsRef = useRef(new Map());
-
     const feedRef = useRef(null);
 
     const videoRef = useRef(null);
+    const playbackPositionsRef = useRef(new Map());
 
     const postRefs = useRef({});
 
@@ -2244,10 +3755,228 @@ function createDesktopViewerImplementation() {
         (post) => String(getPostId(post)) === String(activeId),
       ),
     );
+    const activeIndexRef = useRef(activeIndex);
+    activeIndexRef.current = activeIndex;
 
     const activePost = viewerPosts[activeIndex];
 
     const activePostId = getPostId(activePost);
+    useEffect(() => {
+      // Keep the cover visible whenever the desktop viewer changes videos.
+      setPlayingVideoPostId(null);
+    }, [activeId]);
+    const activeOriginalVideoUrl = getOriginalVideoUrl(activePost);
+    const activePostIsPhoto = Boolean(
+      activePost?.mediaType === "photo" ||
+      activePost?.mediaType === "image" ||
+      activePost?.type === "photo" ||
+      activePost?.type === "image" ||
+      activePost?.isImagePost === true ||
+      activePost?.isPhotoPost === true,
+    );
+    const shouldPlayActiveVideoRef = useRef(!paused);
+    shouldPlayActiveVideoRef.current = !paused;
+
+    useEffect(() => {
+      qualityControllerRef.current = null;
+      setQualityOptions([]);
+
+      if (!activePostId || activePostIsPhoto || !activeOriginalVideoUrl) {
+        return undefined;
+      }
+
+      const video = videoRef.current;
+      if (!video || !getCloudinaryHlsUrl(activeOriginalVideoUrl)) {
+        return undefined;
+      }
+
+      return attachCloudinaryAdaptiveStream(
+        video,
+        activeOriginalVideoUrl,
+        getOptimizedPlaybackUrl(activeOriginalVideoUrl),
+        () => shouldPlayActiveVideoRef.current,
+        () => setMuted(true),
+        (levels) => {
+          setQualityOptions(levels);
+          if (selectedQualityRef.current !== "auto") {
+            qualityControllerRef.current?.selectQuality(
+              selectedQualityRef.current,
+            );
+          }
+        },
+        (controller) => {
+          qualityControllerRef.current = controller;
+          if (controller) {
+            controller.selectQuality(selectedQualityRef.current);
+          }
+        },
+        selectedQualityRef.current,
+        playbackPositionsRef.current.get(String(activePostId)) || 0,
+        (time) => {
+          if (Number.isFinite(time) && time >= 0) {
+            playbackPositionsRef.current.set(String(activePostId), time);
+          }
+        },
+      );
+    }, [activePostId, activeOriginalVideoUrl, activePostIsPhoto]);
+
+    // Prewarm one upcoming video while the current video is playing. Rebuild
+    // the observer after each active-index change so the next card is observed
+    // anew even when it already intersects the root margin; without this, the
+    // observer can skip it once and never notify again during a fast swipe.
+    useEffect(() => {
+      const feed = feedRef.current;
+      if (!feed || typeof IntersectionObserver === "undefined") {
+        return undefined;
+      }
+
+      const candidateByElement = new Map();
+      viewerPosts.forEach((post, index) => {
+        const element = postRefs.current[String(getPostId(post))];
+        if (element) candidateByElement.set(element, { post, index });
+      });
+      if (!candidateByElement.size) return undefined;
+
+      const observer = new IntersectionObserver(
+        (entries) => {
+          for (const entry of entries) {
+            if (!entry.isIntersecting) continue;
+
+            const candidate = candidateByElement.get(entry.target);
+            if (!candidate) {
+              observer.unobserve(entry.target);
+              continue;
+            }
+
+            const currentIndex = activeIndexRef.current;
+            if (candidate.index <= currentIndex) {
+              observer.unobserve(entry.target);
+              continue;
+            }
+            if (candidate.index !== currentIndex + 1) continue;
+
+            observer.unobserve(entry.target);
+            const nextPost =
+              viewerPostsRef.current[candidate.index] || candidate.post;
+            if (
+              nextPost?.mediaType === "photo" ||
+              nextPost?.mediaType === "image" ||
+              nextPost?.type === "photo" ||
+              nextPost?.type === "image" ||
+              nextPost?.isImagePost === true ||
+              nextPost?.isPhotoPost === true
+            ) {
+              continue;
+            }
+
+            const nextUrl = getOriginalVideoUrl(nextPost);
+            if (getCloudinaryHlsUrl(nextUrl)) {
+              preloadCloudinaryVideoStream(
+                nextUrl,
+                selectedQualityRef.current,
+                { includeFirstSegment: false },
+              );
+            }
+          }
+        },
+        {
+          root: feed,
+          rootMargin: "0px 0px 130% 0px",
+          threshold: 0.01,
+        },
+      );
+
+      candidateByElement.forEach(({ index }, element) => {
+        if (index > activeIndex) observer.observe(element);
+      });
+
+      return () => observer.disconnect();
+    }, [viewerPostIdsKey, activeIndex]);
+
+    // Prepare next-video metadata early, but defer its first media segment until
+    // the active stream has a healthy buffer so it cannot slow first playback.
+    useEffect(() => {
+      if (
+        !activePostId ||
+        String(playingVideoPostId) !== String(activePostId)
+      ) {
+        return undefined;
+      }
+
+      const activeVideo = videoRef.current;
+      if (!activeVideo) return undefined;
+
+      let nextUrl = "";
+      for (
+        let index = activeIndex + 1;
+        index < viewerPosts.length;
+        index += 1
+      ) {
+        const candidate = viewerPosts[index];
+        const candidateType = String(
+          candidate?.mediaType || candidate?.type || "",
+        ).toLowerCase();
+        if (
+          ["photo", "image", "photos", "gallery"].includes(candidateType) ||
+          candidate?.isImagePost === true ||
+          candidate?.isPhotoPost === true
+        )
+          continue;
+        const candidateUrl = getOriginalVideoUrl(candidate);
+        if (getCloudinaryHlsUrl(candidateUrl)) {
+          nextUrl = candidateUrl;
+          break;
+        }
+      }
+      if (!nextUrl) return undefined;
+
+      preloadCloudinaryVideoStream(nextUrl, "auto", {
+        includeFirstSegment: false,
+      });
+
+      let segmentPreloaded = false;
+      const cleanupListeners = () => {
+        activeVideo.removeEventListener("timeupdate", maybePreloadNextSegment);
+        activeVideo.removeEventListener("progress", maybePreloadNextSegment);
+        activeVideo.removeEventListener("playing", maybePreloadNextSegment);
+      };
+      const maybePreloadNextSegment = () => {
+        if (segmentPreloaded || activeVideo.paused || activeVideo.ended) return;
+        const currentTime = Number(activeVideo.currentTime) || 0;
+        if (currentTime < 0.5 || !activeVideo.buffered?.length) return;
+
+        let bufferedAhead = 0;
+        for (let index = 0; index < activeVideo.buffered.length; index += 1) {
+          const start = activeVideo.buffered.start(index);
+          const end = activeVideo.buffered.end(index);
+          if (currentTime >= start - 0.15 && currentTime <= end + 0.15) {
+            bufferedAhead = Math.max(0, end - currentTime);
+            break;
+          }
+        }
+        if (bufferedAhead < 1.5) return;
+
+        segmentPreloaded = true;
+        cleanupListeners();
+        preloadCloudinaryVideoStream(nextUrl, "auto", {
+          includeFirstSegment: true,
+        });
+      };
+
+      activeVideo.addEventListener("timeupdate", maybePreloadNextSegment);
+      activeVideo.addEventListener("progress", maybePreloadNextSegment);
+      activeVideo.addEventListener("playing", maybePreloadNextSegment);
+      maybePreloadNextSegment();
+
+      return cleanupListeners;
+    }, [viewerPostIdsKey, activeIndex, activePostId, playingVideoPostId]);
+
+    function changeVideoQuality(quality) {
+      const value = quality === "auto" ? "auto" : String(quality);
+      selectedQualityRef.current = value;
+      setSelectedQuality(value);
+      qualityControllerRef.current?.selectQuality(value);
+    }
 
     const [comments, setComments] = useState([]);
 
@@ -2374,9 +4103,10 @@ function createDesktopViewerImplementation() {
       };
     }, [viewerPostIdsKey]);
 
-    // Load comments for the currently active post.
+    // Load comments only while the desktop comments panel is open. Fetching a
+    // complete thread on every video switch competes with HLS startup traffic.
     useEffect(() => {
-      if (!activePostId) return undefined;
+      if (!activePostId || !commentsOpen) return undefined;
 
       let cancelled = false;
 
@@ -2410,7 +4140,7 @@ function createDesktopViewerImplementation() {
       return () => {
         cancelled = true;
       };
-    }, [activePostId]);
+    }, [activePostId, commentsOpen]);
 
     // Open the viewer at the exact post selected from Home/Discover.
     useEffect(() => {
@@ -2531,8 +4261,11 @@ function createDesktopViewerImplementation() {
     // Reset playback controls after the active post changes.
     useEffect(() => {
       const frameId = window.requestAnimationFrame(() => {
+        const resumeTime = Number(
+          playbackPositionsRef.current.get(String(activeId)) || 0,
+        );
         setProgress(0);
-        setCurrentTime(0);
+        setCurrentTime(Number.isFinite(resumeTime) ? resumeTime : 0);
         setDuration(0);
         setPaused(false);
         setPlaybackFeedback(null);
@@ -2582,7 +4315,7 @@ function createDesktopViewerImplementation() {
             }
           }
 
-          if (!mostVisibleEntry || mostVisibleEntry.intersectionRatio < 0.6) {
+          if (!mostVisibleEntry || mostVisibleEntry.intersectionRatio < 0.35) {
             return;
           }
 
@@ -2606,7 +4339,7 @@ function createDesktopViewerImplementation() {
         {
           root: feed,
 
-          threshold: [0.6, 0.75, 0.9],
+          threshold: [0.35, 0.5, 0.6, 0.75, 0.9],
         },
       );
 
@@ -2850,46 +4583,6 @@ function createDesktopViewerImplementation() {
       }));
     }
 
-    // Warm upcoming video data so selecting an Up next item starts sooner.
-    // Limit background preloading to a small number of videos to protect bandwidth.
-    function warmVideo(post, preload = "auto") {
-      const url = getVideoUrl(post);
-
-      if (!url) return;
-
-      const previousPreload = warmedVideoUrlsRef.current.get(url);
-      if (
-        previousPreload === "auto" ||
-        (previousPreload === "metadata" && preload === "metadata")
-      ) {
-        return;
-      }
-
-      // Allow metadata-only preloads to be upgraded when this becomes the next video.
-      warmedVideoUrlsRef.current.set(url, preload);
-
-      const warmVideoElement = document.createElement("video");
-
-      warmVideoElement.preload = preload;
-
-      warmVideoElement.muted = true;
-
-      warmVideoElement.src = url;
-
-      warmVideoElement.load();
-    }
-
-    // Prepare the next two videos in the background. Never preload the whole feed.
-    useEffect(() => {
-      const nextPosts = viewerPostsRef.current.slice(
-        activeIndex + 1,
-        activeIndex + 3,
-      );
-      nextPosts.forEach((post, index) => {
-        warmVideo(post, index === 0 ? "auto" : "metadata");
-      });
-    }, [activeIndex, viewerPostIdsKey]);
-
     async function submitComment(text) {
       if (!activePostId || !text?.trim()) {
         throw new Error("Choose a post and enter a comment first.");
@@ -3044,9 +4737,22 @@ function createDesktopViewerImplementation() {
               {viewerPosts.map((post) => {
                 const postId = getPostId(post);
 
-                const postThumbnail = getPostImage(post);
-
+                const explicitThumbnail = resolveMediaUrl(
+                  getExplicitPostThumbnail(post),
+                );
                 const videoUrl = getVideoUrl(post);
+                const generatedVideoThumbnail = getCloudinaryVideoThumbnailUrl(
+                  getOriginalVideoUrl(post),
+                );
+                const existingImageCandidate = getPostImage(post);
+                const postThumbnail =
+                  explicitThumbnail ||
+                  generatedVideoThumbnail ||
+                  (/\.(mp4|mov|m4v|webm|avi|mkv)(?:[?#]|$)/i.test(
+                    existingImageCandidate,
+                  )
+                    ? ""
+                    : existingImageCandidate);
 
                 const photoSet = getPostImages(post);
 
@@ -3185,44 +4891,62 @@ function createDesktopViewerImplementation() {
                           )}
                         </>
                       ) : isActive ? (
-                        <video
-                          key={postId}
-                          ref={videoRef}
-                          src={videoUrl || undefined}
-                          poster={postThumbnail || undefined}
-                          autoPlay={!paused}
-                          preload="auto"
-                          muted={muted}
-                          loop
-                          playsInline
-                          onClick={togglePlayback}
-                          onTimeUpdate={handleTimeUpdate}
-                          onLoadedMetadata={(event) => {
-                            const video = event.currentTarget;
+                        <>
+                          <video
+                            key={postId}
+                            ref={videoRef}
+                            src={
+                              isActive &&
+                              getCloudinaryHlsUrl(getOriginalVideoUrl(post))
+                                ? undefined
+                                : videoUrl || undefined
+                            }
+                            poster={postThumbnail || undefined}
+                            autoPlay={!paused}
+                            preload="auto"
+                            muted={muted}
+                            loop
+                            playsInline
+                            onClick={togglePlayback}
+                            onTimeUpdate={handleTimeUpdate}
+                            onLoadedMetadata={(event) => {
+                              const video = event.currentTarget;
 
-                            setDuration(video.duration || 0);
+                              setDuration(video.duration || 0);
 
-                            setVideoRatios((previous) => ({
-                              ...previous,
+                              setVideoRatios((previous) => ({
+                                ...previous,
 
-                              [postId]:
-                                video.videoWidth /
-                                Math.max(video.videoHeight, 1),
-                            }));
-                          }}
-                          onError={(event) => {
-                            console.error("Spotli video failed to load", {
-                              postId,
-                              src: event.currentTarget.currentSrc || videoUrl,
-                              error:
-                                event.currentTarget.error?.message ||
-                                "Unknown media error",
-                            });
-                          }}
-                          onPlay={() => setPaused(false)}
-                          onPause={() => setPaused(true)}
-                          className="absolute inset-0 h-full w-full object-contain"
-                        />
+                                [postId]:
+                                  video.videoWidth /
+                                  Math.max(video.videoHeight, 1),
+                              }));
+                            }}
+                            onError={(event) => {
+                              console.error("Spotli video failed to load", {
+                                postId,
+                                src: event.currentTarget.currentSrc || videoUrl,
+                                error:
+                                  event.currentTarget.error?.message ||
+                                  "Unknown media error",
+                              });
+                            }}
+                            onPlay={() => setPaused(false)}
+                            onPause={() => setPaused(true)}
+                            onLoadedData={(event) => {
+                              // Reveal the first decoded video frame as soon as it exists,
+                              // instead of waiting for the later `playing` event. This
+                              // avoids leaving the thumbnail over a frame that's already ready.
+                              if (isActive && !paused) {
+                                setPlayingVideoPostId(String(postId));
+                              }
+                            }}
+                            onPlaying={() =>
+                              setPlayingVideoPostId(String(postId))
+                            }
+                            className="absolute inset-0 h-full w-full object-contain"
+                          />
+                        </>
                       ) : (
                         <div className="absolute inset-0 flex items-center justify-center bg-black">
                           {postThumbnail ? (
@@ -3511,9 +5235,60 @@ function createDesktopViewerImplementation() {
                             <Captions size={14} />
                           </button>
 
-                          <button type="button" aria-label="Settings">
-                            <Settings size={14} />
-                          </button>
+                          <div className="relative shrink-0">
+                            <button
+                              type="button"
+                              aria-label="Playback settings"
+                              aria-expanded={settingsOpen}
+                              onClick={() => setSettingsOpen((open) => !open)}
+                            >
+                              <Settings size={14} />
+                            </button>
+                            {settingsOpen && (
+                              <div className="absolute bottom-8 right-0 z-50 max-h-64 min-w-36 overflow-y-auto rounded-lg bg-black/95 p-2 text-white shadow-xl">
+                                <p className="px-3 pb-1 pt-1 text-[10px] font-semibold uppercase tracking-wide text-white/55">
+                                  Video quality
+                                </p>
+                                <button
+                                  type="button"
+                                  aria-pressed={selectedQuality === "auto"}
+                                  onClick={() => changeVideoQuality("auto")}
+                                  className={`block w-full rounded px-3 py-2 text-left text-xs ${selectedQuality === "auto" ? "text-[#FF2D4A]" : "text-white"}`}
+                                >
+                                  Auto {selectedQuality === "auto" ? "✓" : ""}
+                                </button>
+                                {qualityOptions.length > 0 ? (
+                                  [...qualityOptions]
+                                    .reverse()
+                                    .map((quality) => (
+                                      <button
+                                        key={quality.height}
+                                        type="button"
+                                        aria-pressed={
+                                          selectedQuality ===
+                                          String(quality.height)
+                                        }
+                                        onClick={() =>
+                                          changeVideoQuality(quality.height)
+                                        }
+                                        className={`block w-full rounded px-3 py-2 text-left text-xs ${selectedQuality === String(quality.height) ? "text-[#FF2D4A]" : "text-white"}`}
+                                      >
+                                        {quality.label}{" "}
+                                        {selectedQuality ===
+                                        String(quality.height)
+                                          ? "✓"
+                                          : ""}
+                                      </button>
+                                    ))
+                                ) : (
+                                  <p className="px-3 py-2 text-[11px] leading-snug text-white/55">
+                                    Manual quality is unavailable for this
+                                    video/browser.
+                                  </p>
+                                )}
+                              </div>
+                            )}
+                          </div>
 
                           <button
                             type="button"
@@ -3558,8 +5333,6 @@ function createDesktopViewerImplementation() {
                         <button
                           key={getPostId(post)}
                           type="button"
-                          onMouseEnter={() => warmVideo(post)}
-                          onFocus={() => warmVideo(post)}
                           onClick={() => selectPost(post)}
                           className="flex w-full gap-2 text-left"
                         >

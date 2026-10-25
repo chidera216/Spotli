@@ -1,4 +1,5 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { preloadCloudinaryVideoStream } from "./VideoViewer";
 
 import {
   Heart,
@@ -28,6 +29,32 @@ function getImageUrl(image, width = 1200, height) {
     : `fit=max&w=${width}`;
 
   return `https://images.unsplash.com/${image}?auto=format&${dimensions}&q=90`;
+}
+
+// Generate a lightweight still image from a Cloudinary video URL. This avoids
+// mounting background video players just to display feed thumbnails.
+function getCloudinaryVideoThumbnailUrl(value, width = 720, height = 405) {
+  if (typeof value !== "string" || !value.trim()) return "";
+
+  const url = value.trim();
+  if (!/^https?:\/\/res\.cloudinary\.com\//i.test(url)) return "";
+
+  const marker = "/video/upload/";
+  const markerIndex = url.indexOf(marker);
+  if (markerIndex < 0) return "";
+
+  const pathStart = markerIndex + marker.length;
+  let assetPath = url.slice(pathStart).split(/[?#]/, 1)[0];
+  const firstSegment = assetPath.split("/")[0];
+
+  // Uploaded post URLs are normally untransformed. If a transformed URL is
+  // supplied, avoid stacking transformations and let the card use its fallback.
+  if (!assetPath || firstSegment.includes(",")) return "";
+
+  assetPath = assetPath.replace(/\.(mp4|mov|m4v|webm|avi|mkv)$/i, "");
+  if (!assetPath) return "";
+
+  return `${url.slice(0, pathStart)}so_0,w_${width},h_${height},c_fill,q_auto,f_jpg/${assetPath}.jpg`;
 }
 
 function getCreatorName(creator) {
@@ -68,6 +95,37 @@ function getPostImages(post) {
   return [...new Set(rawImages)].filter(
     (image) => typeof image === "string" && image.trim(),
   );
+}
+
+function getPostVideoSource(post) {
+  const candidates = [
+    post?.mediaUrl,
+    post?.videoUrl,
+    post?.video,
+    typeof post?.media === "string" ? post.media : "",
+    post?.media?.url,
+    post?.media?.secure_url,
+    post?.mediaUrls?.[0],
+    post?.videos?.[0]?.url,
+    post?.url,
+  ];
+
+  for (const candidate of candidates) {
+    const value =
+      typeof candidate === "string"
+        ? candidate
+        : candidate && typeof candidate === "object"
+          ? candidate.url ||
+            candidate.src ||
+            candidate.secure_url ||
+            candidate.path ||
+            ""
+          : "";
+    if (typeof value === "string" && value.trim())
+      return getImageUrl(value.trim());
+  }
+
+  return "";
 }
 
 function CreatorAvatar({ post }) {
@@ -155,8 +213,18 @@ function PostCard({
   onOpenPhoto,
   isBookmarked,
   onToggleBookmark,
+  isPriorityVideo = false,
 }) {
   const [activeImageIndex, setActiveImageIndex] = useState(0);
+  const videoPreloadTimerRef = useRef(null);
+  const videoCardRef = useRef(null);
+
+  function cancelScheduledVideoPreload() {
+    if (videoPreloadTimerRef.current != null) {
+      window.clearTimeout(videoPreloadTimerRef.current);
+      videoPreloadTimerRef.current = null;
+    }
+  }
 
   const isPhoto = isPhotoPost(post);
 
@@ -173,6 +241,48 @@ function PostCard({
   const images = getPostImages(post);
 
   const activeImage = images[activeImageIndex] || "";
+  const videoUrl = getPostVideoSource(post);
+
+  // Prepare only lightweight HLS playlists before a card is opened. The active
+  // video itself downloads its media segment, avoiding duplicate downloads.
+  useEffect(() => {
+    if (
+      !isVideo ||
+      !isPriorityVideo ||
+      !videoUrl ||
+      typeof IntersectionObserver === "undefined"
+    ) {
+      return undefined;
+    }
+
+    const target = videoCardRef.current;
+    if (!target) return undefined;
+
+    let preloaded = false;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (preloaded) return;
+
+        if (entries.some((entry) => entry.isIntersecting)) {
+          preloaded = true;
+          preloadCloudinaryVideoStream(videoUrl, "auto", {
+            includeFirstSegment: true,
+          });
+          observer.disconnect();
+        }
+      },
+      {
+        // Prepare only cards that are on screen or immediately entering it.
+        // Together with the 2-entry preload limit, this avoids downloading a
+        // feed full of videos while still warming a tapped video's first segment.
+        rootMargin: "0px 0px 100px 0px",
+        threshold: 0.35,
+      },
+    );
+
+    observer.observe(target);
+    return () => observer.disconnect();
+  }, [isVideo, isPriorityVideo, videoUrl]);
 
   function openPost() {
     if (isVideo) {
@@ -341,24 +451,41 @@ function PostCard({
     );
   }
 
-  const thumbnail = getImageUrl(
-    post.image || post.thumbnailUrl || post.poster,
+  const thumbnail =
+    getImageUrl(post.image || post.thumbnailUrl || post.poster, 720, 405) ||
+    getCloudinaryVideoThumbnailUrl(videoUrl, 720, 405);
 
-    720,
-
-    405,
-  );
-
-  const videoUrl = getImageUrl(
-    post.mediaUrl || post.videoUrl || post.video || "",
-  );
+  // A short desktop hover is a head start, and pointerdown prewarms the exact
+  // first segment for both mouse and touch. The HLS loader shares that request.
+  function scheduleVideoPreload(event) {
+    if (event?.pointerType && event.pointerType !== "mouse") return;
+    cancelScheduledVideoPreload();
+    // A short hover is a useful head start; fast mouse movement across the feed
+    // doesn't start media downloads. Only the startup segment is warmed.
+    videoPreloadTimerRef.current = window.setTimeout(() => {
+      videoPreloadTimerRef.current = null;
+      preloadCloudinaryVideoStream(videoUrl, "auto", {
+        includeFirstSegment: true,
+      });
+    }, 250);
+  }
 
   return (
     <article className="min-w-0">
       <div className="group relative">
         <button
+          ref={videoCardRef}
           type="button"
           aria-label={`Open video: ${post.caption || "Spotli video"}`}
+          onPointerEnter={scheduleVideoPreload}
+          onPointerLeave={cancelScheduledVideoPreload}
+          onPointerDown={() => {
+            // The viewer's HLS loader shares this in-flight request, so the
+            // player can reuse the startup segment instead of downloading it twice.
+            preloadCloudinaryVideoStream(videoUrl, "auto", {
+              includeFirstSegment: true,
+            });
+          }}
           onClick={openPost}
           className="relative block aspect-video w-full overflow-hidden rounded-lg bg-gray-950 text-left"
         >
@@ -366,19 +493,13 @@ function PostCard({
             <img
               src={thumbnail}
               alt={post.caption || "Video thumbnail"}
-              loading="lazy"
+              loading={isPriorityVideo ? "eager" : "lazy"}
+              fetchPriority={isPriorityVideo ? "high" : "low"}
+              decoding="async"
               onError={(event) => {
                 event.currentTarget.style.display = "none";
               }}
               className="absolute inset-0 h-full w-full object-cover transition-transform duration-300 group-hover:scale-[1.03]"
-            />
-          ) : videoUrl ? (
-            <video
-              src={videoUrl}
-              muted
-              playsInline
-              preload="metadata"
-              className="absolute inset-0 h-full w-full object-cover"
             />
           ) : (
             <div className="absolute inset-0 flex items-center justify-center bg-gray-900">
@@ -417,6 +538,8 @@ function PostCard({
         <div className="min-w-0 flex-1">
           <button
             type="button"
+            onPointerEnter={scheduleVideoPreload}
+            onPointerLeave={cancelScheduledVideoPreload}
             onClick={openPost}
             className="block w-full text-left"
           >
@@ -454,6 +577,46 @@ function PostCard({
 
 function PostGrid({ onOpenVideo, onOpenPhoto, posts: suppliedPosts }) {
   const feedPosts = suppliedPosts ?? samplePosts;
+  const firstPriorityVideoUrl =
+    feedPosts
+      .filter((post) => !isPhotoPost(post))
+      .map((post) => getPostVideoSource(post))
+      .find(Boolean) || "";
+
+  // Warm the first video's HLS playlists as soon as feed data is available.
+  // Keep media-segment downloads under the active player's control so a slow
+  // background request cannot delay the tap-to-play path.
+  const firstVideoPreloadKey = feedPosts
+    .filter((post) => !isPhotoPost(post))
+    .map((post) => `${post?._id || post?.id || ""}:${getPostVideoSource(post)}`)
+    .filter((entry) => entry.slice(entry.indexOf(":") + 1).length > 0)
+    .slice(0, 1)
+    .join("|");
+
+  useEffect(() => {
+    if (!firstVideoPreloadKey) return undefined;
+
+    const candidates = feedPosts
+      .filter((post) => !isPhotoPost(post))
+      .map((post) => getPostVideoSource(post))
+      .filter(Boolean)
+      .slice(0, 1);
+
+    const timers = [];
+    candidates.forEach((url, index) => {
+      const timer = window.setTimeout(
+        () =>
+          preloadCloudinaryVideoStream(url, "auto", {
+            includeFirstSegment: false,
+          }),
+        0,
+      );
+      timers.push(timer);
+    });
+
+    return () => timers.forEach((timer) => window.clearTimeout(timer));
+  }, [firstVideoPreloadKey]);
+
   const [bookmarkedIds, setBookmarkedIds] = useState({});
   const [bookmarkBusyIds, setBookmarkBusyIds] = useState({});
 
@@ -528,6 +691,10 @@ function PostGrid({ onOpenVideo, onOpenPhoto, posts: suppliedPosts }) {
         };
 
         const isPhoto = isPhotoPost(safePost);
+        const cardVideoUrl = getPostVideoSource(safePost);
+        const isPriorityVideo = Boolean(
+          firstPriorityVideoUrl && cardVideoUrl === firstPriorityVideoUrl,
+        );
 
         return (
           <div
@@ -542,6 +709,7 @@ function PostGrid({ onOpenVideo, onOpenPhoto, posts: suppliedPosts }) {
                 bookmarkedIds[String(safePost._id || safePost.id)],
               )}
               onToggleBookmark={toggleBookmark}
+              isPriorityVideo={isPriorityVideo}
             />
           </div>
         );

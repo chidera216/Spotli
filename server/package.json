@@ -7,7 +7,8 @@
   "scripts": {
     "start": "node src/app.js",
     "dev": "nodemon src/app.js",
-    "indexes:follow": "node src/scripts/ensureFollowIndexes.js"
+    "indexes:follow": "node src/scripts/ensureFollowIndexes.js",
+    "videos:prepare-hls": "node src/scripts/prepareExistingVideoHls.js"
   },
   "dependencies": {
     "bcryptjs": "^3.0.3",

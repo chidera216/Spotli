@@ -74,8 +74,6 @@ function Create() {
 
   const cancelUploadRequestedRef = useRef(false);
 
-  const activeCompressionRef = useRef(null);
-
   const [postType, setPostType] = useState("video");
 
   const [media, setMedia] = useState([]);
@@ -512,165 +510,6 @@ function Create() {
     );
   }
 
-  async function compressVideoForUpload(file) {
-    // Browser-native compression avoids requiring a large WASM download.
-    // If this browser cannot safely re-encode video/audio, upload the original.
-    if (
-      typeof MediaRecorder === "undefined" ||
-      !HTMLCanvasElement.prototype.captureStream
-    ) {
-      return file;
-    }
-
-    setNotice("Optimizing video before upload…");
-    setUploadProgress(0);
-
-    let video;
-    let canvas;
-    let animationFrame = 0;
-    let recorder;
-    let sourceStream;
-    let outputStream;
-
-    try {
-      video = document.createElement("video");
-      video.preload = "auto";
-      video.playsInline = true;
-      video.muted = false;
-      video.src = URL.createObjectURL(file);
-      activeCompressionRef.current = {
-        cancel() {
-          try {
-            if (recorder && recorder.state !== "inactive") recorder.stop();
-          } catch {}
-          try {
-            video.pause();
-            video.onended?.();
-          } catch {}
-        },
-      };
-
-      await new Promise((resolve, reject) => {
-        video.onloadedmetadata = resolve;
-        video.onerror = () =>
-          reject(new Error("Could not read this video for compression."));
-        video.load();
-      });
-
-      if (cancelUploadRequestedRef.current) throw new Error("UPLOAD_CANCELLED");
-
-      const maxDimension = 1280;
-      const scale = Math.min(
-        1,
-        maxDimension /
-          Math.max(
-            video.videoWidth || maxDimension,
-            video.videoHeight || maxDimension,
-          ),
-      );
-      canvas = document.createElement("canvas");
-      canvas.width = Math.max(
-        2,
-        Math.floor(((video.videoWidth || 1280) * scale) / 2) * 2,
-      );
-      canvas.height = Math.max(
-        2,
-        Math.floor(((video.videoHeight || 720) * scale) / 2) * 2,
-      );
-      const context = canvas.getContext("2d");
-      if (!context) return file;
-
-      sourceStream = video.captureStream?.() || video.mozCaptureStream?.();
-      if (!sourceStream) return file;
-
-      outputStream = canvas.captureStream(30);
-      sourceStream
-        .getAudioTracks()
-        .forEach((track) => outputStream.addTrack(track));
-
-      const mimeType = [
-        "video/webm;codecs=vp9,opus",
-        "video/webm;codecs=vp8,opus",
-        "video/webm",
-      ].find((type) => MediaRecorder.isTypeSupported(type));
-
-      if (!mimeType) return file;
-
-      const chunks = [];
-      recorder = new MediaRecorder(outputStream, {
-        mimeType,
-        videoBitsPerSecond: 2_500_000,
-        audioBitsPerSecond: 128_000,
-      });
-
-      const recording = new Promise((resolve, reject) => {
-        recorder.ondataavailable = (event) => {
-          if (event.data?.size) chunks.push(event.data);
-        };
-        recorder.onerror = () => reject(new Error("Video compression failed."));
-        recorder.onstop = () => resolve();
-      });
-
-      const drawFrame = () => {
-        if (
-          !video ||
-          video.paused ||
-          video.ended ||
-          cancelUploadRequestedRef.current
-        )
-          return;
-        context.drawImage(video, 0, 0, canvas.width, canvas.height);
-        animationFrame = requestAnimationFrame(drawFrame);
-      };
-
-      recorder.start(250);
-      await video.play();
-      drawFrame();
-
-      await new Promise((resolve, reject) => {
-        video.onended = resolve;
-        video.onerror = () =>
-          reject(new Error("Video playback failed during compression."));
-      });
-
-      if (recorder.state !== "inactive") recorder.stop();
-      await recording;
-
-      if (cancelUploadRequestedRef.current) throw new Error("UPLOAD_CANCELLED");
-
-      const compressedBlob = new Blob(chunks, { type: mimeType });
-      // Avoid replacing the original if compression did not make it meaningfully smaller.
-      if (!compressedBlob.size || compressedBlob.size >= file.size * 0.95)
-        return file;
-
-      const baseName = file.name.replace(/\.[^.]+$/, "") || "spotli-video";
-      return new File([compressedBlob], `${baseName}.webm`, {
-        type: "video/webm",
-        lastModified: Date.now(),
-      });
-    } catch (error) {
-      if (error?.message === "UPLOAD_CANCELLED") throw error;
-      // Keep publishing resilient on browsers/devices that cannot re-encode.
-      return file;
-    } finally {
-      if (animationFrame) cancelAnimationFrame(animationFrame);
-      if (recorder && recorder.state !== "inactive") {
-        try {
-          recorder.stop();
-        } catch {}
-      }
-      sourceStream?.getTracks().forEach((track) => track.stop());
-      outputStream?.getTracks().forEach((track) => track.stop());
-      if (video) {
-        video.pause();
-        if (video.src) URL.revokeObjectURL(video.src);
-        video.removeAttribute("src");
-        video.load();
-      }
-      activeCompressionRef.current = null;
-    }
-  }
-
   async function uploadToCloudinary(file, resourceType, onProgress) {
     if (cancelUploadRequestedRef.current) {
       throw new Error("UPLOAD_CANCELLED");
@@ -810,15 +649,75 @@ function Create() {
     setUploadProgress(0);
     setNotice("");
 
+    let cleanupCompressedVideo = null;
+
     try {
       const resourceType = postType === "photo" ? "image" : "video";
       let mediaAssets = [];
       let videoFileToUpload = null;
 
       if (postType === "video") {
-        videoFileToUpload = await compressVideoForUpload(media[0].file);
-        if (cancelUploadRequestedRef.current)
-          throw new Error("UPLOAD_CANCELLED");
+        const originalVideoFile = media[0].file;
+        videoFileToUpload = originalVideoFile;
+
+        // Compress larger videos before sending them to Cloudinary. The helper
+        // falls back to the original when this browser cannot safely transcode.
+        if (originalVideoFile.size >= 12 * 1024 * 1024) {
+          setUploadProgress(0);
+          setNotice("Optimizing video… 0%");
+
+          try {
+            const { compressVideoForUpload } =
+              await import("../utils/videoCompression.js");
+            const compressionResult = await compressVideoForUpload(
+              originalVideoFile,
+              {
+                shouldCancel: () => cancelUploadRequestedRef.current,
+                onProgress: (progress) => {
+                  if (cancelUploadRequestedRef.current) return;
+                  setUploadProgress(progress);
+                  setNotice(`Optimizing video… ${progress}%`);
+                },
+              },
+            );
+
+            if (cancelUploadRequestedRef.current) {
+              await compressionResult.cleanup?.();
+              throw new Error("UPLOAD_CANCELLED");
+            }
+
+            videoFileToUpload = compressionResult.file;
+            cleanupCompressedVideo = compressionResult.cleanup || null;
+
+            if (compressionResult.compressed) {
+              setUploadProgress(0);
+              setNotice(
+                `Video reduced from ${formatFileSize(originalVideoFile.size)} to ${formatFileSize(videoFileToUpload.size)}. Uploading video… 0%`,
+              );
+            } else {
+              setUploadProgress(0);
+              setNotice(
+                `${compressionResult.reason || "Video kept in its original format."} Uploading video… 0%`,
+              );
+            }
+          } catch (compressionError) {
+            if (
+              cancelUploadRequestedRef.current ||
+              compressionError?.message === "UPLOAD_CANCELLED"
+            ) {
+              throw new Error("UPLOAD_CANCELLED");
+            }
+            console.warn(
+              "Spotli video optimization failed; uploading the original video.",
+              compressionError,
+            );
+            videoFileToUpload = originalVideoFile;
+            setUploadProgress(0);
+            setNotice(
+              "Video optimization failed. Uploading the original video… 0%",
+            );
+          }
+        }
       }
 
       if (postType === "photo" && media.length > 1) {
@@ -939,6 +838,13 @@ function Create() {
         setNotice(error.message || "Unable to publish your post.");
       }
     } finally {
+      if (typeof cleanupCompressedVideo === "function") {
+        try {
+          await cleanupCompressedVideo();
+        } catch (cleanupError) {
+          console.warn("Temporary video cleanup failed:", cleanupError);
+        }
+      }
       activeUploadRequestsRef.current.clear();
       cancelUploadRequestedRef.current = false;
       setIsPublishing(false);
@@ -957,7 +863,6 @@ function Create() {
     }
 
     cancelUploadRequestedRef.current = true;
-    activeCompressionRef.current?.cancel?.();
     activeUploadRequestsRef.current.forEach((request) => request.abort());
     setNotice("Cancelling upload…");
   }
