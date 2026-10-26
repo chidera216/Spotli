@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import {
   useEffect as tablet_useEffect,
+  useLayoutEffect as tablet_useLayoutEffect,
   useRef as tablet_useRef,
   useState as tablet_useState,
   useCallback as tablet_useCallback,
@@ -25,6 +26,7 @@ import {
 } from "lucide-react";
 import {
   useEffect as desktop_useEffect,
+  useLayoutEffect as desktop_useLayoutEffect,
   useMemo as desktop_useMemo,
   useRef as desktop_useRef,
   useState as desktop_useState,
@@ -278,19 +280,32 @@ const hlsManifestPreloadStartedAt = new Map();
 const hlsWarmResourceCache = new Map();
 const hlsWarmResourcePromises = new Map();
 let hlsWarmResourceCacheBytes = 0;
-const HLS_WARM_CACHE_MAX_BYTES = 4 * 1024 * 1024;
-const HLS_WARM_CACHE_MAX_ENTRY_BYTES = 2 * 1024 * 1024;
+// Keep the one preloaded next-video segment available long enough for HLS.js
+// to reuse it when that post becomes active. Some 720p/1080p startup fragments
+// exceed 2 MB, so the old cap silently discarded them after downloading.
+const HLS_WARM_CACHE_MAX_BYTES = 12 * 1024 * 1024;
+const HLS_WARM_CACHE_MAX_ENTRY_BYTES = 8 * 1024 * 1024;
 
-function getWarmResource(url, type) {
-  const entry = hlsWarmResourceCache.get(url);
+function getWarmResourceKey(url, type, rangeStart = null, rangeEnd = null) {
+  const hasRange =
+    Number.isInteger(rangeStart) &&
+    Number.isInteger(rangeEnd) &&
+    rangeStart >= 0 &&
+    rangeEnd > rangeStart;
+  return `${type}::${url}::${hasRange ? `${rangeStart}-${rangeEnd}` : "full"}`;
+}
+
+function getWarmResource(url, type, rangeStart = null, rangeEnd = null) {
+  const key = getWarmResourceKey(url, type, rangeStart, rangeEnd);
+  const entry = hlsWarmResourceCache.get(key);
   if (!entry || entry.type !== type) return null;
   // Refresh insertion order for simple LRU eviction.
-  hlsWarmResourceCache.delete(url);
-  hlsWarmResourceCache.set(url, entry);
+  hlsWarmResourceCache.delete(key);
+  hlsWarmResourceCache.set(key, entry);
   return entry.data;
 }
 
-function setWarmResource(url, type, data) {
+function setWarmResource(url, type, data, rangeStart = null, rangeEnd = null) {
   const size = type === "text" ? data.length * 2 : data?.byteLength || 0;
 
   // Avoid retaining unusually large fragments in memory. They can still be
@@ -303,10 +318,11 @@ function setWarmResource(url, type, data) {
     return;
   }
 
-  const previous = hlsWarmResourceCache.get(url);
+  const key = getWarmResourceKey(url, type, rangeStart, rangeEnd);
+  const previous = hlsWarmResourceCache.get(key);
   if (previous) {
     hlsWarmResourceCacheBytes -= previous.size;
-    hlsWarmResourceCache.delete(url);
+    hlsWarmResourceCache.delete(key);
   }
 
   while (
@@ -319,15 +335,28 @@ function setWarmResource(url, type, data) {
     hlsWarmResourceCacheBytes -= oldest?.size || 0;
   }
 
-  hlsWarmResourceCache.set(url, { type, data, size });
+  hlsWarmResourceCache.set(key, {
+    type,
+    data,
+    size,
+    rangeStart: Number.isInteger(rangeStart) ? rangeStart : null,
+    rangeEnd: Number.isInteger(rangeEnd) ? rangeEnd : null,
+  });
   hlsWarmResourceCacheBytes += size;
 }
 
-function getOrLoadWarmResource(url, type, loader) {
-  const cached = getWarmResource(url, type);
+function getOrLoadWarmResource(
+  url,
+  type,
+  loader,
+  rangeStart = null,
+  rangeEnd = null,
+) {
+  const key = getWarmResourceKey(url, type, rangeStart, rangeEnd);
+  const cached = getWarmResource(url, type, rangeStart, rangeEnd);
   if (cached != null) return Promise.resolve(cached);
 
-  const inFlight = hlsWarmResourcePromises.get(url);
+  const inFlight = hlsWarmResourcePromises.get(key);
   if (inFlight?.type === type) return inFlight.promise;
 
   const startedAt =
@@ -337,30 +366,41 @@ function getOrLoadWarmResource(url, type, loader) {
     .then((data) => {
       const finishedAt =
         typeof performance !== "undefined" ? performance.now() : Date.now();
-      setWarmResource(url, type, data);
+      setWarmResource(url, type, data, rangeStart, rangeEnd);
       const durationMs = Math.max(1, finishedAt - startedAt);
-      const entry = hlsWarmResourceCache.get(url);
+      const entry = hlsWarmResourceCache.get(key);
       if (entry) entry.durationMs = durationMs;
       return data;
     })
     .finally(() => {
-      if (hlsWarmResourcePromises.get(url)?.promise === promise) {
-        hlsWarmResourcePromises.delete(url);
+      if (hlsWarmResourcePromises.get(key)?.promise === promise) {
+        hlsWarmResourcePromises.delete(key);
       }
     });
 
-  hlsWarmResourcePromises.set(url, { type, promise });
+  hlsWarmResourcePromises.set(key, { type, promise });
   return promise;
 }
-// Keep a tiny cache of prepared starts. A whole feed's worth of media preloads
-// competes with the active stream on slow mobile connections.
-const HLS_PREFETCH_CACHE_LIMIT = 2;
+// Keep both playlist/segment preparations for the active video and the next
+// video. A two-entry limit evicted one of those preparations before handoff.
+// This remains bounded so feed-wide speculation cannot grow indefinitely.
+const HLS_PREFETCH_CACHE_LIMIT = 4;
 
 // When a video opens, stop unfinished background preloads so they do not
 // compete with the active stream. Keep completed resources for the active video;
 // the browser may reuse them from HTTP cache when caching is enabled.
 function cancelCloudinaryVideoPreloadsExcept(activeHlsUrl) {
   const keepPrefix = `${activeHlsUrl}::`;
+
+  // Promote resources for the newly active video before applying the small LRU
+  // cap. Otherwise preparing its next video can evict the just-prepared segment.
+  for (const key of [...hlsManifestPreloads.keys()]) {
+    if (!key.startsWith(keepPrefix)) continue;
+    const pending = hlsManifestPreloads.get(key);
+    hlsManifestPreloads.delete(key);
+    hlsManifestPreloads.set(key, pending);
+  }
+
   for (const [key, controller] of hlsManifestPreloadControllers) {
     // Keep the current video's playlist/segment preparation alive even if it is
     // still in flight. Aborting it on tap throws away the head start and can
@@ -390,20 +430,56 @@ async function fetchCachedText(url, signal) {
   });
 }
 
-async function warmCachedResource(url, signal) {
-  return getOrLoadWarmResource(url, "arraybuffer", async () => {
-    const response = await fetch(url, {
-      method: "GET",
-      mode: "cors",
-      credentials: "omit",
-      cache: "force-cache",
-      signal,
-    });
-    if (!response.ok) {
-      throw new Error(`HLS segment preload failed (${response.status})`);
-    }
-    return response.arrayBuffer();
-  });
+async function warmCachedResource(resource, signal) {
+  const descriptor =
+    typeof resource === "string" ? { url: resource } : resource || {};
+  const { url } = descriptor;
+  const hasRange =
+    Number.isInteger(descriptor.rangeStart) &&
+    Number.isInteger(descriptor.rangeEnd) &&
+    descriptor.rangeStart >= 0 &&
+    descriptor.rangeEnd > descriptor.rangeStart;
+  const rangeStart = hasRange ? descriptor.rangeStart : null;
+  const rangeEnd = hasRange ? descriptor.rangeEnd : null;
+
+  if (!url) throw new Error("HLS media resource URL is missing");
+
+  return getOrLoadWarmResource(
+    url,
+    "arraybuffer",
+    async () => {
+      const headers = hasRange
+        ? { Range: `bytes=${rangeStart}-${rangeEnd - 1}` }
+        : undefined;
+      const response = await fetch(url, {
+        method: "GET",
+        mode: "cors",
+        credentials: "omit",
+        cache: "force-cache",
+        headers,
+        signal,
+      });
+      if (!response.ok) {
+        throw new Error(`HLS segment preload failed (${response.status})`);
+      }
+      if (hasRange && response.status !== 206) {
+        // Don't accidentally read/cache a whole packed media file when the
+        // origin ignores Range. It could cost megabytes on a slow connection.
+        try {
+          await response.body?.cancel();
+        } catch {}
+        throw new Error("Origin did not honor the HLS byte-range request");
+      }
+
+      const data = await response.arrayBuffer();
+      if (hasRange && data.byteLength !== rangeEnd - rangeStart) {
+        throw new Error("HLS byte-range response length did not match request");
+      }
+      return data;
+    },
+    rangeStart,
+    rangeEnd,
+  );
 }
 
 // HLS.js normally has its own XHR/fetch loader, which cannot reuse an in-flight
@@ -425,14 +501,21 @@ function createWarmCacheLoader(Hls) {
       const url = context?.url;
       const type =
         context?.responseType === "arraybuffer" ? "arraybuffer" : "text";
+      const hasRange =
+        Number.isInteger(context?.rangeStart) &&
+        Number.isInteger(context?.rangeEnd) &&
+        context.rangeStart >= 0 &&
+        context.rangeEnd > context.rangeStart;
+      const rangeStart = hasRange ? context.rangeStart : null;
+      const rangeEnd = hasRange ? context.rangeEnd : null;
+      const warmKey = getWarmResourceKey(url || "", type, rangeStart, rangeEnd);
 
-      // Byte-range requests cannot safely use a cached whole-resource body.
-      if (!url || context.rangeStart != null || context.rangeEnd != null) {
-        return super.load(context, config, callbacks);
-      }
+      if (!url) return super.load(context, config, callbacks);
 
-      const cachedData = getWarmResource(url, type);
-      const inFlight = hlsWarmResourcePromises.get(url);
+      // Match the exact URL and exclusive byte-range offsets used by HLS.js.
+      // Whole-resource bytes are never treated as if they were a ranged body.
+      const cachedData = getWarmResource(url, type, rangeStart, rangeEnd);
+      const inFlight = hlsWarmResourcePromises.get(warmKey);
       const sharedPromise =
         cachedData != null
           ? Promise.resolve(cachedData)
@@ -453,7 +536,7 @@ function createWarmCacheLoader(Hls) {
             typeof performance !== "undefined" ? performance.now() : Date.now();
           const byteLength =
             type === "text" ? data.length * 2 : data?.byteLength || 0;
-          const cacheEntry = hlsWarmResourceCache.get(url);
+          const cacheEntry = hlsWarmResourceCache.get(warmKey);
           const measuredDuration = cacheEntry?.durationMs || 0;
           // Don't report a near-zero load time for memory hits: that can trick ABR
           // into overestimating the real network and choosing an oversized rendition.
@@ -481,7 +564,7 @@ function createWarmCacheLoader(Hls) {
             {
               url,
               data: type === "arraybuffer" ? data.slice(0) : data,
-              code: 200,
+              code: hasRange ? 206 : 200,
             },
             stats,
             context,
@@ -544,31 +627,102 @@ function parseHlsVariants(playlistText, playlistUrl) {
 }
 
 function parseFirstMediaResources(playlistText, playlistUrl) {
-  const resources = [];
-  const mapMatch = playlistText.match(/#EXT-X-MAP:[^\r\n]*URI="([^"]+)"/i);
-  if (mapMatch) resources.push(resolvePlaylistUri(mapMatch[1], playlistUrl));
-
   const lines = playlistText.split(/\r?\n/).map((line) => line.trim());
+  const resources = [];
+  const mapLine = lines.find((line) => line.startsWith("#EXT-X-MAP:"));
+
+  if (mapLine) {
+    const uriMatch = mapLine.match(/URI="([^"]+)"/i);
+    const rangeMatch = mapLine.match(/BYTERANGE="(\d+)(?:@(\d+))?"/i);
+    if (uriMatch) {
+      const resource = {
+        url: resolvePlaylistUri(uriMatch[1], playlistUrl),
+      };
+      if (rangeMatch) {
+        const length = Number(rangeMatch[1]);
+        const start = rangeMatch[2] == null ? 0 : Number(rangeMatch[2]);
+        if (
+          Number.isSafeInteger(length) &&
+          length > 0 &&
+          Number.isSafeInteger(start)
+        ) {
+          resource.rangeStart = start;
+          resource.rangeEnd = start + length;
+        }
+      }
+      if (resource.url) resources.push(resource);
+    }
+  }
+
   let expectingSegment = false;
+  let pendingByteRange = null;
+  let firstSegment = null;
   for (const line of lines) {
+    if (line.startsWith("#EXT-X-BYTERANGE:")) {
+      pendingByteRange = line.slice(line.indexOf(":") + 1).trim();
+      continue;
+    }
     if (line.startsWith("#EXTINF:")) {
       expectingSegment = true;
       continue;
     }
     if (expectingSegment && line && !line.startsWith("#")) {
-      resources.push(resolvePlaylistUri(line, playlistUrl));
+      const url = resolvePlaylistUri(line, playlistUrl);
+      if (url) {
+        firstSegment = { url };
+        if (pendingByteRange != null) {
+          const rangeMatch = pendingByteRange.match(/^(\d+)(?:@(\d+))?$/);
+          if (rangeMatch) {
+            const length = Number(rangeMatch[1]);
+            // An omitted offset refers to the preceding byte-range segment.
+            // Since this is the first segment we can see, don't guess an offset.
+            if (rangeMatch[2] != null) {
+              const start = Number(rangeMatch[2]);
+              if (
+                Number.isSafeInteger(length) &&
+                length > 0 &&
+                Number.isSafeInteger(start)
+              ) {
+                firstSegment.rangeStart = start;
+                firstSegment.rangeEnd = start + length;
+              } else {
+                firstSegment = null;
+              }
+            } else {
+              firstSegment = null;
+            }
+          } else {
+            firstSegment = null;
+          }
+        }
+      }
       break;
     }
   }
 
-  // Some playlists omit EXTINF on a partially generated initial response.
-  if (resources.length === 0) {
-    const firstMediaLine = lines.find((line) => line && !line.startsWith("#"));
-    if (firstMediaLine)
-      resources.push(resolvePlaylistUri(firstMediaLine, playlistUrl));
+  // Don't interpret a master-playlist child URI as a media segment if the
+  // response is incomplete or does not include EXTINF media entries.
+  if (!firstSegment && !lines.some((line) => line.startsWith("#EXTINF:"))) {
+    return [];
   }
+  if (!firstSegment) return [];
+  resources.push(firstSegment);
 
-  return [...new Set(resources.filter(Boolean))].slice(0, 2);
+  // Keep only the init map plus the first actual media segment.
+  const seen = new Set();
+  return resources
+    .filter((resource) => {
+      const key = getWarmResourceKey(
+        resource.url,
+        "arraybuffer",
+        resource.rangeStart ?? null,
+        resource.rangeEnd ?? null,
+      );
+      if (!resource.url || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .slice(0, 2);
 }
 
 export function preloadCloudinaryVideoStream(
@@ -597,7 +751,12 @@ export function preloadCloudinaryVideoStream(
   const cacheKey = `${hlsUrl}::${qualityKey}::${includeFirstSegment ? "segment" : "playlist"}`;
 
   if (hlsManifestPreloads.has(cacheKey)) {
-    return hlsManifestPreloads.get(cacheKey);
+    // Refresh insertion order on reuse so active/next-video preparations are
+    // not treated as stale by the bounded request cache.
+    const existing = hlsManifestPreloads.get(cacheKey);
+    hlsManifestPreloads.delete(cacheKey);
+    hlsManifestPreloads.set(cacheKey, existing);
+    return existing;
   }
 
   const controller =
@@ -666,12 +825,18 @@ export function preloadCloudinaryVideoStream(
       // download a video segment for cards the viewer may never open.
       if (includeFirstSegment) {
         const resources = parseFirstMediaResources(masterText, hlsUrl);
-        await Promise.allSettled(
+        if (!resources.length) {
+          throw new Error("No initial HLS media resource was found");
+        }
+        const results = await Promise.allSettled(
           resources.map((url) => warmCachedResource(url, signal)),
         );
+        if (results.some((result) => result.status === "rejected")) {
+          throw new Error("Could not warm the initial HLS media resource");
+        }
       }
       hlsManifestPreloadCompleted.add(cacheKey);
-      return;
+      return true;
     }
 
     const mediaPlaylistText = await fetchCachedText(startupVariant.url, signal);
@@ -680,12 +845,19 @@ export function preloadCloudinaryVideoStream(
         mediaPlaylistText,
         startupVariant.url,
       );
-      await Promise.allSettled(
+      if (!resources.length) {
+        throw new Error("No initial HLS media resource was found");
+      }
+      const results = await Promise.allSettled(
         resources.map((url) => warmCachedResource(url, signal)),
       );
+      if (results.some((result) => result.status === "rejected")) {
+        throw new Error("Could not warm the initial HLS media resource");
+      }
     }
     // On success, preserve this prewarm when the active HLS player takes over.
     hlsManifestPreloadCompleted.add(cacheKey);
+    return true;
   })()
     .catch(() => {
       // Prefetch must never block playback; the active player retries normally.
@@ -697,6 +869,7 @@ export function preloadCloudinaryVideoStream(
       ) {
         hlsManifestPreloads.delete(cacheKey);
       }
+      return false;
     })
     .finally(() => {
       if (
@@ -808,8 +981,6 @@ function attachCloudinaryAdaptiveStream(
   let networkRetries = 0;
   let mediaRetries = 0;
   let manualRecoveryAttempts = 0;
-  let hlsReadinessRetries = 0;
-  let hlsReadinessRetryTimer = null;
   let selectedStreamQuality =
     initialQualityKey === "NaN" ? "auto" : initialQualityKey;
   let streamHasPlayed = false;
@@ -854,10 +1025,6 @@ function attachCloudinaryAdaptiveStream(
 
   const onVideoPlaying = () => {
     streamHasPlayed = true;
-    if (hlsReadinessRetryTimer != null) {
-      clearTimeout(hlsReadinessRetryTimer);
-      hlsReadinessRetryTimer = null;
-    }
     rememberPosition();
   };
   video.addEventListener("playing", onVideoPlaying);
@@ -1187,38 +1354,6 @@ function attachCloudinaryAdaptiveStream(
     hls.on(Hls.Events.ERROR, (_event, data) => {
       if (cancelled || !data?.fatal) return;
 
-      // Cloudinary can temporarily report 404/423 while an asynchronously
-      // generated HLS rendition is still becoming available. hls.js performs
-      // its own request retries first; give the manifest/level one final,
-      // bounded retry before switching to the progressive MP4 fallback. Reload
-      // the master playlist rather than calling startLoad(), which cannot
-      // recover a manifest that never loaded successfully.
-      const responseCode = Number(data.response?.code);
-      const isHlsPlaylistError = /manifest|level/i.test(
-        String(data.details || ""),
-      );
-      const cloudinaryHlsNotReady =
-        !streamHasPlayed &&
-        isHlsPlaylistError &&
-        (responseCode === 404 || responseCode === 423);
-
-      if (cloudinaryHlsNotReady && hlsReadinessRetries < 1) {
-        hlsReadinessRetries += 1;
-        if (hlsReadinessRetryTimer != null) {
-          clearTimeout(hlsReadinessRetryTimer);
-        }
-        hlsReadinessRetryTimer = setTimeout(
-          () => {
-            hlsReadinessRetryTimer = null;
-            if (cancelled || !hls) return;
-            networkRetries = 0;
-            hls.loadSource(hlsUrl);
-          },
-          responseCode === 423 ? 500 : 300,
-        );
-        return;
-      }
-
       if (data.type === Hls.ErrorTypes.NETWORK_ERROR && networkRetries < 2) {
         networkRetries += 1;
         hls?.startLoad();
@@ -1283,10 +1418,6 @@ function attachCloudinaryAdaptiveStream(
 
   return () => {
     cancelled = true;
-    if (hlsReadinessRetryTimer != null) {
-      clearTimeout(hlsReadinessRetryTimer);
-      hlsReadinessRetryTimer = null;
-    }
     rememberPosition();
     video.removeEventListener("error", onNativeHlsError);
     video.removeEventListener("loadeddata", onMediaReady);
@@ -1414,60 +1545,184 @@ function createTabletViewerImplementation() {
     );
   }
 
+  function getPostTypeValues(post) {
+    return [post?.mediaType, post?.type, post?.postType, post?.kind]
+      .map((value) =>
+        String(value || "")
+          .trim()
+          .toLowerCase(),
+      )
+      .filter(Boolean);
+  }
+
+  function mediaValueToUrl(value) {
+    if (typeof value === "string") return value.trim();
+    if (!value || typeof value !== "object") return "";
+    return (
+      value.url ||
+      value.src ||
+      value.imageUrl ||
+      value.videoUrl ||
+      value.secure_url ||
+      value.path ||
+      value.location ||
+      ""
+    );
+  }
+
+  function looksLikeImageMedia(value) {
+    const url = mediaValueToUrl(value);
+    return /(?:\.(?:avif|bmp|gif|jpe?g|png|webp)(?:[?#]|$)|\/image\/upload\/|^data:image\/)/i.test(
+      url,
+    );
+  }
+
+  function looksLikeVideoMedia(value) {
+    const url = mediaValueToUrl(value);
+    return /(?:\.(?:mp4|mov|m4v|webm|avi|mkv|m3u8|mpd)(?:[?#]|$)|\/video\/upload\/|^data:video\/)/i.test(
+      url,
+    );
+  }
+
+  function isDeclaredPhotoPost(post) {
+    const mediaType = String(post?.mediaType || "")
+      .trim()
+      .toLowerCase();
+    if (["image", "photo", "photos", "gallery"].includes(mediaType))
+      return true;
+    if (["video", "reel"].includes(mediaType)) return false;
+
+    const otherTypes = [post?.type, post?.postType, post?.kind]
+      .map((value) =>
+        String(value || "")
+          .trim()
+          .toLowerCase(),
+      )
+      .filter(Boolean);
+    if (
+      otherTypes.some((type) =>
+        ["image", "photo", "photos", "gallery"].includes(type),
+      )
+    )
+      return true;
+    if (otherTypes.some((type) => ["video", "reel"].includes(type)))
+      return false;
+
+    return (
+      post?.isImagePost === true ||
+      post?.isPhotoPost === true ||
+      String(post?.mimeType || post?.mimetype || "")
+        .toLowerCase()
+        .startsWith("image/")
+    );
+  }
+
+  function isExplicitVideoPost(post) {
+    const mediaType = String(post?.mediaType || "")
+      .trim()
+      .toLowerCase();
+    if (["video", "reel"].includes(mediaType)) return true;
+    if (["image", "photo", "photos", "gallery"].includes(mediaType))
+      return false;
+
+    const otherTypes = [post?.type, post?.postType, post?.kind]
+      .map((value) =>
+        String(value || "")
+          .trim()
+          .toLowerCase(),
+      )
+      .filter(Boolean);
+    if (otherTypes.some((type) => ["video", "reel"].includes(type)))
+      return true;
+    if (
+      otherTypes.some((type) =>
+        ["image", "photo", "photos", "gallery"].includes(type),
+      )
+    )
+      return false;
+
+    return (
+      post?.isVideoPost === true ||
+      Boolean(post?.videoUrl || post?.videoFile || post?.videos?.length) ||
+      looksLikeVideoMedia(post?.video) ||
+      looksLikeVideoMedia(post?.mediaUrl) ||
+      looksLikeVideoMedia(post?.media) ||
+      looksLikeVideoMedia(post?.mediaUrls?.[0])
+    );
+  }
+
   function getPostImages(post) {
+    const imageLike = (value) => {
+      const url = mediaValueToUrl(value);
+      return url ? resolveMediaUrl(url) : "";
+    };
+    const photoPost =
+      isDeclaredPhotoPost(post) ||
+      [post?.mediaUrl, post?.media, post?.mediaUrls?.[0]].some(
+        looksLikeImageMedia,
+      );
     const sources = [
       ...(Array.isArray(post?.images) ? post.images : []),
-
       ...(Array.isArray(post?.mediaUrls) ? post.mediaUrls : []),
-
       ...(Array.isArray(post?.photos) ? post.photos : []),
+      post?.imageUrl,
+      post?.image,
+      post?.photoUrl,
+      ...(photoPost ? [post?.mediaUrl, post?.media] : []),
     ];
 
-    const images = sources
-
-      .map((item) => {
-        if (typeof item === "string") return resolveMediaUrl(item);
-
-        if (item && typeof item === "object") {
-          return resolveMediaUrl(
-            item.url || item.src || item.imageUrl || item.secure_url || "",
-          );
-        }
-
-        return "";
-      })
-
-      .filter(Boolean);
-
+    const images = sources.map(imageLike).filter(Boolean);
     if (images.length) return [...new Set(images)];
 
-    const single =
+    const single = mediaValueToUrl(
       post?.imageUrl ||
-      post?.image ||
-      post?.thumbnailUrl ||
-      post?.thumbnail ||
-      "";
+        post?.image ||
+        post?.photoUrl ||
+        (photoPost ? post?.mediaUrl || post?.media : "") ||
+        post?.thumbnailUrl ||
+        post?.thumbnail ||
+        "",
+    );
+    if (!single) return [];
 
-    if (typeof single !== "string" || !single) return [];
-
-    if (/^https?:\/\//i.test(single) || single.startsWith("/")) {
+    if (/^(?:https?:|data:|blob:)/i.test(single) || single.startsWith("/")) {
       return [resolveMediaUrl(single)];
     }
 
-    return [
-      `https://images.unsplash.com/${single}?auto=format&fit=crop&w=1200&q=90`,
-    ];
+    if (/^photo-/i.test(single)) {
+      return [
+        `https://images.unsplash.com/${single}?auto=format&fit=crop&w=1200&q=90`,
+      ];
+    }
+    return [];
   }
 
   function getOriginalVideoUrl(post) {
-    return resolveMediaUrl(
-      post?.videoUrl ||
-        post?.video ||
-        post?.mediaUrl ||
-        (typeof post?.media === "string" ? post.media : "") ||
-        post?.url ||
-        "",
-    );
+    if (isDeclaredPhotoPost(post)) return "";
+
+    const explicitVideoCandidates = [
+      post?.videoUrl,
+      post?.video,
+      post?.videoFile,
+      Array.isArray(post?.videos) ? post.videos[0] : "",
+    ];
+    for (const candidate of explicitVideoCandidates) {
+      const url = mediaValueToUrl(candidate);
+      if (url && !looksLikeImageMedia(url)) return resolveMediaUrl(url);
+    }
+
+    const ambiguousCandidates = [
+      post?.mediaUrl,
+      post?.media,
+      Array.isArray(post?.mediaUrls) ? post.mediaUrls[0] : "",
+      post?.url,
+    ];
+    for (const candidate of ambiguousCandidates) {
+      const url = mediaValueToUrl(candidate);
+      if (!url || looksLikeImageMedia(url)) continue;
+      return resolveMediaUrl(url);
+    }
+    return "";
   }
 
   function getVideoUrl(post) {
@@ -1475,18 +1730,14 @@ function createTabletViewerImplementation() {
   }
 
   function isPhotoPost(post) {
-    const type = String(post?.type || post?.mediaType || "").toLowerCase();
+    if (isDeclaredPhotoPost(post)) return true;
+    if (isExplicitVideoPost(post)) return false;
 
-    if (
-      ["image", "photo", "photos", "gallery"].includes(type) ||
-      post?.isImagePost === true
-    ) {
+    const ambiguousMedia = [post?.mediaUrl, post?.media, post?.mediaUrls?.[0]];
+    if (ambiguousMedia.some(looksLikeImageMedia)) return true;
+    if (Array.isArray(post?.photos) && post.photos.length) return true;
+    if (Array.isArray(post?.images) && post.images.length && !getVideoUrl(post))
       return true;
-    }
-
-    if (["video", "reel"].includes(type) || post?.isVideoPost === true) {
-      return false;
-    }
 
     return !getVideoUrl(post) && getPostImages(post).length > 0;
   }
@@ -1510,13 +1761,41 @@ function createTabletViewerImplementation() {
 
     initialPost,
 
+    preservePostOrder = false,
+
+    initialPostIndex = null,
+
     onBack,
   }) {
-    // Start with the exact post selected on Home, then shuffle every other
-    // post once for this viewer session. This never scrolls the Home page.
+    // Profile viewers preserve the supplied grid order. Other entry points keep
+    // their existing selected-first shuffled behavior.
     const initialPostId = getPostId(initialPost);
 
     const posts = useMemo(() => {
+      if (preservePostOrder) {
+        const containsInitial = sourcePosts.some(
+          (post) =>
+            post === initialPost ||
+            String(getPostId(post)) === String(initialPostId),
+        );
+        if (containsInitial) return sourcePosts;
+        if (!initialPost) return sourcePosts;
+
+        // If post identifiers were normalized differently by a caller, retain
+        // the profile order and restore the selected post at its original index
+        // rather than moving it to the beginning (which made earlier videos
+        // impossible to reach by scrolling backwards).
+        if (Number.isInteger(initialPostIndex) && initialPostIndex >= 0) {
+          const ordered = [...sourcePosts];
+          const safeIndex = Math.min(initialPostIndex, ordered.length);
+          if (safeIndex < ordered.length) ordered[safeIndex] = initialPost;
+          else ordered.splice(safeIndex, 0, initialPost);
+          return ordered;
+        }
+
+        return [initialPost, ...sourcePosts];
+      }
+
       if (initialPostId == null) return sourcePosts;
 
       const selectedPost =
@@ -1539,7 +1818,13 @@ function createTabletViewerImplementation() {
       }
 
       return [selectedPost, ...remainingPosts];
-    }, [sourcePosts, initialPostId, initialPost]);
+    }, [
+      sourcePosts,
+      initialPostId,
+      initialPost,
+      preservePostOrder,
+      initialPostIndex,
+    ]);
 
     const feedRef = useRef(null);
 
@@ -1563,15 +1848,18 @@ function createTabletViewerImplementation() {
     const lastFeedScrollTopRef = useRef(0);
 
     const initialScrollDoneRef = useRef(false);
+    const [initialPlacementReady, setInitialPlacementReady] = useState(false);
 
     const [activeIndex, setActiveIndex] = useState(() => {
       const initialId = getPostId(initialPost);
-
       const index = posts.findIndex(
-        (post) => String(getPostId(post)) === String(initialId),
+        (post) =>
+          post === initialPost || String(getPostId(post)) === String(initialId),
       );
-
-      return index >= 0 ? index : 0;
+      if (index >= 0) return index;
+      return Number.isInteger(initialPostIndex) && initialPostIndex >= 0
+        ? Math.min(initialPostIndex, Math.max(posts.length - 1, 0))
+        : 0;
     });
 
     const [likedPosts, setLikedPosts] = useState({});
@@ -1797,15 +2085,29 @@ function createTabletViewerImplementation() {
       });
 
       let segmentPreloaded = false;
+      let segmentPreloadInProgress = false;
+      let lastSegmentPreloadAttemptAt = 0;
       const cleanupListeners = () => {
         activeVideo.removeEventListener("timeupdate", maybePreloadNextSegment);
         activeVideo.removeEventListener("progress", maybePreloadNextSegment);
         activeVideo.removeEventListener("playing", maybePreloadNextSegment);
       };
       const maybePreloadNextSegment = () => {
-        if (segmentPreloaded || activeVideo.paused || activeVideo.ended) return;
+        if (
+          segmentPreloaded ||
+          segmentPreloadInProgress ||
+          activeVideo.paused ||
+          activeVideo.ended
+        )
+          return;
+
+        // Failed speculative requests used to be marked complete before the
+        // network request finished, so they never retried during this playback.
+        const now = Date.now();
+        if (now - lastSegmentPreloadAttemptAt < 2500) return;
+
         const currentTime = Number(activeVideo.currentTime) || 0;
-        if (currentTime < 0.5 || !activeVideo.buffered?.length) return;
+        if (!activeVideo.buffered?.length) return;
 
         let bufferedAhead = 0;
         for (let index = 0; index < activeVideo.buffered.length; index += 1) {
@@ -1817,14 +2119,29 @@ function createTabletViewerImplementation() {
           }
         }
 
-        // Leave at least ~1.5 seconds of current playback buffered before
-        // spending bandwidth on the next video's first segment.
-        if (bufferedAhead < 1.5) return;
-        segmentPreloaded = true;
-        cleanupListeners();
-        preloadCloudinaryVideoStream(nextUrl, "auto", {
-          includeFirstSegment: true,
-        });
+        // Prepare early, but keep a small safety buffer for the active video.
+        // Weak connections still get a little more headroom before competing.
+        const minimumBufferedAhead = getNetworkPlaybackProfile().constrained
+          ? 1.0
+          : 0.45;
+        if (bufferedAhead < minimumBufferedAhead) return;
+
+        segmentPreloadInProgress = true;
+        lastSegmentPreloadAttemptAt = now;
+        Promise.resolve(
+          preloadCloudinaryVideoStream(nextUrl, selectedQualityRef.current, {
+            includeFirstSegment: true,
+          }),
+        )
+          .then((prepared) => {
+            if (prepared === true) {
+              segmentPreloaded = true;
+              cleanupListeners();
+            }
+          })
+          .finally(() => {
+            segmentPreloadInProgress = false;
+          });
       };
 
       activeVideo.addEventListener("timeupdate", maybePreloadNextSegment);
@@ -2207,8 +2524,9 @@ function createTabletViewerImplementation() {
     useEffect(() => {
       activeIndexRef.current = activeIndex;
     }, [activeIndex]);
-    // Only align to the initial post once. Never force-scroll on every render.
-    useEffect(() => {
+    // Align before paint so the clicked post opens directly instead of briefly
+    // showing the first post and visibly scrolling to the selection.
+    tablet_useLayoutEffect(() => {
       const feed = feedRef.current;
 
       if (!feed || !posts.length || initialScrollDoneRef.current) return;
@@ -2216,26 +2534,34 @@ function createTabletViewerImplementation() {
       const initialId = getPostId(initialPost);
 
       const index = posts.findIndex(
-        (post) => String(getPostId(post)) === String(initialId),
+        (post) =>
+          post === initialPost || String(getPostId(post)) === String(initialId),
       );
 
-      const resolvedIndex = index >= 0 ? index : 0;
-
+      const requestedIndex =
+        Number.isInteger(initialPostIndex) && initialPostIndex >= 0
+          ? Math.min(initialPostIndex, Math.max(posts.length - 1, 0))
+          : 0;
+      const resolvedIndex = index >= 0 ? index : requestedIndex;
       const targetPost = posts[resolvedIndex];
-
       const target = postRefs.current[getPostId(targetPost)];
-
       if (!target) return;
 
       initialScrollDoneRef.current = true;
-
       activeIndexRef.current = resolvedIndex;
-
       setActiveIndex(resolvedIndex);
 
-      feed.scrollTop = target.offsetTop;
+      // Place the selected card instantly while scroll snapping is disabled.
+      // Re-enabling snap after this synchronous layout update prevents an
+      // animated journey from the first post to the clicked post.
+      const feedTop = feed.getBoundingClientRect().top;
+      const targetTop = target.getBoundingClientRect().top;
+      feed.style.scrollBehavior = "auto";
+      feed.style.scrollSnapType = "none";
+      feed.scrollTop = Math.max(0, feed.scrollTop + targetTop - feedTop);
       lastFeedScrollTopRef.current = feed.scrollTop;
-    }, [initialPost, posts]);
+      setInitialPlacementReady(true);
+    }, [initialPost, posts, initialPostIndex]);
     // Play only the active video; do not change the feed scroll position here.
     useEffect(() => {
       posts.forEach((post, index) => {
@@ -2295,20 +2621,30 @@ function createTabletViewerImplementation() {
 
         if (!currentFeed || !currentFeed.clientHeight) return;
 
-        const scrollTop = currentFeed.scrollTop;
-        const pagePosition = scrollTop / currentFeed.clientHeight;
-        const lowerPage = Math.floor(pagePosition);
-        const pageFraction = pagePosition - lowerPage;
-        const movingDown = scrollTop >= lastFeedScrollTopRef.current;
-        lastFeedScrollTopRef.current = scrollTop;
+        const feedRect = currentFeed.getBoundingClientRect();
+        const feedCenter = feedRect.top + currentFeed.clientHeight / 2;
+        let nextIndex = activeIndexRef.current;
+        let bestDistance = Number.POSITIVE_INFINITY;
 
-        // Switch to the next item after ~35% of a downward swipe, rather than
-        // waiting until 60% of the next card is visible. On an upward swipe,
-        // switch back after ~35% toward the previous item.
-        const resolvedPage = movingDown
-          ? lowerPage + (pageFraction >= 0.35 ? 1 : 0)
-          : lowerPage + (pageFraction > 0.65 ? 1 : 0);
-        const nextIndex = Math.max(0, Math.min(resolvedPage, posts.length - 1));
+        // Resolve the active card from its actual visible position instead of
+        // dividing scrollTop by a viewport height. This stays correct when the
+        // browser chrome/safe area changes height and supports both directions.
+        posts.forEach((post, index) => {
+          const element = postRefs.current[getPostId(post)];
+          if (!element) return;
+          const rect = element.getBoundingClientRect();
+          const visibleHeight =
+            Math.min(rect.bottom, feedRect.bottom) -
+            Math.max(rect.top, feedRect.top);
+          if (visibleHeight <= 0) return;
+          const distance = Math.abs((rect.top + rect.bottom) / 2 - feedCenter);
+          if (distance < bestDistance) {
+            bestDistance = distance;
+            nextIndex = index;
+          }
+        });
+
+        lastFeedScrollTopRef.current = currentFeed.scrollTop;
 
         if (nextIndex !== activeIndexRef.current) {
           activeIndexRef.current = nextIndex;
@@ -2318,7 +2654,7 @@ function createTabletViewerImplementation() {
           setPaused(false);
         }
       });
-    }, [posts.length, revealDetails]);
+    }, [posts, revealDetails]);
 
     function togglePlayback(postId) {
       const video = videoRefs.current[postId];
@@ -2688,11 +3024,11 @@ function createTabletViewerImplementation() {
           onTouchStart={revealDetails}
           onTouchMove={revealDetails}
           onWheel={revealDetails}
-          className="h-full snap-y snap-mandatory overflow-x-hidden overflow-y-auto overscroll-contain scroll-smooth scrollbar-none [&::-webkit-scrollbar]:hidden"
+          className="h-full snap-y snap-mandatory overflow-x-hidden overflow-y-auto overscroll-contain scrollbar-none [&::-webkit-scrollbar]:hidden"
           style={{
             WebkitOverflowScrolling: "touch",
-
-            scrollBehavior: "smooth",
+            scrollBehavior: "auto",
+            scrollSnapType: initialPlacementReady ? "y mandatory" : "none",
           }}
         >
           {posts.map((post, index) => {
@@ -2714,7 +3050,11 @@ function createTabletViewerImplementation() {
 
             const videoUrl = getVideoUrl(post);
 
-            const orientation = videoOrientations[postId] || "portrait";
+            // Until real video dimensions are available, contain the frame so
+            // landscape content is never cropped while HLS initializes.
+            const orientation = videoOrientations[postId] || "unknown";
+
+            const orientationKnown = orientation !== "unknown";
 
             const isLandscape = orientation === "landscape";
 
@@ -2909,7 +3249,9 @@ function createTabletViewerImplementation() {
                         }}
                         onPlaying={() => setPlayingVideoPostId(String(postId))}
                         className={`h-full w-full ${
-                          isLandscape ? "object-contain" : "object-cover"
+                          isLandscape || !orientationKnown
+                            ? "object-contain"
+                            : "object-cover"
                         }`}
                       />
                       {thumbnail &&
@@ -2969,16 +3311,16 @@ function createTabletViewerImplementation() {
 
                 {!photoPost && isActive && playbackVisible && (
                   <div
-                    className="absolute inset-x-0 bottom-0 z-60 w-full bg-transparent px-4 pb-[max(12px,env(safe-area-inset-bottom))] pt-2 text-white transition-opacity duration-300"
+                    className="absolute inset-x-0 bottom-0 z-60 w-full bg-transparent px-3 pb-[max(12px,env(safe-area-inset-bottom))] pt-2 text-white transition-opacity duration-300"
                     onClick={(event) => event.stopPropagation()}
                     onTouchStart={(event) => event.stopPropagation()}
                   >
-                    <div className="flex w-full items-center gap-3 text-xs">
+                    <div className="flex w-full items-center gap-1 text-xs">
                       <button
                         type="button"
                         onClick={() => togglePlayback(postId)}
                         aria-label={paused ? "Play video" : "Pause video"}
-                        className="shrink-0 p-1"
+                        className="grid h-9 w-9 shrink-0 place-items-center rounded-md transition-colors hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
                       >
                         {paused ? (
                           <Play size={17} fill="currentColor" />
@@ -2986,14 +3328,14 @@ function createTabletViewerImplementation() {
                           <Pause size={17} />
                         )}
                       </button>
-                      <span className="shrink-0 tabular-nums">
+                      <span className="shrink-0 tabular-nums text-[10px] sm:text-xs">
                         {formatTime(currentTime)} / {formatTime(duration)}
                       </span>
                       <button
                         type="button"
                         onClick={() => toggleMute(postId)}
                         aria-label={muted ? "Unmute video" : "Mute video"}
-                        className="shrink-0 p-1"
+                        className="grid h-9 w-9 shrink-0 place-items-center rounded-md transition-colors hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
                       >
                         {muted ? <VolumeX size={17} /> : <Volume2 size={17} />}
                       </button>
@@ -3005,7 +3347,7 @@ function createTabletViewerImplementation() {
                             ? "Turn captions off"
                             : "Turn captions on"
                         }
-                        className={`shrink-0 p-1 ${captionsEnabled ? "text-[#FF2D4A]" : "text-white"}`}
+                        className={`grid h-9 w-9 shrink-0 place-items-center rounded-md transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white ${captionsEnabled ? "bg-[#FF2D4A]/15 text-[#FF2D4A]" : "text-white hover:bg-white/10"}`}
                       >
                         <Captions size={17} />
                       </button>
@@ -3014,12 +3356,12 @@ function createTabletViewerImplementation() {
                           type="button"
                           onClick={() => setSettingsOpen((open) => !open)}
                           aria-label="Playback settings"
-                          className="p-1"
+                          className="grid h-9 w-9 place-items-center rounded-md transition-colors hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
                         >
                           <Settings size={17} />
                         </button>
                         {settingsOpen && (
-                          <div className="absolute bottom-9 right-0 z-70 max-h-72 min-w-40 max-w-48 overflow-y-auto rounded-lg bg-black/95 p-2 text-white shadow-xl">
+                          <div className="absolute bottom-10 right-0 z-70 max-h-72 min-w-40 max-w-48 overflow-y-auto rounded-lg bg-black/95 p-2 text-white shadow-xl">
                             <p className="px-3 pb-1 pt-1 text-[10px] font-semibold uppercase tracking-wide text-white/55">
                               Playback speed
                             </p>
@@ -3084,7 +3426,7 @@ function createTabletViewerImplementation() {
                           else video.requestFullscreen?.();
                         }}
                         aria-label="Fullscreen video"
-                        className="shrink-0 p-1"
+                        className="grid h-9 w-9 shrink-0 place-items-center rounded-md transition-colors hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
                       >
                         <Maximize size={17} />
                       </button>
@@ -3099,7 +3441,7 @@ function createTabletViewerImplementation() {
                         seekVideo(postId, event.target.value)
                       }
                       aria-label="Seek video"
-                      className="mt-2 block h-1.5 w-full cursor-pointer accent-white"
+                      className="mt-1 block h-7 w-full cursor-pointer touch-pan-x accent-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
                     />
                   </div>
                 )}
@@ -3123,27 +3465,27 @@ function createTabletViewerImplementation() {
                   </span>
                 </header>
 
-                <aside className="absolute bottom-32 right-2 z-40 flex flex-col items-center gap-5">
+                <aside className="absolute bottom-32 right-2 z-40 flex flex-col items-center gap-3">
                   <button
                     type="button"
                     onClick={() => toggleLike(postId)}
                     aria-label={
                       likedPosts[postId] ? "Unlike post" : "Like post"
                     }
-                    className="flex flex-col items-center gap-1"
+                    className="flex min-h-11 min-w-11 flex-col items-center gap-0.5"
                   >
                     <span
-                      className={`grid h-11 w-11 place-items-center rounded-full bg-black/35 backdrop-blur-sm ${
+                      className={`grid h-9 w-9 place-items-center rounded-full bg-black/35 backdrop-blur-sm ${
                         likedPosts[postId] ? "text-[#FF2D4A]" : "text-white"
                       }`}
                     >
                       <Heart
-                        size={35}
+                        size={24}
                         fill={likedPosts[postId] ? "currentColor" : "none"}
                       />
                     </span>
 
-                    <span className="text-xs font-semibold">
+                    <span className="text-[11px] font-semibold">
                       {formatCount(
                         likeCounts[String(postId)] ??
                           Number(
@@ -3160,13 +3502,13 @@ function createTabletViewerImplementation() {
                     type="button"
                     onClick={() => openComments(post)}
                     aria-label="Comments"
-                    className="flex flex-col items-center gap-1"
+                    className="flex min-h-11 min-w-11 flex-col items-center gap-0.5"
                   >
-                    <span className="grid h-11 w-11 place-items-center rounded-full bg-black/35 backdrop-blur-sm">
-                      <MessageCircle size={35} />
+                    <span className="grid h-9 w-9 place-items-center rounded-full bg-black/35 backdrop-blur-sm">
+                      <MessageCircle size={24} />
                     </span>
 
-                    <span className="text-xs font-semibold">
+                    <span className="text-[11px] font-semibold">
                       {formatCount(
                         commentCounts[String(getPostId(post))] ??
                           post.commentsCount ??
@@ -3181,13 +3523,13 @@ function createTabletViewerImplementation() {
                     type="button"
                     onClick={() => sharePost(post)}
                     aria-label="Share post"
-                    className="flex flex-col items-center gap-1"
+                    className="flex min-h-11 min-w-11 flex-col items-center gap-0.5"
                   >
-                    <span className="grid h-11 w-11 place-items-center rounded-full bg-black/35 backdrop-blur-sm">
-                      <Share2 size={23} />
+                    <span className="grid h-9 w-9 place-items-center rounded-full bg-black/35 backdrop-blur-sm">
+                      <Share2 size={20} />
                     </span>
 
-                    <span className="text-xs font-semibold">
+                    <span className="text-[11px] font-semibold">
                       {formatCount(post.shares || 0)}
                     </span>
                   </button>
@@ -3196,10 +3538,10 @@ function createTabletViewerImplementation() {
                     type="button"
                     onClick={() => openPostMenu(post)}
                     aria-label="More post options"
-                    className="flex flex-col items-center gap-1"
+                    className="flex min-h-11 min-w-11 flex-col items-center gap-0.5"
                   >
-                    <span className="grid h-11 w-11 place-items-center rounded-full bg-black/35 backdrop-blur-sm">
-                      <MoreVertical size={25} />
+                    <span className="grid h-9 w-9 place-items-center rounded-full bg-black/35 backdrop-blur-sm">
+                      <MoreVertical size={20} />
                     </span>
                   </button>
 
@@ -3217,11 +3559,11 @@ function createTabletViewerImplementation() {
                         ? "Remove from saved posts"
                         : "Save post"
                     }
-                    className="flex flex-col items-center gap-1"
+                    className="flex min-h-11 min-w-11 flex-col items-center gap-0.5"
                   >
-                    <span className="grid h-11 w-11 place-items-center rounded-full bg-black/35 backdrop-blur-sm">
+                    <span className="grid h-9 w-9 place-items-center rounded-full bg-black/35 backdrop-blur-sm">
                       <Bookmark
-                        size={23}
+                        size={20}
                         fill={
                           bookmarkedPosts[String(postId)]
                             ? "currentColor"
@@ -3446,6 +3788,7 @@ function createDesktopViewerImplementation() {
       post?.coverImage,
       post?.imageUrl,
       post?.image,
+      post?.photoUrl,
     ]
       .map(toUrl)
       .filter(Boolean);
@@ -3457,14 +3800,81 @@ function createDesktopViewerImplementation() {
       .map(toUrl)
       .filter(Boolean);
 
-    const photoMedia =
-      post?.mediaType === "photo" || post?.mediaType === "image"
-        ? [toUrl(post?.mediaUrl), toUrl(post?.media)].filter(Boolean)
-        : [];
+    const photoMedia = isPhotoMediaPost(post)
+      ? [toUrl(post?.mediaUrl), toUrl(post?.media)].filter(Boolean)
+      : [];
 
     return [
       ...new Set([...thumbnailCandidates, ...photoMedia, ...collectionImages]),
     ];
+  }
+
+  function isPhotoMediaPost(post) {
+    const mediaType = String(post?.mediaType || "")
+      .trim()
+      .toLowerCase();
+    if (["photo", "image", "photos", "gallery"].includes(mediaType))
+      return true;
+    if (["video", "reel"].includes(mediaType)) return false;
+
+    const types = [post?.type, post?.postType, post?.kind]
+      .map((value) =>
+        String(value || "")
+          .trim()
+          .toLowerCase(),
+      )
+      .filter(Boolean);
+    if (
+      types.some((type) =>
+        ["photo", "image", "photos", "gallery"].includes(type),
+      )
+    )
+      return true;
+    if (types.some((type) => ["video", "reel"].includes(type))) return false;
+    if (post?.isImagePost === true || post?.isPhotoPost === true) return true;
+    if (post?.isVideoPost === true) return false;
+
+    const sourceUrl = (value) => {
+      if (typeof value === "string") return value;
+      if (!value || typeof value !== "object") return "";
+      return (
+        value.url ||
+        value.src ||
+        value.imageUrl ||
+        value.videoUrl ||
+        value.secure_url ||
+        value.path ||
+        ""
+      );
+    };
+    const looksImage = (value) =>
+      /(?:\.(?:avif|bmp|gif|jpe?g|png|webp)(?:[?#]|$)|\/image\/upload\/|^data:image\/)/i.test(
+        sourceUrl(value),
+      );
+    const looksVideo = (value) =>
+      /(?:\.(?:mp4|mov|m4v|webm|avi|mkv|m3u8|mpd)(?:[?#]|$)|\/video\/upload\/|^data:video\/)/i.test(
+        sourceUrl(value),
+      );
+
+    if (
+      [post?.videoUrl, post?.video, post?.videoFile, post?.videos?.[0]].some(
+        looksVideo,
+      )
+    )
+      return false;
+    if ([post?.mediaUrl, post?.media, post?.mediaUrls?.[0]].some(looksVideo))
+      return false;
+    if ([post?.mediaUrl, post?.media, post?.mediaUrls?.[0]].some(looksImage))
+      return true;
+    if (Array.isArray(post?.photos) && post.photos.length) return true;
+    if (
+      Array.isArray(post?.images) &&
+      post.images.length &&
+      !post?.videoUrl &&
+      !post?.video
+    )
+      return true;
+    return false;
   }
 
   function resolveMediaUrl(value) {
@@ -3511,24 +3921,43 @@ function createDesktopViewerImplementation() {
       return "";
     };
 
-    const candidates = [
+    if (isPhotoMediaPost(post)) return "";
+
+    const explicitVideoCandidates = [
       post?.videoUrl,
       post?.video,
-      post?.mediaUrl,
-      post?.media,
       post?.videoFile,
-      post?.video?.url,
-      post?.media?.url,
-      post?.mediaUrls?.[0],
       post?.videos?.[0],
-      post?.url,
     ];
-
-    for (const candidate of candidates) {
+    for (const candidate of explicitVideoCandidates) {
       const rawUrl = toMediaUrl(candidate);
-      if (rawUrl) return resolveMediaUrl(rawUrl);
+      if (
+        rawUrl &&
+        !/(?:\.(?:avif|bmp|gif|jpe?g|png|webp)(?:[?#]|$)|\/image\/upload\/|^data:image\/)/i.test(
+          rawUrl,
+        )
+      ) {
+        return resolveMediaUrl(rawUrl);
+      }
     }
 
+    const ambiguousCandidates = [
+      post?.mediaUrl,
+      post?.media,
+      post?.mediaUrls?.[0],
+      post?.url,
+    ];
+    for (const candidate of ambiguousCandidates) {
+      const rawUrl = toMediaUrl(candidate);
+      if (!rawUrl) continue;
+      if (
+        /(?:\.(?:avif|bmp|gif|jpe?g|png|webp)(?:[?#]|$)|\/image\/upload\/|^data:image\/)/i.test(
+          rawUrl,
+        )
+      )
+        continue;
+      return resolveMediaUrl(rawUrl);
+    }
     return "";
   }
 
@@ -3625,6 +4054,25 @@ function createDesktopViewerImplementation() {
     return String(number);
   }
 
+  function formatPostViews(post) {
+    const value = post?.viewsCount ?? post?.views;
+
+    if (value == null || value === "") return "— views";
+
+    if (typeof value === "string") {
+      const trimmed = value.trim();
+      if (!trimmed) return "— views";
+      if (/\bviews?\b/i.test(trimmed)) return trimmed;
+
+      const numericValue = Number(trimmed);
+      return Number.isFinite(numericValue)
+        ? `${formatCount(numericValue)} views`
+        : `${trimmed} views`;
+    }
+
+    return `${formatCount(value)} views`;
+  }
+
   function getPostId(post) {
     return post?._id ?? post?.id;
   }
@@ -3633,7 +4081,13 @@ function createDesktopViewerImplementation() {
     return Math.max(0, Number(post?.likesCount ?? post?.likes) || 0);
   }
 
-  function DesktopVideoViewer({ posts = [], initialPost, onBack }) {
+  function DesktopVideoViewer({
+    posts = [],
+    initialPost,
+    preservePostOrder = false,
+    initialPostIndex = null,
+    onBack,
+  }) {
     const availablePosts = useMemo(
       () => posts.filter((post) => getPostId(post) != null),
       [posts],
@@ -3645,9 +4099,31 @@ function createDesktopViewerImplementation() {
       (post) => String(getPostId(post)) === String(initialPostId),
     );
 
-    // Open directly on the selected Home post, then shuffle the remaining
-    // feed once for this viewing session. The Home page itself is not scrolled.
+    // Profile viewers preserve the supplied grid order. Other entry points keep
+    // their existing selected-first shuffled behavior.
     const viewerPosts = useMemo(() => {
+      if (preservePostOrder) {
+        const containsInitial = availablePosts.some(
+          (post) =>
+            post === initialPost ||
+            String(getPostId(post)) === String(initialPostId),
+        );
+        if (containsInitial) return availablePosts;
+        if (!initialPost) return availablePosts;
+
+        // Keep the profile sequence when ID shapes differ; don't move the
+        // selected post to index zero, otherwise earlier posts disappear above.
+        if (Number.isInteger(initialPostIndex) && initialPostIndex >= 0) {
+          const ordered = [...availablePosts];
+          const safeIndex = Math.min(initialPostIndex, ordered.length);
+          if (safeIndex < ordered.length) ordered[safeIndex] = initialPost;
+          else ordered.splice(safeIndex, 0, initialPost);
+          return ordered;
+        }
+
+        return [initialPost, ...availablePosts];
+      }
+
       if (initialPostId == null) return availablePosts;
 
       const selectedPost = matchingInitialPost || initialPost;
@@ -3666,7 +4142,14 @@ function createDesktopViewerImplementation() {
       }
 
       return [selectedPost, ...remainingPosts];
-    }, [availablePosts, initialPost, initialPostId, matchingInitialPost]);
+    }, [
+      availablePosts,
+      initialPost,
+      initialPostId,
+      matchingInitialPost,
+      preservePostOrder,
+      initialPostIndex,
+    ]);
 
     // A stable key prevents effects from rerunning just because the parent
     // creates a fresh `posts` array on each render.
@@ -3684,6 +4167,7 @@ function createDesktopViewerImplementation() {
     const firstPostId = initialPostId ?? getPostId(viewerPosts[0]);
 
     const [activeId, setActiveId] = useState(firstPostId);
+    const [initialPlacementReady, setInitialPlacementReady] = useState(false);
 
     const [likedPosts, setLikedPosts] = useState({});
 
@@ -3709,6 +4193,8 @@ function createDesktopViewerImplementation() {
     const [playingVideoPostId, setPlayingVideoPostId] = useState(null);
 
     const [settingsOpen, setSettingsOpen] = useState(false);
+    const [captionsEnabled, setCaptionsEnabled] = useState(false);
+
     const [qualityOptions, setQualityOptions] = useState([]);
     const [selectedQuality, setSelectedQuality] = useState("auto");
     const qualityControllerRef = useRef(null);
@@ -3766,14 +4252,7 @@ function createDesktopViewerImplementation() {
       setPlayingVideoPostId(null);
     }, [activeId]);
     const activeOriginalVideoUrl = getOriginalVideoUrl(activePost);
-    const activePostIsPhoto = Boolean(
-      activePost?.mediaType === "photo" ||
-      activePost?.mediaType === "image" ||
-      activePost?.type === "photo" ||
-      activePost?.type === "image" ||
-      activePost?.isImagePost === true ||
-      activePost?.isPhotoPost === true,
-    );
+    const activePostIsPhoto = isPhotoMediaPost(activePost);
     const shouldPlayActiveVideoRef = useRef(!paused);
     shouldPlayActiveVideoRef.current = !paused;
 
@@ -3935,15 +4414,29 @@ function createDesktopViewerImplementation() {
       });
 
       let segmentPreloaded = false;
+      let segmentPreloadInProgress = false;
+      let lastSegmentPreloadAttemptAt = 0;
       const cleanupListeners = () => {
         activeVideo.removeEventListener("timeupdate", maybePreloadNextSegment);
         activeVideo.removeEventListener("progress", maybePreloadNextSegment);
         activeVideo.removeEventListener("playing", maybePreloadNextSegment);
       };
       const maybePreloadNextSegment = () => {
-        if (segmentPreloaded || activeVideo.paused || activeVideo.ended) return;
+        if (
+          segmentPreloaded ||
+          segmentPreloadInProgress ||
+          activeVideo.paused ||
+          activeVideo.ended
+        )
+          return;
+
+        // Failed speculative requests used to be marked complete before the
+        // network request finished, so they never retried during this playback.
+        const now = Date.now();
+        if (now - lastSegmentPreloadAttemptAt < 2500) return;
+
         const currentTime = Number(activeVideo.currentTime) || 0;
-        if (currentTime < 0.5 || !activeVideo.buffered?.length) return;
+        if (!activeVideo.buffered?.length) return;
 
         let bufferedAhead = 0;
         for (let index = 0; index < activeVideo.buffered.length; index += 1) {
@@ -3954,13 +4447,30 @@ function createDesktopViewerImplementation() {
             break;
           }
         }
-        if (bufferedAhead < 1.5) return;
 
-        segmentPreloaded = true;
-        cleanupListeners();
-        preloadCloudinaryVideoStream(nextUrl, "auto", {
-          includeFirstSegment: true,
-        });
+        // Prepare early, but keep a small safety buffer for the active video.
+        // Weak connections still get a little more headroom before competing.
+        const minimumBufferedAhead = getNetworkPlaybackProfile().constrained
+          ? 1.0
+          : 0.45;
+        if (bufferedAhead < minimumBufferedAhead) return;
+
+        segmentPreloadInProgress = true;
+        lastSegmentPreloadAttemptAt = now;
+        Promise.resolve(
+          preloadCloudinaryVideoStream(nextUrl, selectedQualityRef.current, {
+            includeFirstSegment: true,
+          }),
+        )
+          .then((prepared) => {
+            if (prepared === true) {
+              segmentPreloaded = true;
+              cleanupListeners();
+            }
+          })
+          .finally(() => {
+            segmentPreloadInProgress = false;
+          });
       };
 
       activeVideo.addEventListener("timeupdate", maybePreloadNextSegment);
@@ -4142,65 +4652,34 @@ function createDesktopViewerImplementation() {
       };
     }, [activePostId, commentsOpen]);
 
-    // Open the viewer at the exact post selected from Home/Discover.
-    useEffect(() => {
+    // Position the feed on the selected post before the browser paints.
+    // Disable smooth scrolling for this initial placement so opening post 5 does
+    // not visibly animate through posts 1–4 first.
+    desktop_useLayoutEffect(() => {
       const initialId = initialPostId;
+      const feed = feedRef.current;
+      const postElement =
+        initialId == null ? null : postRefs.current[String(initialId)];
 
-      if (initialId == null) return undefined;
+      if (!feed || !postElement) return undefined;
 
-      let frameId;
+      // Disable both smooth scrolling and snap while positioning the clicked
+      // post. Re-enable snap only after its offset has been applied, so a post
+      // opened from a grid never animates from the first post.
+      feed.style.scrollBehavior = "auto";
+      feed.style.scrollSnapType = "none";
 
-      let attempts = 0;
+      const feedTop = feed.getBoundingClientRect().top;
+      const postTop = postElement.getBoundingClientRect().top;
+      feed.scrollTop = Math.max(0, feed.scrollTop + postTop - feedTop);
 
-      let cancelled = false;
+      const selectedPost = viewerPostsRef.current.find(
+        (post) => String(getPostId(post)) === String(initialId),
+      );
+      if (selectedPost) setActiveId(getPostId(selectedPost));
+      setInitialPlacementReady(true);
 
-      const scrollToSelectedPost = () => {
-        if (cancelled) return;
-
-        const feed = feedRef.current;
-
-        const postElement = postRefs.current[String(initialId)];
-
-        // The viewer may need another frame for its post refs/layout to be ready.
-        if (!feed || !postElement) {
-          if (attempts < 10) {
-            attempts += 1;
-
-            frameId = window.requestAnimationFrame(scrollToSelectedPost);
-          }
-
-          return;
-        }
-
-        // Calculate the target relative to the scroll container instead of relying
-        // on offsetTop, which can be relative to a different offset parent.
-        const feedTop = feed.getBoundingClientRect().top;
-
-        const postTop = postElement.getBoundingClientRect().top;
-
-        const targetTop = feed.scrollTop + postTop - feedTop;
-
-        feed.scrollTo({ top: Math.max(0, targetTop), behavior: "auto" });
-
-        setActiveId(
-          getPostId(
-            viewerPostsRef.current.find(
-              (post) => String(getPostId(post)) === String(initialId),
-            ),
-          ) ?? initialId,
-        );
-      };
-
-      // Two frames allow the viewer and its snap-scrolling items to finish layout.
-      frameId = window.requestAnimationFrame(() => {
-        frameId = window.requestAnimationFrame(scrollToSelectedPost);
-      });
-
-      return () => {
-        cancelled = true;
-
-        if (frameId != null) window.cancelAnimationFrame(frameId);
-      };
+      return undefined;
     }, [initialPostId, viewerPostIdsKey]);
 
     // Keep playback and mute state in sync with the active video.
@@ -4416,6 +4895,22 @@ function createDesktopViewerImplementation() {
 
         showPlaybackFeedback("pause");
       }
+    }
+
+    function toggleCaptions() {
+      const tracks = videoRef.current?.textTracks;
+      if (!tracks || tracks.length === 0) {
+        setCaptionsEnabled(false);
+        return;
+      }
+
+      const nextEnabled = !Array.from(tracks).some(
+        (track) => track.mode === "showing",
+      );
+      Array.from(tracks).forEach((track) => {
+        track.mode = nextEnabled ? "showing" : "hidden";
+      });
+      setCaptionsEnabled(nextEnabled);
     }
 
     function handleTimeUpdate() {
@@ -4727,10 +5222,8 @@ function createDesktopViewerImplementation() {
               ref={feedRef}
               className="relative min-h-0 min-w-0 overflow-x-hidden overflow-y-auto snap-y snap-mandatory overscroll-y-contain bg-[#080808] scrollbar-none [&::-webkit-scrollbar]:hidden"
               style={{
-                scrollBehavior: "smooth",
-
-                scrollSnapType: "y mandatory",
-
+                scrollBehavior: "auto",
+                scrollSnapType: initialPlacementReady ? "y mandatory" : "none",
                 WebkitOverflowScrolling: "touch",
               }}
             >
@@ -4757,13 +5250,7 @@ function createDesktopViewerImplementation() {
                 const photoSet = getPostImages(post);
 
                 const postIsImage =
-                  post.type === "image" ||
-                  post.type === "photo" ||
-                  post.mediaType === "image" ||
-                  post.mediaType === "photo" ||
-                  post.isImagePost === true ||
-                  post.isPhotoPost === true ||
-                  (!videoUrl && photoSet.length > 0);
+                  isPhotoMediaPost(post) || (!videoUrl && photoSet.length > 0);
 
                 const photoIndex = photoIndexes[postId] || 0;
 
@@ -5055,17 +5542,14 @@ function createDesktopViewerImplementation() {
                             </button>
                           </div>
 
-                          <p className="mt-0.5 max-w-[92%] text-xs font-bold leading-snug text-white [text-shadow:0_2px_5px_rgba(0,0,0,0.95)]">
-                            <MentionText
-                              text={post.caption}
-                              mentions={post.mentions}
-                            />
-                          </p>
-
-                          <p className="mt-0.5 text-[10px] leading-snug text-white/95 [text-shadow:0_1px_4px_rgba(0,0,0,0.95)]">
-                            Beautiful moments, good food and great people. Share
-                            your story on Spotli.
-                          </p>
+                          {post.caption && (
+                            <p className="mt-0.5 max-w-[92%] text-xs font-bold leading-snug text-white [text-shadow:0_2px_5px_rgba(0,0,0,0.95)]">
+                              <MentionText
+                                text={post.caption}
+                                mentions={post.mentions}
+                              />
+                            </p>
+                          )}
 
                           <p className="mt-1 text-[10px] font-medium text-white/90">
                             ♫ Original sound · {getCreatorName(post)}
@@ -5073,7 +5557,7 @@ function createDesktopViewerImplementation() {
                         </div>
                       )}
 
-                      <aside className="absolute right-2 top-1/2 z-20 flex -translate-y-1/2 flex-col items-center gap-2 text-white">
+                      <aside className="absolute right-2 top-[56%] z-20 flex -translate-y-1/2 flex-col items-center gap-2 text-white">
                         <button
                           type="button"
                           onClick={() => toggleLike(postId)}
@@ -5197,8 +5681,9 @@ function createDesktopViewerImplementation() {
                             type="button"
                             onClick={togglePlayback}
                             aria-label={paused ? "Play" : "Pause"}
+                            className="grid h-8 w-8 shrink-0 place-items-center rounded-md transition-colors hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
                           >
-                            {paused ? <Play size={14} /> : <Pause size={14} />}
+                            {paused ? <Play size={16} /> : <Pause size={16} />}
                           </button>
 
                           <span className="whitespace-nowrap text-[11px]">
@@ -5213,9 +5698,9 @@ function createDesktopViewerImplementation() {
                             step="0.1"
                             value={Math.min(currentTime, duration || 1)}
                             onChange={handleSeek}
-                            className="h-1 min-w-0 flex-1 cursor-pointer accent-[#FF2D4A]"
+                            className="h-1.5 min-w-0 flex-1 cursor-pointer accent-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
                             style={{
-                              background: `linear-gradient(to right, #FF2D4A ${progress}%, rgba(255,255,255,.4) ${progress}%)`,
+                              background: `linear-gradient(to right, #FFFFFF ${progress}%, rgba(255,255,255,.4) ${progress}%)`,
                             }}
                           />
 
@@ -5223,16 +5708,28 @@ function createDesktopViewerImplementation() {
                             type="button"
                             onClick={() => setMuted((value) => !value)}
                             aria-label={muted ? "Unmute" : "Mute"}
+                            className="grid h-8 w-8 shrink-0 place-items-center rounded-md transition-colors hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
                           >
                             {muted ? (
-                              <VolumeX size={14} />
+                              <VolumeX size={16} />
                             ) : (
-                              <Volume2 size={14} />
+                              <Volume2 size={16} />
                             )}
                           </button>
 
-                          <button type="button" aria-label="Captions">
-                            <Captions size={14} />
+                          <button
+                            type="button"
+                            aria-label={
+                              captionsEnabled
+                                ? "Turn captions off"
+                                : "Turn captions on"
+                            }
+                            aria-pressed={captionsEnabled}
+                            title="Toggle captions when available"
+                            onClick={toggleCaptions}
+                            className={`grid h-8 w-8 shrink-0 place-items-center rounded-md transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white ${captionsEnabled ? "bg-[#FF2D4A]/20 text-[#FF2D4A]" : "hover:bg-white/10"}`}
+                          >
+                            <Captions size={16} />
                           </button>
 
                           <div className="relative shrink-0">
@@ -5241,8 +5738,9 @@ function createDesktopViewerImplementation() {
                               aria-label="Playback settings"
                               aria-expanded={settingsOpen}
                               onClick={() => setSettingsOpen((open) => !open)}
+                              className="grid h-8 w-8 shrink-0 place-items-center rounded-md transition-colors hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
                             >
-                              <Settings size={14} />
+                              <Settings size={16} />
                             </button>
                             {settingsOpen && (
                               <div className="absolute bottom-8 right-0 z-50 max-h-64 min-w-36 overflow-y-auto rounded-lg bg-black/95 p-2 text-white shadow-xl">
@@ -5294,8 +5792,9 @@ function createDesktopViewerImplementation() {
                             type="button"
                             onClick={() => toggleFullscreen(postId)}
                             aria-label="Fullscreen"
+                            className="grid h-8 w-8 shrink-0 place-items-center rounded-md transition-colors hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
                           >
-                            <Maximize size={14} />
+                            <Maximize size={16} />
                           </button>
                         </div>
                       )}
@@ -5361,7 +5860,7 @@ function createDesktopViewerImplementation() {
                             </p>
 
                             <p className="mt-1 text-[10px] text-gray-500">
-                              {post.views || "—"} views ·{" "}
+                              {formatPostViews(post)} ·{" "}
                               {post.time || "Recently"}
                             </p>
                           </div>
@@ -5406,7 +5905,13 @@ const DesktopViewerImplementation = createDesktopViewerImplementation();
  * same tablet implementation, handlers, playback state, and interaction logic.
  * Desktop continues to use its existing implementation.
  */
-export default function VideoViewer({ posts = [], initialPost, onBack }) {
+export default function VideoViewer({
+  posts = [],
+  initialPost,
+  preservePostOrder = false,
+  initialPostIndex = null,
+  onBack,
+}) {
   const getDevice = () => {
     if (typeof window === "undefined") return "mobile";
     if (window.matchMedia("(min-width: 1024px)").matches) return "desktop";
@@ -5437,7 +5942,13 @@ export default function VideoViewer({ posts = [], initialPost, onBack }) {
     };
   }, []);
 
-  const viewerProps = { posts, initialPost, onBack };
+  const viewerProps = {
+    posts,
+    initialPost,
+    preservePostOrder,
+    initialPostIndex,
+    onBack,
+  };
   if (device === "desktop")
     return <DesktopViewerImplementation {...viewerProps} />;
   // Mobile and tablet intentionally share the same implementation.

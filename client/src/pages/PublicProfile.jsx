@@ -14,6 +14,7 @@ import { useNavigate } from "react-router-dom";
 import api from "../services/api";
 import MentionText from "../components/MentionText";
 import BottomNav from "../components/BottomNav";
+import ProfilePostTabs from "../components/ProfilePostTabs";
 import { useAuth } from "../context/useAuth";
 
 const API_ORIGIN = (
@@ -823,22 +824,14 @@ export default function PublicProfile({ userId, onOpenVideo, onOpenPhoto }) {
               </div>
             )}
 
-            <section className="mt-4">
-              <div className="inline-flex w-fit max-w-full flex-wrap items-center gap-1 rounded-full bg-[#F0F0F0] p-1">
-                {["All Posts", "Videos", "Photos"].map((tab) => (
-                  <button
-                    key={tab}
-                    type="button"
-                    onClick={() => setActiveTab(tab)}
-                    className={`rounded-full px-3.5 py-1.5 text-sm font-semibold transition duration-300 ${
-                      activeTab === tab
-                        ? "bg-black text-white shadow-sm"
-                        : "text-neutral-600 hover:bg-white hover:text-black"
-                    }`}
-                  >
-                    {tab}
-                  </button>
-                ))}
+            <section>
+              <div className="mt-4 flex flex-col gap-2.5 sm:flex-row sm:items-center sm:justify-between lg:mt-5">
+                <ProfilePostTabs
+                  tabs={["All Posts", "Videos", "Photos"]}
+                  activeTab={activeTab}
+                  onChange={setActiveTab}
+                  ariaLabel="Filter profile posts"
+                />
               </div>
 
               {isPostsLoading ? (
@@ -860,11 +853,12 @@ export default function PublicProfile({ userId, onOpenVideo, onOpenPhoto }) {
                     {visiblePosts.map((post, index) => {
                       const photo = isPhoto(post);
 
-                      const openPost = () =>
-                        (photo ? onOpenPhoto : onOpenVideo)?.(
-                          post,
-                          visiblePosts,
-                        );
+                      const openPost = () => {
+                        // Preserve all profile posts in their original order so
+                        // swiping includes both photos and videos, even from a
+                        // filtered Videos or Photos tab.
+                        (photo ? onOpenPhoto : onOpenVideo)?.(post, posts);
+                      };
 
                       return (
                         <article key={post._id || post.id} className="min-w-0">

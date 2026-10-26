@@ -16,6 +16,8 @@ import { videoPosts } from "../components/postData";
 function MainLayout() {
   const [selectedPost, setSelectedPost] = useState(null);
   const [viewerPosts, setViewerPosts] = useState([]);
+  const [viewerPreservePostOrder, setViewerPreservePostOrder] = useState(false);
+  const [viewerInitialPostIndex, setViewerInitialPostIndex] = useState(null);
   const [fallbackPage, setFallbackPage] = useState("Home");
   const [isMobileViewport, setIsMobileViewport] = useState(
     () =>
@@ -63,6 +65,8 @@ function MainLayout() {
     if (!postFromNotification) return;
 
     setViewerPosts([postFromNotification]);
+    setViewerPreservePostOrder(false);
+    setViewerInitialPostIndex(null);
     setSelectedPost(postFromNotification);
     homeScrollYRef.current = 0;
     hadViewerOpenRef.current = true;
@@ -70,14 +74,45 @@ function MainLayout() {
   }, [location.state, navigate]);
 
   // Open a video or photo without unmounting Home.
-  function handleOpenPost(post, feedPosts = []) {
+  function handleOpenPost(post, feedPosts = [], options = {}) {
     if (!post) return;
 
     homeScrollYRef.current = window.scrollY;
     hadViewerOpenRef.current = true;
 
-    setViewerPosts(Array.isArray(feedPosts) ? feedPosts : []);
+    const orderedPosts = Array.isArray(feedPosts) ? feedPosts : [];
+    setViewerPosts(orderedPosts);
+    setViewerPreservePostOrder(Boolean(options?.preservePostOrder));
+    const requestedIndex = Number(options?.initialPostIndex);
+    setViewerInitialPostIndex(
+      options?.preservePostOrder &&
+        Number.isInteger(requestedIndex) &&
+        requestedIndex >= 0
+        ? requestedIndex
+        : null,
+    );
     setSelectedPost(post);
+  }
+
+  // Profile viewers must retain the grid's ordering so the selected item keeps
+  // its real neighbours (e.g. opening item 5 lets the viewer scroll to 4 and 6).
+  function handleOpenProfilePost(post, feedPosts = []) {
+    const orderedPosts = Array.isArray(feedPosts) ? feedPosts : [];
+    const selectedId = post?._id ?? post?.id ?? post?.postId;
+    const initialPostIndex = orderedPosts.findIndex((candidate) => {
+      if (candidate === post) return true;
+      const candidateId = candidate?._id ?? candidate?.id ?? candidate?.postId;
+      return (
+        selectedId != null &&
+        candidateId != null &&
+        String(candidateId) === String(selectedId)
+      );
+    });
+
+    handleOpenPost(post, orderedPosts, {
+      preservePostOrder: true,
+      initialPostIndex,
+    });
   }
 
   // Close the viewer and return to Home.
@@ -163,7 +198,10 @@ function MainLayout() {
           className="min-h-screen bg-white text-black md:hidden"
           style={selectedPost ? { display: "none" } : undefined}
         >
-          <Profile onOpenVideo={handleOpenPost} onOpenPhoto={handleOpenPost} />
+          <Profile
+            onOpenVideo={handleOpenProfilePost}
+            onOpenPhoto={handleOpenProfilePost}
+          />
         </div>
       )}
 
@@ -175,8 +213,8 @@ function MainLayout() {
         >
           <PublicProfile
             userId={publicProfileId}
-            onOpenVideo={handleOpenPost}
-            onOpenPhoto={handleOpenPost}
+            onOpenVideo={handleOpenProfilePost}
+            onOpenPhoto={handleOpenProfilePost}
           />
         </div>
       )}
@@ -218,7 +256,10 @@ function MainLayout() {
           className="hidden min-h-screen bg-white text-black md:block"
           style={selectedPost ? { display: "none" } : undefined}
         >
-          <Profile onOpenVideo={handleOpenPost} onOpenPhoto={handleOpenPost} />
+          <Profile
+            onOpenVideo={handleOpenProfilePost}
+            onOpenPhoto={handleOpenProfilePost}
+          />
         </div>
       )}
 
@@ -230,8 +271,8 @@ function MainLayout() {
         >
           <PublicProfile
             userId={publicProfileId}
-            onOpenVideo={handleOpenPost}
-            onOpenPhoto={handleOpenPost}
+            onOpenVideo={handleOpenProfilePost}
+            onOpenPhoto={handleOpenProfilePost}
           />
         </div>
       )}
@@ -278,6 +319,8 @@ function MainLayout() {
           key={`viewer-${selectedPost.id || selectedPost._id}`}
           posts={postsForViewer}
           initialPost={selectedPost}
+          preservePostOrder={viewerPreservePostOrder}
+          initialPostIndex={viewerInitialPostIndex}
           onBack={closeViewer}
         />
       )}

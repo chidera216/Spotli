@@ -15,6 +15,7 @@ import {
   Save,
   Upload,
   Bookmark,
+  Bell,
   MapPin,
   Link as LinkIcon,
   Settings,
@@ -23,6 +24,7 @@ import {
 import api from "../services/api";
 
 import BottomNav from "../components/BottomNav";
+import ProfilePostTabs from "../components/ProfilePostTabs";
 
 import { useAuth } from "../context/useAuth";
 
@@ -275,7 +277,7 @@ function ProfilePostCard({ post, onOpenPost, onRemoveBookmark, index = 99 }) {
       <button
         type="button"
         onClick={() => onOpenPost?.(post)}
-        className={`group relative block aspect-video w-full overflow-hidden rounded-xl sm:rounded-2xl lg:rounded-[20px] bg-stone-100 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-black`}
+        className={`group relative block aspect-video w-full overflow-hidden ${isPhoto ? "rounded-xl sm:rounded-2xl lg:rounded-[20px]" : "rounded-md sm:rounded-lg"} bg-stone-100 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#FF2D4A]`}
         aria-label={`Open post: ${caption || "Spotli post"}`}
       >
         {media && !thumbnailFailed ? (
@@ -604,7 +606,9 @@ export default function Profile({ onOpenVideo, onOpenPhoto }) {
     "creator"
   ).replace(/^@/, "");
 
-  const avatar = optimizeImage(getMediaUrl(user?.avatar), 256);
+  const rawAvatar = getMediaUrl(user?.avatar);
+  const avatar = optimizeImage(rawAvatar, 256);
+  const profileAvatar = optimizeImage(rawAvatar, 480);
 
   function openEditProfile() {
     setEditForm({
@@ -991,11 +995,13 @@ export default function Profile({ onOpenVideo, onOpenPhoto }) {
             <button
               type="button"
               aria-label="Notifications"
-              className="relative grid h-9 w-9 place-items-center rounded-full text-black transition hover:bg-neutral-100"
+              title="Notifications"
+              onClick={() => navigate("/notifications")}
+              className="relative grid h-9 w-9 place-items-center rounded-full text-black transition hover:bg-neutral-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#FF2D4A] focus-visible:ring-offset-2"
             >
-              <span className="absolute right-2 top-2 h-2.5 w-2.5 rounded-full bg-[#FF2D4A] ring-2 ring-white" />
+              <span className="spotli-profile-notification-dot absolute right-2 top-2 h-2.5 w-2.5 rounded-full bg-[#FF2D4A] ring-2 ring-white" />
 
-              <MessageCircle size={19} />
+              <Bell size={19} />
             </button>
 
             <button
@@ -1025,7 +1031,7 @@ export default function Profile({ onOpenVideo, onOpenPhoto }) {
               <div className="relative mx-auto h-24 w-24 shrink-0 rounded-full bg-neutral-100 sm:mx-0 sm:h-28 sm:w-28 lg:h-44 lg:w-44">
                 {avatar && !avatarFailed ? (
                   <img
-                    src={optimizeImage(avatar, 360)}
+                    src={profileAvatar}
                     alt={`${fullName}'s profile`}
                     fetchPriority="high"
                     decoding="async"
@@ -1110,8 +1116,9 @@ export default function Profile({ onOpenVideo, onOpenPhoto }) {
 
                   <button
                     type="button"
+                    aria-label={`View ${followersCount} followers`}
                     onClick={() => openFollowList("followers")}
-                    className="rounded-lg px-2 text-center transition hover:bg-neutral-50 sm:px-5 sm:text-left"
+                    className="rounded-lg px-2 text-center transition hover:bg-neutral-50 sm:px-5 sm:text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#FF2D4A]"
                   >
                     <p className="text-xl font-bold tracking-tight text-black sm:text-2xl">
                       {formatCount(followersCount)}
@@ -1124,8 +1131,9 @@ export default function Profile({ onOpenVideo, onOpenPhoto }) {
 
                   <button
                     type="button"
+                    aria-label={`View ${followingCount} accounts you follow`}
                     onClick={() => openFollowList("following")}
-                    className="rounded-lg px-2 text-center transition hover:bg-neutral-50 sm:px-5 sm:text-left"
+                    className="rounded-lg px-2 text-center transition hover:bg-neutral-50 sm:px-5 sm:text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#FF2D4A]"
                   >
                     <p className="text-xl font-bold tracking-tight text-black sm:text-2xl">
                       {formatCount(followingCount)}
@@ -1151,18 +1159,12 @@ export default function Profile({ onOpenVideo, onOpenPhoto }) {
           </div>
 
           <div className="mt-4 flex flex-col gap-2.5 sm:flex-row sm:items-center sm:justify-between lg:mt-5">
-            <div className="inline-flex w-fit max-w-full flex-wrap items-center gap-1 rounded-full bg-[#F0F0F0] p-1">
-              {tabs.map((tab) => (
-                <button
-                  key={tab}
-                  type="button"
-                  onClick={() => setActiveTab(tab)}
-                  className={`rounded-full px-3.5 py-1.5 text-sm font-semibold transition duration-300 ${activeTab === tab ? "bg-black text-white shadow-sm" : "text-neutral-700 hover:bg-white hover:text-black"}`}
-                >
-                  {tab}
-                </button>
-              ))}
-            </div>
+            <ProfilePostTabs
+              tabs={tabs}
+              activeTab={activeTab}
+              onChange={setActiveTab}
+              ariaLabel="Filter profile posts"
+            />
           </div>
 
           {activeTab === "Bookmarks" && isLoadingBookmarks ? (
@@ -1174,7 +1176,7 @@ export default function Profile({ onOpenVideo, onOpenPhoto }) {
               <button
                 type="button"
                 onClick={() => setActiveTab("All Posts")}
-                className="rounded-full bg-black px-4 py-2 text-sm font-semibold text-white transition hover:bg-neutral-800"
+                className="spotli-profile-primary-action rounded-full bg-black px-4 py-2 text-sm font-semibold text-white transition hover:bg-neutral-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#FF2D4A]"
               >
                 Back to posts
               </button>
@@ -1188,7 +1190,7 @@ export default function Profile({ onOpenVideo, onOpenPhoto }) {
               <button
                 type="button"
                 onClick={() => window.location.reload()}
-                className="rounded-full bg-black px-4 py-2 text-sm font-semibold text-white transition hover:bg-neutral-800"
+                className="spotli-profile-primary-action rounded-full bg-black px-4 py-2 text-sm font-semibold text-white transition hover:bg-neutral-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#FF2D4A]"
               >
                 Try again
               </button>
@@ -1204,12 +1206,17 @@ export default function Profile({ onOpenVideo, onOpenPhoto }) {
                     onRemoveBookmark={
                       activeTab === "Bookmarks" ? removeSavedPost : undefined
                     }
-                    onOpenPost={() =>
-                      (isPhotoPost(post) ? onOpenPhoto : onOpenVideo)?.(
+                    onOpenPost={() => {
+                      const openingPhoto = isPhotoPost(post);
+                      // Preserve the full mixed photo/video sequence, even when the
+                      // grid is filtered. Bookmarks keep their own saved-post order.
+                      const relatedPosts =
+                        activeTab === "Bookmarks" ? visiblePosts : ownPosts;
+                      (openingPhoto ? onOpenPhoto : onOpenVideo)?.(
                         post,
-                        activeTab === "Bookmarks" ? savedPosts : ownPosts,
-                      )
-                    }
+                        relatedPosts,
+                      );
+                    }}
                   />
                 ))}
               </div>
@@ -1242,7 +1249,7 @@ export default function Profile({ onOpenVideo, onOpenPhoto }) {
                 <button
                   type="button"
                   onClick={() => navigate("/create")}
-                  className="mt-4 rounded-full bg-black px-5 py-2.5 text-sm font-semibold text-white transition hover:bg-neutral-800"
+                  className="spotli-profile-primary-action mt-4 rounded-full bg-black px-5 py-2.5 text-sm font-semibold text-white transition hover:bg-neutral-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#FF2D4A]"
                 >
                   Create a post
                 </button>

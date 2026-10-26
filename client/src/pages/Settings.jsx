@@ -17,6 +17,8 @@ import {
   ExternalLink,
   Smartphone,
   Moon,
+  Sun,
+  Monitor,
 } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import api from "../services/api";
@@ -32,15 +34,24 @@ const DEFAULT_PREFERENCES = {
   showMentions: true,
   startMuted: true,
   playbackRate: "1",
-  appearance: "Light",
+  appearance: "light",
   language: "English",
 };
 
+function normalizeAppearance(value) {
+  const appearance = String(value || "light").toLowerCase();
+  return ["light", "dark", "system"].includes(appearance)
+    ? appearance
+    : "light";
+}
+
 function readPreferences() {
   try {
+    const stored = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}");
     return {
       ...DEFAULT_PREFERENCES,
-      ...JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}"),
+      ...stored,
+      appearance: normalizeAppearance(stored.appearance),
     };
   } catch {
     return { ...DEFAULT_PREFERENCES };
@@ -71,10 +82,10 @@ function PreferenceSwitch({ checked, onChange, label, description }) {
         aria-checked={checked}
         aria-label={label}
         onClick={() => onChange(!checked)}
-        className={`relative h-6 w-11 shrink-0 rounded-full transition ${checked ? "bg-[#FF2D4A]" : "bg-neutral-300"}`}
+        className={`relative h-8 w-14 shrink-0 rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#FF2D4A] focus-visible:ring-offset-2 ${checked ? "bg-[#FF2D4A]" : "bg-neutral-300"}`}
       >
         <span
-          className={`absolute top-0.5 h-5 w-5 rounded-full bg-white shadow transition-all ${checked ? "left-[22px]" : "left-0.5"}`}
+          className={`spotli-switch-thumb absolute top-[3px] h-[26px] w-[26px] rounded-full bg-white shadow-sm transition-all duration-200 ${checked ? "left-[27px]" : "left-[3px]"}`}
         />
       </button>
     </div>
@@ -155,8 +166,43 @@ export default function Settings() {
   const [requestError, setRequestError] = useState("");
   const [busyRequestId, setBusyRequestId] = useState("");
   const [preferences, setPreferences] = useState(readPreferences);
+  const [systemPrefersDark, setSystemPrefersDark] = useState(() => {
+    if (
+      typeof window === "undefined" ||
+      typeof window.matchMedia !== "function"
+    ) {
+      return false;
+    }
+    return window.matchMedia("(prefers-color-scheme: dark)").matches;
+  });
   const [logoutError, setLogoutError] = useState("");
   const [isLoggingOut, setIsLoggingOut] = useState(false);
+
+  useEffect(() => {
+    if (
+      typeof window === "undefined" ||
+      typeof window.matchMedia !== "function"
+    ) {
+      return undefined;
+    }
+
+    const mediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
+    const handleSystemAppearanceChange = (event) => {
+      setSystemPrefersDark(event.matches);
+    };
+
+    mediaQuery.addEventListener?.("change", handleSystemAppearanceChange);
+    if (!mediaQuery.addEventListener) {
+      mediaQuery.addListener?.(handleSystemAppearanceChange);
+    }
+
+    return () => {
+      mediaQuery.removeEventListener?.("change", handleSystemAppearanceChange);
+      if (!mediaQuery.removeEventListener) {
+        mediaQuery.removeListener?.(handleSystemAppearanceChange);
+      }
+    };
+  }, []);
 
   function updatePreference(key, value) {
     setPreferences((current) => {
@@ -167,6 +213,38 @@ export default function Settings() {
   }
 
   const isPrivate = Boolean(user?.isPrivate);
+  const effectiveAppearance =
+    preferences.appearance === "system"
+      ? systemPrefersDark
+        ? "dark"
+        : "light"
+      : preferences.appearance;
+
+  function handleAppearanceKeyDown(event, currentValue) {
+    const optionValues = ["light", "dark", "system"];
+    const currentIndex = optionValues.indexOf(currentValue);
+    let nextIndex = currentIndex;
+
+    if (event.key === "ArrowRight" || event.key === "ArrowDown") {
+      nextIndex = (currentIndex + 1) % optionValues.length;
+    } else if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
+      nextIndex =
+        (currentIndex - 1 + optionValues.length) % optionValues.length;
+    } else if (event.key === "Home") {
+      nextIndex = 0;
+    } else if (event.key === "End") {
+      nextIndex = optionValues.length - 1;
+    } else {
+      return;
+    }
+
+    event.preventDefault();
+    const nextValue = optionValues[nextIndex];
+    updatePreference("appearance", nextValue);
+    event.currentTarget.parentElement
+      ?.querySelector(`[data-appearance-option="${nextValue}"]`)
+      ?.focus();
+  }
 
   useEffect(() => {
     if (section !== "privacy") return;
@@ -227,8 +305,8 @@ export default function Settings() {
   }
 
   return (
-    <div className="min-h-screen bg-white font-sans text-[#111111]">
-      <main className="mx-auto min-h-screen w-full max-w-[900px] px-3 pb-24 pt-4 sm:px-5 sm:pb-8 lg:px-8 lg:pt-7">
+    <div className="spotli-settings-page min-h-screen bg-white font-sans text-[#111111]">
+      <main className="mx-auto min-h-screen w-full px-4 pb-24 pt-4 sm:w-[90%] sm:px-0 sm:pb-8 lg:pt-7">
         <div className="mb-5 flex items-center gap-3">
           <button
             type="button"
@@ -249,7 +327,8 @@ export default function Settings() {
               {section === "privacy"
                 ? "Choose who can follow you and view your posts."
                 : section
-                  ? "This settings section is planned for a later update."
+                  ? sections.find((item) => item.id === section)?.description ||
+                    "Manage your Spotli preferences."
                   : "Manage your Spotli account and preferences."}
             </p>
           </div>
@@ -324,10 +403,10 @@ export default function Settings() {
                   aria-label="Private account"
                   disabled={isSavingPrivacy}
                   onClick={() => handlePrivacyChange(!isPrivate)}
-                  className={`relative mt-1 h-6 w-11 shrink-0 rounded-full transition disabled:opacity-60 ${isPrivate ? "bg-[#FF2D4A]" : "bg-neutral-300"}`}
+                  className={`relative mt-1 h-8 w-14 shrink-0 rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#FF2D4A] focus-visible:ring-offset-2 disabled:opacity-60 ${isPrivate ? "bg-[#FF2D4A]" : "bg-neutral-300"}`}
                 >
                   <span
-                    className={`absolute top-0.5 h-5 w-5 rounded-full bg-white shadow transition-all ${isPrivate ? "left-[22px]" : "left-0.5"}`}
+                    className={`spotli-switch-thumb absolute top-[3px] h-[26px] w-[26px] rounded-full bg-white shadow-sm transition-all duration-200 ${isPrivate ? "left-[27px]" : "left-[3px]"}`}
                   />
                 </button>
               </div>
@@ -576,26 +655,90 @@ export default function Settings() {
             </p>
           </section>
         ) : section === "preferences" ? (
-          <section className="rounded-2xl border border-neutral-200 p-4 sm:p-5">
-            <h2 className="text-sm font-semibold text-neutral-900">
-              App preferences
-            </h2>
-            <div className="mt-3 divide-y divide-neutral-100">
-              <div className="flex items-center gap-3 py-3">
-                <span className="grid h-10 w-10 place-items-center rounded-full bg-neutral-100">
-                  <Moon size={18} />
-                </span>
-                <div className="min-w-0 flex-1">
-                  <p className="text-sm font-semibold text-neutral-900">
-                    Appearance
-                  </p>
-                  <p className="mt-1 text-xs text-neutral-500">
-                    Spotli currently uses its approved light theme.
-                  </p>
+          <section className="spotli-settings-preferences-card rounded-2xl border border-neutral-200 bg-white p-4 sm:p-5">
+            <div className="divide-y divide-neutral-100">
+              <div className="py-3">
+                <div className="flex items-center gap-3">
+                  <span className="grid h-10 w-10 shrink-0 place-items-center rounded-full bg-neutral-100">
+                    {preferences.appearance === "dark" ? (
+                      <Moon size={18} />
+                    ) : preferences.appearance === "system" ? (
+                      <Monitor size={18} />
+                    ) : (
+                      <Sun size={18} />
+                    )}
+                  </span>
+                  <div className="min-w-0 flex-1">
+                    <p className="text-sm font-semibold text-neutral-900">
+                      Appearance
+                    </p>
+                    <p className="mt-1 text-xs text-neutral-500">
+                      {preferences.appearance === "system"
+                        ? `Following your device's ${effectiveAppearance} appearance.`
+                        : effectiveAppearance === "dark"
+                          ? "Dark mode is on across Spotli."
+                          : "Light mode is on across Spotli."}
+                    </p>
+                  </div>
                 </div>
-                <span className="rounded-full bg-neutral-100 px-3 py-1.5 text-xs font-semibold text-neutral-600">
-                  Light
-                </span>
+                <div
+                  role="radiogroup"
+                  aria-label="Website appearance"
+                  className="mt-4 divide-y divide-neutral-100"
+                >
+                  {[
+                    {
+                      value: "light",
+                      label: "Light mode",
+                      description: "Use Spotli's light appearance.",
+                    },
+                    {
+                      value: "dark",
+                      label: "Dark mode",
+                      description: "Use Spotli's dark appearance.",
+                    },
+                    {
+                      value: "system",
+                      label: "System",
+                      description: "Follow your device's appearance setting.",
+                    },
+                  ].map(({ value, label, description }) => {
+                    const selected = preferences.appearance === value;
+                    return (
+                      <button
+                        key={value}
+                        type="button"
+                        role="radio"
+                        aria-checked={selected}
+                        aria-label={label}
+                        tabIndex={selected ? 0 : -1}
+                        data-appearance-option={value}
+                        onClick={() => updatePreference("appearance", value)}
+                        onKeyDown={(event) =>
+                          handleAppearanceKeyDown(event, value)
+                        }
+                        className="flex w-full items-center gap-4 py-3 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[#FF2D4A]"
+                      >
+                        <span className="min-w-0 flex-1">
+                          <span className="block text-sm font-semibold text-neutral-900">
+                            {label}
+                          </span>
+                          <span className="mt-1 block text-xs leading-5 text-neutral-500">
+                            {description}
+                          </span>
+                        </span>
+                        <span
+                          aria-hidden="true"
+                          className={`relative h-8 w-14 shrink-0 rounded-full transition-colors duration-200 ${selected ? "bg-[#FF2D4A]" : "bg-neutral-300"}`}
+                        >
+                          <span
+                            className={`spotli-switch-thumb absolute top-[3px] h-[26px] w-[26px] rounded-full bg-white shadow-sm transition-all duration-200 ${selected ? "left-[27px]" : "left-[3px]"}`}
+                          />
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
               </div>
               <div className="flex items-center gap-3 py-3">
                 <span className="grid h-10 w-10 place-items-center rounded-full bg-neutral-100">
@@ -615,8 +758,9 @@ export default function Settings() {
               </div>
             </div>
             <p className="mt-3 text-xs leading-5 text-neutral-500">
-              Other themes and languages are not enabled yet, so the current
-              design remains unchanged.
+              Appearance is saved on this device and applies across Spotli.
+              System follows your device's light or dark preference. English is
+              the only language currently available.
             </p>
           </section>
         ) : section === "help" ? (
