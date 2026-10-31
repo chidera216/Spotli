@@ -479,8 +479,16 @@ function Create() {
         return next;
       });
 
-      // Selecting a video only updates the local preview. Compression and upload
-      // begin when the creator presses Publish.
+      // Start preparing and uploading the selected video immediately. The
+      // creator can write the caption while compression and Cloudinary transfer
+      // run in the background; Publish later reuses the staged asset.
+      if (postType === "video") {
+        void startVideoPreupload(file).catch((error) => {
+          if (error?.message !== "UPLOAD_CANCELLED") {
+            console.warn("Spotli background video preparation failed:", error);
+          }
+        });
+      }
       return;
     }
 
@@ -516,6 +524,16 @@ function Create() {
     }));
 
     setMedia((current) => [...current, ...newMedia]);
+
+    // For video posts, begin the existing staged upload pipeline as soon as the
+    // file is selected. This overlaps preparation/transfer with caption entry.
+    if (postType === "video" && filesToAdd[0]) {
+      void startVideoPreupload(filesToAdd[0]).catch((error) => {
+        if (error?.message !== "UPLOAD_CANCELLED") {
+          console.warn("Spotli background video preparation failed:", error);
+        }
+      });
+    }
 
     if (acceptedFiles.length > filesToAdd.length) {
       setNotice(

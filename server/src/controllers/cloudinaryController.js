@@ -5,7 +5,10 @@ import {
   MAX_IMAGE_SIZE_BYTES,
   MAX_VIDEO_SIZE_BYTES,
 } from "../utils/cloudinaryLimits.js";
-import { queueCloudinaryHls } from "../utils/cloudinaryHls.js";
+import {
+  queueCloudinaryHls,
+  recordCloudinaryHlsEagerNotification,
+} from "../utils/cloudinaryHls.js";
 
 const ALLOWED_RESOURCE_TYPES = new Set(["image", "video"]);
 
@@ -224,37 +227,86 @@ export function handleCloudinaryEagerNotification(req, res) {
   }
 
   const publicId = payload?.asset?.public_id || payload?.public_id || "unknown";
-  const eagerItems = Array.isArray(payload?.eager)
-    ? payload.eager
-    : payload?.eager && typeof payload.eager === "object"
-      ? [payload.eager]
+  const eagerValue = payload?.eager;
+  const eagerItems = Array.isArray(eagerValue)
+    ? eagerValue
+    : eagerValue && typeof eagerValue === "object"
+      ? [eagerValue]
       : [];
-  const failedItems = eagerItems.filter((item) =>
-    ["failed", "error"].includes(
-      String(item?.status || item?.state || "").toLowerCase(),
-    ),
-  );
-  const status = String(
-    payload?.status ||
-      (failedItems.length
-        ? "failed"
-        : eagerItems.length
-          ? "completed"
-          : "unknown"),
+  const nestedEagerStatus = String(
+    eagerValue?.status || eagerValue?.state || "",
   ).toLowerCase();
+  const payloadStatus = String(payload?.status || "").toLowerCase();
+  const itemStatuses = eagerItems.map((item) =>
+    String(item?.status || item?.state || "").toLowerCase(),
+  );
+  const failedItems = eagerItems.filter((item, index) =>
+    ["failed", "error"].includes(itemStatuses[index]),
+  );
+  const hasFailure =
+    payloadStatus === "failed" ||
+    nestedEagerStatus === "failed" ||
+    Boolean(payload?.error) ||
+    failedItems.length > 0;
+  const hasSuccess =
+    ["complete", "completed", "success", "successful"].includes(
+      payloadStatus,
+    ) ||
+    ["complete", "completed", "success", "successful"].includes(
+      nestedEagerStatus,
+    ) ||
+    itemStatuses.some((status) =>
+      ["complete", "completed", "success", "successful"].includes(status),
+    ) ||
+    eagerItems.some((item) => Boolean(item?.secure_url || item?.url));
+  const status = hasFailure ? "failed" : hasSuccess ? "completed" : "unknown";
+  const errorMessage = hasFailure
+    ? String(
+        payload?.error?.message ||
+          payload?.error ||
+          failedItems
+            .map(
+              (item) =>
+                item?.error?.message || item?.error || item?.state || "failed",
+            )
+            .join("; ") ||
+          "Cloudinary eager HLS generation failed.",
+      )
+    : null;
+  const batchId =
+    payload?.batch_id ||
+    eagerValue?.batch_id ||
+    payload?.eager?.batch_id ||
+    null;
 
-  if (status === "failed" || failedItems.length > 0) {
+  const recordedState = recordCloudinaryHlsEagerNotification({
+    publicId,
+    status,
+    batchId,
+    error: errorMessage,
+    eagerCount: eagerItems.length,
+  });
+
+  if (status === "failed") {
     console.error("Cloudinary eager video optimization failed:", {
       publicId,
-      error:
-        payload?.error ||
-        failedItems.map((item) => item?.error || item?.state || "failed"),
+      batchId,
+      error: errorMessage,
+      eagerCount: eagerItems.length,
     });
   } else {
     console.info("Cloudinary eager video optimization notification:", {
       publicId,
+      batchId,
       status,
       eagerCount: eagerItems.length,
+      trackedState: recordedState?.status || null,
+      eagerFormats: eagerItems.map((item) => ({
+        format: item?.format || null,
+        width: Number(item?.width) || null,
+        height: Number(item?.height) || null,
+        status: item?.status || item?.state || null,
+      })),
     });
   }
 

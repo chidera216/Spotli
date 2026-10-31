@@ -10,64 +10,25 @@ import Notifications from "../pages/Notifications";
 import SearchResults from "../pages/SearchResults";
 import Settings from "../pages/Settings";
 import RightSidebar from "../components/RightSidebar";
-import VideoViewer, { preloadCloudinaryVideoStream } from "../components/VideoViewer";
+import VideoViewer, {
+  getSpotliPrefetchOriginalVideoUrl,
+  prewarmCloudinaryVideoForOpen,
+} from "../components/VideoViewer";
 import { videoPosts } from "../components/postData";
 import api from "../services/api";
 import { useAuth } from "../context/useAuth";
 
-const API_ORIGIN = (
-  import.meta.env.VITE_API_URL || "http://localhost:5000/api"
-).replace(/\/api\/?$/, "");
-
-function getMediaUrlForPlaybackWarmup(value) {
-  if (typeof value === "string") return value.trim();
-  if (!value || typeof value !== "object") return "";
-  return (
-    value.url ||
-    value.src ||
-    value.videoUrl ||
-    value.secure_url ||
-    value.path ||
-    value.location ||
-    ""
-  );
-}
-
-// Start warming only the video the user explicitly opened. The HLS helper
-// selects the same network-aware rendition used by the active player, so
-// Data Saver continues to use its existing low-resolution/low-bitrate profile.
+// Use the same post-to-video resolver as Home and the viewer's next-video
+// prewarmer. This prevents the feed and viewer from warming different source
+// URLs for the same post (which would make the first segment cache unusable).
 function prewarmOpenedPost(post) {
-  const mediaType = String(
-    post?.mediaType || post?.type || post?.postType || post?.kind || "",
-  ).toLowerCase();
-  if (["photo", "image", "photos", "gallery"].includes(mediaType)) return;
+  const videoUrl = getSpotliPrefetchOriginalVideoUrl(post);
+  if (!videoUrl || !/^https?:\/\//i.test(videoUrl)) return;
 
-  const candidates = [
-    post?.videoUrl,
-    post?.video,
-    post?.videoFile,
-    Array.isArray(post?.videos) ? post.videos[0] : "",
-    post?.mediaUrl,
-    post?.media,
-    Array.isArray(post?.mediaUrls) ? post.mediaUrls[0] : "",
-    post?.url,
-  ];
-
-  for (const candidate of candidates) {
-    const rawUrl = getMediaUrlForPlaybackWarmup(candidate);
-    if (!rawUrl) continue;
-    const resolvedUrl = rawUrl.startsWith("/")
-      ? `${API_ORIGIN}${rawUrl}`
-      : rawUrl;
-    if (!/^https?:\/\//i.test(resolvedUrl)) continue;
-
-    // Do not await this request: opening the viewer must remain synchronous.
-    // The active HLS loader shares this exact playlist/segment warm cache.
-    preloadCloudinaryVideoStream(resolvedUrl, "auto", {
-      includeFirstSegment: true,
-    });
-    return;
-  }
+  // The shared helper warms a byte-capped HLS prefix for HLS.js-capable
+  // browsers. Native-HLS-only browsers warm playlist metadata because their
+  // media stack cannot reuse the JavaScript preloader's partial-byte cache.
+  prewarmCloudinaryVideoForOpen(videoUrl);
 }
 
 function MainLayout() {

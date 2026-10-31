@@ -1,5 +1,10 @@
 import { useEffect, useRef, useState } from "react";
-import { preloadCloudinaryVideoStream } from "./VideoViewer";
+import {
+  getSpotliPrefetchOriginalVideoUrl,
+  preloadCloudinaryVideoStream,
+  prewarmCloudinaryVideoForOpen,
+  shouldSkipHlsPrewarmForMobileAuto,
+} from "./VideoViewer";
 
 import {
   Heart,
@@ -100,53 +105,10 @@ function getPostImages(post) {
 }
 
 function getPostVideoSource(post) {
-  // Keep this priority identical to VideoViewer.getOriginalVideoUrl().
-  // A post can contain both videoUrl and mediaUrl (for example, a legacy
-  // Cloudinary URL plus a newer canonical URL). If the grid prewarms one
-  // version while the player opens the other, the HLS segment cache cannot
-  // be reused and the first frame has to wait for a second download.
-  const candidates = [
-    post?.videoUrl,
-    post?.video,
-    post?.videoFile,
-    Array.isArray(post?.videos) ? post.videos[0] : "",
-    post?.mediaUrl,
-    post?.media,
-    Array.isArray(post?.mediaUrls) ? post.mediaUrls[0] : "",
-    post?.url,
-  ];
-
-  for (const candidate of candidates) {
-    const value =
-      typeof candidate === "string"
-        ? candidate.trim()
-        : candidate && typeof candidate === "object"
-          ? String(
-              candidate.url ||
-                candidate.src ||
-                candidate.imageUrl ||
-                candidate.videoUrl ||
-                candidate.secure_url ||
-                candidate.path ||
-                candidate.location ||
-                "",
-            ).trim()
-          : "";
-
-    if (!value) continue;
-    if (/(?:\.(?:avif|bmp|gif|jpe?g|png|webp)(?:[?#]|$)|\/image\/upload\/|^data:image\/)/i.test(value)) {
-      continue;
-    }
-
-    // Match VideoViewer.resolveMediaUrl(): absolute URLs and root-relative
-    // paths are normalized, while other relative values remain unchanged.
-    if (/^https?:\/\//i.test(value) || value.startsWith("/")) {
-      return getImageUrl(value);
-    }
-    return value;
-  }
-
-  return "";
+  // Share the exact source resolver used by MainLayout and VideoViewer's
+  // upcoming-video prewarmer. A different URL here causes a second segment
+  // request when the viewer mounts.
+  return getSpotliPrefetchOriginalVideoUrl(post);
 }
 
 function CreatorAvatar({ post }) {
@@ -303,10 +265,11 @@ function PostCard({
   const activeImage = images[activeImageIndex] || "";
   const videoUrl = getPostVideoSource(post);
 
-  // Warm only the small HLS playlists as cards enter the grid. Do not download
-  // video segments until the viewer deliberately opens a specific card.
+  // Warm small HLS playlists as desktop cards enter the grid. Mobile Auto uses
+  // the viewer's shared progressive-MP4 element and skips this HLS prewarm.
   useEffect(() => {
     if (
+      shouldSkipHlsPrewarmForMobileAuto() ||
       !isVideo ||
       !isPriorityVideo ||
       !videoUrl ||
@@ -343,6 +306,11 @@ function PostCard({
   }, [isVideo, isPriorityVideo, videoUrl]);
 
   function openPost() {
+    // A delayed hover timer must not fire after this card is selected. The
+    // pointer-down handler starts the intentional prewarm; keyboard and other
+    // activation paths are covered here as well.
+    cancelScheduledVideoPreload();
+
     if (isVideo) {
       onOpenVideo?.(post);
 
@@ -566,20 +534,22 @@ function PostCard({
     }
     const connection =
       typeof navigator !== "undefined"
-        ? navigator.connection || navigator.mozConnection || navigator.webkitConnection
+        ? navigator.connection ||
+          navigator.mozConnection ||
+          navigator.webkitConnection
         : null;
     const effectiveType = String(connection?.effectiveType || "").toLowerCase();
     return Boolean(
       connection?.saveData === true ||
-        ["slow-2g", "2g", "3g"].includes(effectiveType) ||
-        (Number(connection?.downlink) > 0 && Number(connection?.downlink) < 1.2),
+      ["slow-2g", "2g", "3g"].includes(effectiveType) ||
+      (Number(connection?.downlink) > 0 && Number(connection?.downlink) < 1.2),
     );
   }
 
-  // Hover warms only lightweight playlists. Pointerdown still warms the first
-  // segment for the exact video the user is opening, even in Data Saver mode.
+  // Hover warms lightweight playlists only on desktop, where Auto playback uses
+  // HLS. Mobile Auto is owned by the viewer's persistent progressive-MP4 element.
   function scheduleVideoPreload(event) {
-    if (isDataSaverEnabled()) return;
+    if (isDataSaverEnabled() || shouldSkipHlsPrewarmForMobileAuto()) return;
     if (event?.pointerType && event.pointerType !== "mouse") return;
     cancelScheduledVideoPreload();
     // A short hover is a useful head start; fast mouse movement across the feed
@@ -602,11 +572,13 @@ function PostCard({
           onPointerEnter={scheduleVideoPreload}
           onPointerLeave={cancelScheduledVideoPreload}
           onPointerDown={() => {
-            // Explicit user intent: warm only the exact video being opened.
-            // The viewer's HLS loader shares the in-flight bytes.
-            preloadCloudinaryVideoStream(videoUrl, "auto", {
-              includeFirstSegment: true,
-            });
+            // Cancel the delayed hover-only playlist warmup before the
+            // intentional tap/click prewarm starts. This prevents a timer from
+            // waking up after the viewer has already taken ownership.
+            cancelScheduledVideoPreload();
+            // The shared helper selects HLS prewarming on desktop and skips
+            // detached HLS requests on mobile, where the feed MP4 element owns playback.
+            prewarmCloudinaryVideoForOpen(videoUrl);
           }}
           onClick={openPost}
           className="relative block aspect-video w-full overflow-hidden rounded-lg bg-gray-950 text-left"
@@ -758,7 +730,9 @@ function PostGrid({
     .join("|");
 
   useEffect(() => {
-    if (!firstVideoPreloadKey) return undefined;
+    if (!firstVideoPreloadKey || shouldSkipHlsPrewarmForMobileAuto()) {
+      return undefined;
+    }
 
     const candidates = feedPosts
       .filter((post) => !isPhotoPost(post))

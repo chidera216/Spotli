@@ -1,12 +1,63 @@
 import cloudinary from "../config/cloudinary.js";
 
-// Use Cloudinary's predefined Full HD streaming profile. It creates a known,
-// eagerly generated HLS output at up to 1080p and matches the viewer URL. Keep
-// this identifier in sync with VideoViewer.jsx.
-export const CLOUDINARY_HLS_STREAMING_PROFILE = "full_hd";
+// Use Cloudinary's orientation-aware automatic streaming profile. Spotli has
+// portrait and landscape uploads; sp_auto expresses quality using the shorter
+// edge, preserves source orientation, and caps output at Cloudinary's default
+// 1080p maximum without upscaling lower-resolution sources. Keep this profile
+// identifier in sync with VideoViewer.jsx.
+export const CLOUDINARY_HLS_STREAMING_PROFILE = "auto";
 
 const queuedHlsByPublicId = new Map();
+const hlsJobStateByPublicId = new Map();
 const MAX_QUEUED_HLS_CACHE = 2000;
+
+/**
+ * Record Cloudinary's signed eager notification. A failed asynchronous job
+ * must evict the in-process queue entry so the next explicit prepare request
+ * can actually submit a fresh job instead of returning the old resolved promise.
+ */
+export function recordCloudinaryHlsEagerNotification({
+  publicId,
+  status,
+  batchId = null,
+  error = null,
+  eagerCount = 0,
+} = {}) {
+  if (typeof publicId !== "string" || !publicId.startsWith("spotli/posts/")) {
+    return null;
+  }
+
+  const normalizedStatus = String(status || "unknown").toLowerCase();
+  const failed = ["failed", "error"].includes(normalizedStatus);
+  const ready = ["complete", "completed", "success", "successful"].includes(
+    normalizedStatus,
+  );
+
+  const state = {
+    status: failed ? "failed" : ready ? "ready" : "unknown",
+    batchId: batchId || null,
+    eagerCount: Number(eagerCount) || 0,
+    error: error ? String(error).slice(0, 1000) : null,
+    updatedAt: Date.now(),
+  };
+
+  hlsJobStateByPublicId.set(publicId, state);
+
+  if (failed) {
+    queuedHlsByPublicId.delete(publicId);
+  }
+
+  while (hlsJobStateByPublicId.size > MAX_QUEUED_HLS_CACHE) {
+    const oldestKey = hlsJobStateByPublicId.keys().next().value;
+    hlsJobStateByPublicId.delete(oldestKey);
+  }
+
+  return state;
+}
+
+export function getCloudinaryHlsJobState(publicId) {
+  return hlsJobStateByPublicId.get(publicId) || null;
+}
 
 /**
  * Queue asynchronous HLS generation after a direct-to-Cloudinary upload has
@@ -20,8 +71,12 @@ export async function queueCloudinaryHls(publicId) {
     );
   }
 
+  const jobState = hlsJobStateByPublicId.get(publicId);
   const cached = queuedHlsByPublicId.get(publicId);
-  if (cached) return cached;
+  if (cached && jobState?.status !== "failed") return cached;
+  if (jobState?.status === "failed") {
+    queuedHlsByPublicId.delete(publicId);
+  }
 
   const queuePromise = (async () => {
     const options = {
@@ -42,10 +97,46 @@ export async function queueCloudinaryHls(publicId) {
           format: "mp4",
         },
         {
+          width: 854,
+          height: 854,
+          crop: "limit",
+          bit_rate: "300k",
+          quality: "auto:eco",
+          video_codec: "h264",
+          format: "mp4",
+        },
+        {
+          width: 854,
+          height: 854,
+          crop: "limit",
+          bit_rate: "400k",
+          quality: "auto:eco",
+          video_codec: "h264",
+          format: "mp4",
+        },
+        {
+          width: 854,
+          height: 854,
+          crop: "limit",
+          bit_rate: "500k",
+          quality: "auto:eco",
+          video_codec: "h264",
+          format: "mp4",
+        },
+        {
           width: 640,
           height: 640,
           crop: "limit",
           bit_rate: "300k",
+          quality: "auto:eco",
+          video_codec: "h264",
+          format: "mp4",
+        },
+        {
+          width: 640,
+          height: 640,
+          crop: "limit",
+          bit_rate: "200k",
           quality: "auto:eco",
           video_codec: "h264",
           format: "mp4",
@@ -65,7 +156,20 @@ export async function queueCloudinaryHls(publicId) {
       );
     }
 
-    return cloudinary.uploader.explicit(publicId, options);
+    const result = await cloudinary.uploader.explicit(publicId, options);
+    const currentState = hlsJobStateByPublicId.get(publicId);
+    // The webhook can theoretically arrive before the API promise resolves.
+    // Do not downgrade a completed notification back to merely queued.
+    if (currentState?.status !== "ready") {
+      hlsJobStateByPublicId.set(publicId, {
+        status: "queued",
+        batchId: result?.batch_id || null,
+        eagerCount: 0,
+        error: null,
+        updatedAt: Date.now(),
+      });
+    }
+    return result;
   })();
 
   queuedHlsByPublicId.set(publicId, queuePromise);
@@ -81,6 +185,13 @@ export async function queueCloudinaryHls(publicId) {
     if (queuedHlsByPublicId.get(publicId) === queuePromise) {
       queuedHlsByPublicId.delete(publicId);
     }
+    hlsJobStateByPublicId.set(publicId, {
+      status: "failed",
+      batchId: null,
+      eagerCount: 0,
+      error: error?.message || String(error),
+      updatedAt: Date.now(),
+    });
     throw error;
   }
 }

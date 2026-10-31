@@ -2,13 +2,15 @@ import "dotenv/config";
 
 import mongoose from "mongoose";
 import connectDB from "../config/db.js";
-import cloudinary from "../config/cloudinary.js";
 import Post from "../models/Post.js";
+import { queueCloudinaryHls } from "../utils/cloudinaryHls.js";
 
 async function main() {
   await connectDB();
 
-  const posts = await Post.find({ mediaType: "video" })
+  const posts = await Post.find({
+    mediaType: "video",
+  })
     .select("mediaPublicIds")
     .lean();
 
@@ -32,22 +34,14 @@ async function main() {
 
   for (const publicId of publicIds) {
     try {
-      await cloudinary.uploader.explicit(publicId, {
-        type: "upload",
-        resource_type: "video",
-        eager: [
-          {
-            streaming_profile: "full_hd",
-            format: "m3u8",
-          },
-        ],
-        eager_async: true,
-      });
+      await queueCloudinaryHls(publicId);
 
       queued += 1;
-      console.log(`[QUEUED] ${publicId}`);
+
+      console.log(`[QUEUED] orientation-aware auto HLS: ${publicId}`);
     } catch (error) {
       failed += 1;
+
       console.error(`[FAILED] ${publicId}: ${error.message}`);
     }
   }
@@ -64,6 +58,7 @@ try {
   await main();
 } catch (error) {
   console.error("Stream preparation failed:", error.message);
+
   process.exitCode = 1;
 } finally {
   await mongoose.disconnect();

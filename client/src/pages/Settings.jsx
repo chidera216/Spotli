@@ -50,13 +50,15 @@ function normalizeAppearance(value) {
 function shouldDefaultDataSaverOn() {
   if (typeof navigator === "undefined") return false;
   const connection =
-    navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+    navigator.connection ||
+    navigator.mozConnection ||
+    navigator.webkitConnection;
   const effectiveType = String(connection?.effectiveType || "").toLowerCase();
   const downlink = Number(connection?.downlink);
   return Boolean(
     connection?.saveData === true ||
-      ["slow-2g", "2g", "3g"].includes(effectiveType) ||
-      (Number.isFinite(downlink) && downlink > 0 && downlink < 1.2),
+    ["slow-2g", "2g", "3g"].includes(effectiveType) ||
+    (Number.isFinite(downlink) && downlink > 0 && downlink < 1.2),
   );
 }
 
@@ -371,56 +373,56 @@ export default function Settings() {
                 checked={Boolean(preferences.dataSaver)}
                 onChange={(value) => updatePreference("dataSaver", value)}
                 label="Data Saver"
-                description="Reduce mobile data use by limiting automatic video quality and background downloads. Active videos still autoplay."
+                description="Reduce mobile data use by targeting 480p on phones and tablets, while desktop Auto playback stays at 720p. Background downloads are limited; active videos still autoplay."
               />
               <p className="pb-3 text-xs text-neutral-500" role="status">
                 {preferences.dataSaver
-                  ? "Data Saver is on. Automatic playback is limited to a lower data profile."
+                  ? "Data Saver is on. Mobile Auto targets 480p; desktop Auto stays at 720p."
                   : "Data Saver is off. Spotli will use the normal automatic playback profile."}
               </p>
             </section>
             <section className="divide-y divide-neutral-100 rounded-2xl border border-neutral-200 p-1 sm:p-2">
-            {sections.map((item) => (
-              <SettingsRow
-                key={item.id}
-                icon={item.icon}
-                title={item.title}
-                description={item.description}
-                onClick={() => setSection(item.id)}
-              />
-            ))}
-            <button
-              type="button"
-              disabled={isLoggingOut}
-              onClick={async () => {
-                if (isLoggingOut) return;
-                setIsLoggingOut(true);
-                setLogoutError("");
-                try {
-                  await api.auth.logout();
-                  setUser(null);
-                  navigate("/login", { replace: true });
-                } catch (error) {
-                  setLogoutError(error.message || "Unable to log out.");
-                } finally {
-                  setIsLoggingOut(false);
-                }
-              }}
-              className="flex w-full items-center gap-3 rounded-xl px-3 py-3.5 text-left text-sm font-semibold text-[#FF2D4A] transition hover:bg-neutral-50"
-            >
-              <span className="grid h-10 w-10 place-items-center rounded-full bg-rose-50">
-                <LogOut size={19} />
-              </span>
-              {isLoggingOut ? "Logging out…" : "Log out"}
-            </button>
-            {logoutError && (
-              <p role="alert" className="px-4 py-2 text-sm text-red-600">
-                {logoutError}
-              </p>
-            )}
-            {privacyError && (
-              <p className="px-4 py-2 text-sm text-red-600">{privacyError}</p>
-            )}
+              {sections.map((item) => (
+                <SettingsRow
+                  key={item.id}
+                  icon={item.icon}
+                  title={item.title}
+                  description={item.description}
+                  onClick={() => setSection(item.id)}
+                />
+              ))}
+              <button
+                type="button"
+                disabled={isLoggingOut}
+                onClick={async () => {
+                  if (isLoggingOut) return;
+                  setIsLoggingOut(true);
+                  setLogoutError("");
+                  try {
+                    await api.auth.logout();
+                    setUser(null);
+                    navigate("/login", { replace: true });
+                  } catch (error) {
+                    setLogoutError(error.message || "Unable to log out.");
+                  } finally {
+                    setIsLoggingOut(false);
+                  }
+                }}
+                className="flex w-full items-center gap-3 rounded-xl px-3 py-3.5 text-left text-sm font-semibold text-[#FF2D4A] transition hover:bg-neutral-50"
+              >
+                <span className="grid h-10 w-10 place-items-center rounded-full bg-rose-50">
+                  <LogOut size={19} />
+                </span>
+                {isLoggingOut ? "Logging out…" : "Log out"}
+              </button>
+              {logoutError && (
+                <p role="alert" className="px-4 py-2 text-sm text-red-600">
+                  {logoutError}
+                </p>
+              )}
+              {privacyError && (
+                <p className="px-4 py-2 text-sm text-red-600">{privacyError}</p>
+              )}
             </section>
           </>
         ) : section === "privacy" ? (
