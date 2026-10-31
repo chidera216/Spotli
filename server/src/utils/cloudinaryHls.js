@@ -88,6 +88,36 @@ export async function queueCloudinaryHls(publicId) {
           format: "m3u8",
         },
         {
+          // Fast desktop Auto startup: 1080p-class short edge when source permits.
+          width: 1920,
+          height: 1920,
+          crop: "limit",
+          bit_rate: "1600k",
+          quality: "auto:eco",
+          video_codec: "h264",
+          format: "mp4",
+        },
+        {
+          // Weak desktop: preserve 720p-class dimensions with a lower bitrate.
+          width: 1280,
+          height: 1280,
+          crop: "limit",
+          bit_rate: "400k",
+          quality: "auto:eco",
+          video_codec: "h264",
+          format: "mp4",
+        },
+        {
+          // Constrained desktop: 720p-class dimensions with 500 kbps.
+          width: 1280,
+          height: 1280,
+          crop: "limit",
+          bit_rate: "500k",
+          quality: "auto:eco",
+          video_codec: "h264",
+          format: "mp4",
+        },
+        {
           width: 1280,
           height: 1280,
           crop: "limit",

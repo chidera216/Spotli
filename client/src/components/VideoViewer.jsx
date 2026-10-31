@@ -1,4 +1,3 @@
-import { useEffect, useState } from "react";
 import {
   useEffect as tablet_useEffect,
   useLayoutEffect as tablet_useLayoutEffect,
@@ -24,35 +23,9 @@ import {
   Captions as tablet_Captions,
   Bookmark as tablet_Bookmark,
   Trash2 as tablet_Trash2,
+  ChevronUp as tablet_ChevronUp,
+  ChevronDown as tablet_ChevronDown,
 } from "lucide-react";
-import {
-  useEffect as desktop_useEffect,
-  useLayoutEffect as desktop_useLayoutEffect,
-  useMemo as desktop_useMemo,
-  useRef as desktop_useRef,
-  useState as desktop_useState,
-} from "react";
-import {
-  ArrowLeft as desktop_ArrowLeft,
-  ArrowUp as desktop_ArrowUp,
-  ArrowDown as desktop_ArrowDown,
-  Heart as desktop_Heart,
-  MessageCircle as desktop_MessageCircle,
-  Share2 as desktop_Share2,
-  MoreVertical as desktop_MoreVertical,
-  Play as desktop_Play,
-  Pause as desktop_Pause,
-  Volume2 as desktop_Volume2,
-  VolumeX as desktop_VolumeX,
-  Maximize as desktop_Maximize,
-  Captions as desktop_Captions,
-  CheckCircle2 as desktop_CheckCircle2,
-  Bookmark as desktop_Bookmark,
-  Trash2 as desktop_Trash2,
-} from "lucide-react";
-import desktop_TopBar from "../components/TopBar";
-import desktop_CommentSection from "./comments/CommentSection";
-import desktop_api from "../services/api";
 import MentionText from "./MentionText";
 import { getRecentVideoPlaybackUrl } from "../utils/recentVideoPlaybackCache";
 
@@ -389,25 +362,32 @@ function getOptimizedPlaybackUrl(value) {
   // transformation that Cloudinary may have to generate on the first failure
   // path, making the fallback look like another playback failure.
   const desktopEagerFallback = Boolean(networkProfile.desktopPlayback);
+  const desktopFastEagerFallback = Boolean(
+    desktopEagerFallback && networkProfile.fastDesktop,
+  );
 
   // Keep the mobile output near the 480p class when bandwidth allows, but
   // lower both bitrate and maximum dimension on very slow links. Mobile tiers
-  // remain unchanged by the desktop fallback correction.
-  const maxDimension = desktopEagerFallback
-    ? 1280
-    : veryLowBandwidth
-      ? networkProfile.progressiveFallbackMaxDimension || 854
-      : fallbackHeight <= 480
-        ? 854
-        : fallbackHeight <= 720
-          ? 1280
-          : 1920;
+  // remain unchanged by the desktop progressive-startup path.
+  const maxDimension = desktopFastEagerFallback
+    ? 1920
+    : desktopEagerFallback
+      ? 1280
+      : veryLowBandwidth
+        ? networkProfile.progressiveFallbackMaxDimension || 854
+        : fallbackHeight <= 480
+          ? 854
+          : fallbackHeight <= 720
+            ? 1280
+            : 1920;
 
-  // Desktop uses the already-eagerly-generated 800 kbps derivative instead
-  // of requesting a 1600/2500 kbps on-demand transformation. Mobile keeps its
-  // existing network-aware upload-time bitrate ladder.
+  // Desktop Auto now starts from an upload-time eager MP4 instead of waiting
+  // through HLS playlist/segment setup. Normal/weak desktop uses the matching
+  // 720p-class derivative (400k/500k/800k by measured network); fast desktop
+  // uses the 1080p-class 1600k one.
+  // Mobile keeps its existing network-aware upload-time bitrate ladder.
   const maxBitrate = desktopEagerFallback
-    ? "800k"
+    ? getDesktopProgressiveBitrate(networkProfile)
     : veryLowBandwidth
       ? networkProfile.progressiveFallbackBitrate || "300k"
       : fallbackHeight <= 480
@@ -431,18 +411,18 @@ function getOptimizedPlaybackUrl(value) {
 // its first decoded frame is ready.
 const feedVideoPreloadStates = new WeakMap();
 const activeFeedVideoPreloadStates = new Set();
-let mobileFeedPreloadsAllowed = false;
+let feedVideoPreloadsAllowed = false;
 
-// Pause speculative feed-card MP4 requests whenever the active mobile player
-// is buffering or has lost its safety buffer. Sources are kept attached: no
+// Pause speculative feed-card MP4 requests whenever the active player
+// on mobile, tablet or desktop is buffering or has lost its safety buffer. Sources are kept attached: no
 // src removal or load() call is made while yielding, so a partial preload can
 // resume without discarding the element's already received media bytes.
-function setMobileFeedPreloadPriority(
+function setFeedVideoPreloadPriority(
   allowed,
   activeVideo = null,
   reason = "buffer-policy",
 ) {
-  mobileFeedPreloadsAllowed = Boolean(allowed);
+  feedVideoPreloadsAllowed = Boolean(allowed);
 
   for (const state of activeFeedVideoPreloadStates) {
     const candidateVideo = state?.videoElement;
@@ -455,7 +435,7 @@ function setMobileFeedPreloadPriority(
       continue;
     }
 
-    if (!mobileFeedPreloadsAllowed && !state.yieldedForActivePlayback) {
+    if (!feedVideoPreloadsAllowed && !state.yieldedForActivePlayback) {
       state.yieldedForActivePlayback = true;
       state.aggressive = false;
       try {
@@ -480,7 +460,7 @@ function setMobileFeedPreloadPriority(
       continue;
     }
 
-    if (mobileFeedPreloadsAllowed && state.yieldedForActivePlayback) {
+    if (feedVideoPreloadsAllowed && state.yieldedForActivePlayback) {
       state.yieldedForActivePlayback = false;
       state.aggressive = true;
       try {
@@ -510,15 +490,60 @@ function setMobileFeedPreloadPriority(
   }
 }
 
-// Tracks progressive MP4 media that was deliberately retained when a mobile
-// feed card became inactive. The same DOM element can then be verified and
-// resumed instead of trusting a log flag or rebuilding its media source.
-const retainedMobileProgressiveMedia = new WeakMap();
+// Tracks progressive MP4 media retained when any Auto feed card becomes
+// inactive. The same DOM element can be verified and resumed instead of
+// trusting a log flag or rebuilding its media source.
+const retainedProgressiveMedia = new WeakMap();
+const retainedDesktopInflightMp4Requests = new Map();
+const MAX_RETAINED_DESKTOP_INFLIGHT_MP4_REQUESTS = 2;
 
-// Desktop's adaptive HLS stream is attached to a per-post video element. Keep
-// a small number of inactive HLS controllers alive so returning to a recent
-// post can reuse its MediaSource and buffered segments instead of rebuilding
-// the entire stream. The LRU cap prevents unbounded SourceBuffer memory growth.
+function trackRetainedDesktopInflightMp4Request(video, record) {
+  retainedDesktopInflightMp4Requests.delete(video);
+  retainedDesktopInflightMp4Requests.set(video, record);
+
+  while (
+    retainedDesktopInflightMp4Requests.size >
+    MAX_RETAINED_DESKTOP_INFLIGHT_MP4_REQUESTS
+  ) {
+    const oldestEntry = retainedDesktopInflightMp4Requests
+      .entries()
+      .next().value;
+    if (!oldestEntry) break;
+
+    const [oldVideo] = oldestEntry;
+    retainedDesktopInflightMp4Requests.delete(oldVideo);
+
+    // If the old request is still waiting for its first metadata response,
+    // cancel it to avoid allowing many abandoned videos to compete with the
+    // currently active desktop video. Completed/metadata-ready sources stay
+    // attached in their own per-post element for later resume.
+    if (
+      oldVideo !== video &&
+      oldVideo?.isConnected &&
+      oldVideo.readyState === 0 &&
+      oldVideo.networkState === 2 &&
+      !oldVideo.error
+    ) {
+      try {
+        oldVideo.pause();
+        oldVideo.removeAttribute("src");
+        oldVideo.load();
+        retainedProgressiveMedia.delete(oldVideo);
+      } catch {}
+      console.info(
+        "[Spotli playback] Evicted oldest pending desktop MP4 request to protect active playback",
+        {
+          postId: oldVideo.dataset?.postId || null,
+          retainedPendingLimit: MAX_RETAINED_DESKTOP_INFLIGHT_MP4_REQUESTS,
+        },
+      );
+    }
+  }
+}
+
+// HLS recovery streams can still be retained per post when progressive MP4
+// delivery fails. Keep a small LRU cache so recovery does not rebuild a stream
+// unnecessarily; normal desktop Auto now uses retained progressive MP4 instead.
 const retainedDesktopHlsControllers = new Map();
 const MAX_RETAINED_DESKTOP_HLS_CONTROLLERS = 3;
 
@@ -754,7 +779,7 @@ function preloadFeedVideoElement(
       return Promise.resolve(true);
     }
 
-    if (aggressive && !state.aggressive && mobileFeedPreloadsAllowed) {
+    if (aggressive && !state.aggressive && feedVideoPreloadsAllowed) {
       state.aggressive = true;
       state.yieldedForActivePlayback = false;
       videoElement.preload = "auto";
@@ -877,27 +902,14 @@ function preloadNextVideoPlayback(value, options = {}) {
   const networkProfile = getNetworkPlaybackProfile();
   const policy = getUpcomingVideoChunkPreloadPolicy(networkProfile);
 
-  // Mobile Auto starts with the profile-selected progressive MP4, not HLS.
-  // Prewarm that exact source on the actual inactive feed element and stop as
-  // soon as its first decoded frame is ready. The following swipe and any
-  // return to this post can reuse the same element and media buffer.
-  if (!networkProfile.desktopPlayback) {
-    if (!options.videoElement) {
-      console.info(
-        "[Spotli playback] Skipping mobile preload without the reusable feed element",
-        {
-          postId: options.postId == null ? null : String(options.postId),
-          asset:
-            getSpotliCloudinaryAssetParts(value)?.assetPathWithoutExtension ||
-            null,
-          priority: options.priority || "next-video",
-        },
-      );
-      return Promise.resolve(false);
-    }
+  // Auto playback prewarms the exact progressive MP4 URL on the actual
+  // inactive per-post video element for every form factor. This is the same
+  // element that becomes active after a swipe, so no HLS playlist/segment
+  // rebuild is needed and the first decoded frame/buffer can be reused.
+  if (options.videoElement) {
     const optimizedSourceUrl = getOptimizedPlaybackUrl(value);
     const existingState = feedVideoPreloadStates.get(options.videoElement);
-    if (!mobileFeedPreloadsAllowed) {
+    if (!feedVideoPreloadsAllowed) {
       if (existingState?.sourceUrl === optimizedSourceUrl) {
         return (
           existingState.promise ||
@@ -905,25 +917,53 @@ function preloadNextVideoPlayback(value, options = {}) {
         );
       }
       console.info(
-        "[Spotli playback] Deferring mobile MP4 preload until active buffer is healthy",
+        "[Spotli playback] Deferring feed MP4 preload until active buffer is healthy",
         {
           postId: options.postId == null ? null : String(options.postId),
           asset:
             getSpotliCloudinaryAssetParts(value)?.assetPathWithoutExtension ||
             null,
           priority: options.priority || "next-video",
+          desktopPlayback: networkProfile.desktopPlayback,
         },
       );
       return Promise.resolve(false);
     }
     return preloadFeedVideoElement(value, options.videoElement, {
-      // Promote only the exact card that is next in line. It stops as soon as
-      // the first decoded frame is ready and then remains attached for reuse.
       aggressive: true,
       firstFrameOnly: true,
       postId: options.postId,
       priority: options.priority || "next-video",
     });
+  }
+
+  // Auto playback must not warm a detached HLS copy. Desktop, tablet and mobile
+  // all require the actual feed element so the viewer can inherit its source.
+  if (networkProfile.desktopPlayback) {
+    console.info(
+      "[Spotli playback] Skipping desktop HLS prewarm without reusable feed element",
+      {
+        postId: options.postId == null ? null : String(options.postId),
+        asset:
+          getSpotliCloudinaryAssetParts(value)?.assetPathWithoutExtension ||
+          null,
+        priority: options.priority || "next-video",
+      },
+    );
+    return Promise.resolve(false);
+  }
+  if (!networkProfile.desktopPlayback) {
+    console.info(
+      "[Spotli playback] Skipping mobile preload without the reusable feed element",
+      {
+        postId: options.postId == null ? null : String(options.postId),
+        asset:
+          getSpotliCloudinaryAssetParts(value)?.assetPathWithoutExtension ||
+          null,
+        priority: options.priority || "next-video",
+      },
+    );
+    return Promise.resolve(false);
   }
   const requestedFirstSegment = options.includeFirstSegment === true;
   const partialBytes = Math.max(
@@ -1045,13 +1085,16 @@ function getCloudinaryHlsUrl(value) {
   return `${parts.base}sp_auto/${parts.assetPathWithoutExtension}.m3u8`;
 }
 
-// Home uses this same playback policy to avoid warming HLS resources when weak-
-// mobile Auto will start from the optimized progressive MP4 instead.
+// All Auto playback uses the actual per-post progressive MP4 element for
+// predictable startup and instant resume. HLS is now a recovery fallback only,
+// so detached Home HLS prewarming is unnecessary on every form factor.
+export function shouldSkipDetachedHlsPrewarmForAuto() {
+  return true;
+}
+
+// Backwards-compatible export for callers still using the earlier name.
 export function shouldSkipHlsPrewarmForMobileAuto() {
-  const profile = getNetworkPlaybackProfile();
-  // Mobile Auto now plays its profile-selected progressive MP4 directly.
-  // Warming HLS playlists for that same post would be unused network traffic.
-  return !profile.desktopPlayback;
+  return shouldSkipDetachedHlsPrewarmForAuto();
 }
 
 // Detect connection characteristics for startup rendition and buffering
@@ -1233,6 +1276,16 @@ function getNetworkPlaybackProfile() {
     downlinkMbps: hasDownlink ? downlink : null,
     rttMs: hasRtt ? rtt : null,
   };
+}
+
+function getDesktopProgressiveBitrate(profile = getNetworkPlaybackProfile()) {
+  if (profile.fastDesktop) return "1600k";
+  // Keep the desktop short-edge resolution floor at 720p while using a bitrate
+  // that leaves network headroom on weak connections. Resolution and bitrate
+  // are independent: this does not switch desktop to a 480p rendition.
+  if (profile.downlinkMbps > 0 && profile.downlinkMbps < 0.7) return "400k";
+  if (profile.weakNetwork || profile.dataSaver) return "500k";
+  return "800k";
 }
 
 // Choose the highest-resolution rendition within the device/network ceiling
@@ -2880,48 +2933,23 @@ export function preloadCloudinaryVideoStream(
   return request;
 }
 
-// All feed entry points use this one policy when the user opens a video.
-// Desktop HLS playback warms the same byte-capped prefix the active player uses.
-// Mobile Auto skips detached HLS preloading and lets its actual feed video
-// element own progressive-MP4 startup and resume.
+// All Auto feed videos start from their persistent per-post progressive MP4
+// element. A detached HLS tap warmup would prefetch a different source and can
+// compete with the active video, so the viewer owns the request on every device.
 export function prewarmCloudinaryVideoForOpen(value) {
   const networkProfile = getNetworkPlaybackProfile();
-  const policy = getUpcomingVideoChunkPreloadPolicy(networkProfile);
-
-  // All mobile Auto playback is owned by the viewer's actual feed video
-  // element. Do not create a detached HLS preloader on Home tap: it would warm
-  // a source the mobile player will not use and can compete with MP4 startup.
-  if (!networkProfile.desktopPlayback) {
-    console.info(
-      "[Spotli playback] Skipping detached mobile HLS tap prewarm; viewer MP4 element owns startup",
-      {
-        asset:
-          getSpotliCloudinaryAssetParts(value)?.assetPathWithoutExtension ||
-          null,
-        downlinkMbps: networkProfile.downlinkMbps,
-        effectiveType: networkProfile.effectiveType,
-        dataSaver: networkProfile.dataSaver,
-      },
-    );
-    return Promise.resolve(false);
-  }
-
-  // Native-HLS-only browsers cannot consume Spotli's JavaScript byte-prefix
-  // cache. Prepare only the small playlists there; do not download a segment
-  // that the native media stack may request again independently.
-  if (!browserCanUseHlsJs()) {
-    return preloadCloudinaryVideoStream(value, "auto", {
-      includeFirstSegment: false,
-    });
-  }
-
-  // Every HLS.js-capable Cloudinary open uses the same small HLS prefix that
-  // the next-two queue prepares. The active player completes only the missing
-  // suffix, avoiding a full-segment download on pointer-down.
-  return preloadCloudinaryVideoStream(value, "auto", {
-    partialBytes: policy.segmentBytes,
-    initBytes: policy.initBytes,
-  });
+  console.info(
+    "[Spotli playback] Skipping detached HLS tap prewarm; per-post MP4 element owns startup",
+    {
+      asset:
+        getSpotliCloudinaryAssetParts(value)?.assetPathWithoutExtension || null,
+      desktopPlayback: networkProfile.desktopPlayback,
+      downlinkMbps: networkProfile.downlinkMbps,
+      effectiveType: networkProfile.effectiveType,
+      dataSaver: networkProfile.dataSaver,
+    },
+  );
+  return Promise.resolve(false);
 }
 
 // Treat completed and in-flight HLS segment/chunk prewarms as reusable. The
@@ -3033,10 +3061,8 @@ if (typeof document !== "undefined") {
   }
 }
 
-// Start loading hls.js while Home is visible when the current playback policy
-// will use HLS. Mobile Auto starts with progressive MP4, so defer the HLS
-// bundle until it is genuinely needed as a fallback; this avoids competing
-// with the first MP4 request on mobile data connections.
+// Auto playback starts from the persistent progressive MP4 element on every
+// device. Defer hls.js until the MP4 recovery path actually needs HLS.
 if (browserCanUseHlsJs() && !shouldSkipHlsPrewarmForMobileAuto()) {
   loadHlsLibrary();
 }
@@ -3113,26 +3139,31 @@ function attachCloudinaryAdaptiveStream(
   const startupPreloadPolicy =
     getUpcomingVideoChunkPreloadPolicy(attachNetworkProfile);
 
-  // Prepare the exact same bounded HLS prefix used by Home and the next-two
-  // queue. This is deliberately done before checking the warm cache so an
-  // in-flight request can be joined by the active player's custom loader.
+  // Auto playback on every form factor starts from the same per-post
+  // progressive MP4 element. HLS remains available as a recovery path if the
+  // eager MP4 cannot be delivered, but it is no longer the normal desktop
+  // startup sequence.
   const mobileProgressiveAutoPrimary = Boolean(
     initialQualityKey === "auto" &&
     !attachNetworkProfile.desktopPlayback &&
     !hasLocalUploadCopy,
   );
-  // Every mobile Auto video uses a progressive MP4 on its own persistent feed
-  // element. The selected URL still follows the network profile (480p-class
-  // low-bitrate tiers on weak links; 720p/800 kbps on normal mobile). Keeping
-  // this same source attached across swipes lets the browser reuse the decoded
-  // frame and buffered ranges when the viewer returns to a previous post.
-  const retainMobileProgressiveBufferOnDeactivate = Boolean(
-    !attachNetworkProfile.desktopPlayback,
+  const desktopProgressiveAutoPrimary = Boolean(
+    initialQualityKey === "auto" &&
+    attachNetworkProfile.desktopPlayback &&
+    !hasLocalUploadCopy,
   );
+  const progressiveAutoPrimary = Boolean(
+    mobileProgressiveAutoPrimary || desktopProgressiveAutoPrimary,
+  );
+  // Keep the actual per-post MP4 element, decoded frame and buffer attached
+  // whenever Auto playback is active. This makes desktop behave like the
+  // already-working mobile/tablet resume path without changing their profile.
+  const retainProgressiveBufferOnDeactivate = initialQualityKey === "auto";
 
   if (
     !hasLocalUploadCopy &&
-    !mobileProgressiveAutoPrimary &&
+    !progressiveAutoPrimary &&
     initialQualityKey === "auto" &&
     browserCanUseHlsJs()
   ) {
@@ -3160,17 +3191,21 @@ function attachCloudinaryAdaptiveStream(
   );
   const plannedPlaybackSource = hasLocalUploadCopy
     ? "local-upload-mp4"
-    : mobileProgressiveAutoPrimary
-      ? "optimized-progressive-mp4-mobile-auto-primary"
-      : nativeLowDataMp4Plan
-        ? "optimized-progressive-mp4-native-hls-low-data"
-        : hlsJsSupported
-          ? usePrewarmedHlsAtStartup
-            ? "prewarmed-cloudinary-hls"
-            : "cloudinary-hls"
-          : nativeHlsSupportedAtPlan
-            ? "native-cloudinary-hls"
-            : "optimized-progressive-mp4-fallback";
+    : desktopProgressiveAutoPrimary
+      ? attachNetworkProfile.fastDesktop
+        ? "optimized-progressive-mp4-desktop-1080-auto-primary"
+        : "optimized-progressive-mp4-desktop-720-auto-primary"
+      : mobileProgressiveAutoPrimary
+        ? "optimized-progressive-mp4-mobile-auto-primary"
+        : nativeLowDataMp4Plan
+          ? "optimized-progressive-mp4-native-hls-low-data"
+          : hlsJsSupported
+            ? usePrewarmedHlsAtStartup
+              ? "prewarmed-cloudinary-hls"
+              : "cloudinary-hls"
+            : nativeHlsSupportedAtPlan
+              ? "native-cloudinary-hls"
+              : "optimized-progressive-mp4-fallback";
 
   console.info("[Spotli playback] Playback source plan", {
     playbackId: playbackDiagnosticId,
@@ -3185,8 +3220,12 @@ function attachCloudinaryAdaptiveStream(
     downlinkMbps: attachNetworkProfile.downlinkMbps,
     hasPrewarmedHlsStartup: usePrewarmedHlsAtStartup,
     mobileProgressiveAutoPrimary,
+    desktopProgressiveAutoPrimary,
+    progressiveAutoPrimary,
     warmHlsFirstSegmentState: getPrewarmedHlsFirstSegmentState(originalUrl),
-    progressiveMp4IsFallbackOnly: !hasLocalUploadCopy,
+    progressiveMp4IsPrimary: progressiveAutoPrimary,
+    progressiveMp4IsFallbackOnly:
+      !progressiveAutoPrimary && !hasLocalUploadCopy,
     videoReadyStateAtAttach: video.readyState,
     videoNetworkStateAtAttach: video.networkState,
     videoBufferedAheadAtAttachSeconds:
@@ -3202,7 +3241,7 @@ function attachCloudinaryAdaptiveStream(
   // full-segment prewarm (they checked only partial chunks), then aborted that
   // request here and fetched the same segment again through the active player.
   const preserveActiveHlsWarmup =
-    usePrewarmedHlsAtStartup || attachNetworkProfile.desktopPlayback;
+    !progressiveAutoPrimary && usePrewarmedHlsAtStartup;
   cancelCloudinaryVideoPreloadsExcept(
     preserveActiveHlsWarmup || !directMp4Url ? hlsUrl : "",
   );
@@ -3279,10 +3318,10 @@ function attachCloudinaryAdaptiveStream(
     }
   };
   const networkSelectedProgressiveSource = normalizeMediaUrl(fallbackUrl);
-  const retainedMediaAtAttach = retainedMobileProgressiveMedia.get(video);
+  const retainedMediaAtAttach = retainedProgressiveMedia.get(video);
   const currentAssetKey = sourceParts?.assetPathWithoutExtension || null;
   const retainedSourceMatchesAsset = Boolean(
-    !attachNetworkProfile.desktopPlayback &&
+    retainProgressiveBufferOnDeactivate &&
     retainedMediaAtAttach?.sourceUrl &&
     currentAssetKey &&
     retainedMediaAtAttach.assetKey === currentAssetKey,
@@ -3334,8 +3373,8 @@ function attachCloudinaryAdaptiveStream(
   };
 
   // Each post keeps its own playhead when the user scrolls away and comes back.
-  // HLS is reattached for the active post only, so restore the saved position
-  // once the new media element exposes metadata/seekability.
+  // Restore the saved position once the same progressive source exposes
+  // metadata/seekability; an evicted buffer may still require a range request.
   const restoreResumePosition = () => {
     if (
       cancelled ||
@@ -3376,7 +3415,7 @@ function attachCloudinaryAdaptiveStream(
       }
       resumeSeekPending = false;
       resumePositionApplied = true;
-      retainedMobileProgressiveMedia.delete(video);
+      retainedProgressiveMedia.delete(video);
       onRememberPosition?.(desiredResumeTime);
       console.info("[Spotli playback] Resume position restored before play", {
         playbackId: playbackDiagnosticId,
@@ -3443,8 +3482,12 @@ function attachCloudinaryAdaptiveStream(
   const onMediaProgress = () => logMediaNetworkState("progress");
   const onMediaStalled = () => logMediaNetworkState("stalled", { force: true });
   const onMediaSuspend = () => logMediaNetworkState("suspend", { force: true });
-  const onMediaLoadedMetadata = () =>
+  const onMediaLoadedMetadata = () => {
+    if (attachNetworkProfile.desktopPlayback) {
+      retainedDesktopInflightMp4Requests.delete(video);
+    }
     logMediaNetworkState("loadedmetadata", { force: true });
+  };
 
   video.addEventListener("loadstart", onMediaLoadStart);
   video.addEventListener("progress", onMediaProgress);
@@ -3485,6 +3528,7 @@ function attachCloudinaryAdaptiveStream(
         source,
         plannedPlaybackSource,
         mobileProgressiveAutoPrimary,
+        desktopProgressiveAutoPrimary,
         desktopPlayback: attachNetworkProfile.desktopPlayback,
         startupTargetHeight: attachNetworkProfile.startupHeight,
         selectedQuality: selectedStreamQuality,
@@ -3614,7 +3658,7 @@ function attachCloudinaryAdaptiveStream(
       if (cancelled || streamInactive || directMp4Failed) return;
 
       const mediaErrorCode = Number(video.error?.code) || 0;
-      const isDesktopCloudinaryFallback = Boolean(
+      const isDesktopCloudinaryProgressiveSource = Boolean(
         attachNetworkProfile.desktopPlayback &&
         !hasLocalUploadCopy &&
         !String(expectedProgressiveSource || fallbackUrl || "").startsWith(
@@ -3622,7 +3666,7 @@ function attachCloudinaryAdaptiveStream(
         ),
       );
       const canRetryTransientDesktopFailure =
-        isDesktopCloudinaryFallback &&
+        isDesktopCloudinaryProgressiveSource &&
         (mediaErrorCode === 0 ||
           mediaErrorCode === 2 ||
           mediaErrorCode === 4) &&
@@ -3658,15 +3702,17 @@ function attachCloudinaryAdaptiveStream(
           playIfRequested();
 
           console.warn(
-            "[Spotli playback] Retrying desktop eager MP4 fallback after a transient media error",
+            "[Spotli playback] Retrying desktop eager MP4 startup after a transient media error",
             {
               playbackId: playbackDiagnosticId,
               attempt,
               maxAttempts: 2,
               retryDelayMs,
               mediaErrorCode: mediaErrorCode || null,
-              fallbackBitrate: "800k",
-              fallbackDimension: 1280,
+              fallbackBitrate: attachNetworkProfile.desktopPlayback
+                ? getDesktopProgressiveBitrate(attachNetworkProfile)
+                : attachNetworkProfile.progressiveFallbackBitrate || "800k",
+              fallbackDimension: attachNetworkProfile.fastDesktop ? 1920 : 1280,
             },
           );
         }, retryDelayMs);
@@ -3676,7 +3722,7 @@ function attachCloudinaryAdaptiveStream(
 
       directMp4Failed = true;
       console.warn(
-        "[Spotli playback] Optimized MP4 fallback failed; switching to Cloudinary HLS",
+        "[Spotli playback] Optimized progressive MP4 startup failed; switching to Cloudinary HLS recovery",
         {
           playbackId: playbackDiagnosticId,
           mediaErrorCode: mediaErrorCode || null,
@@ -3719,15 +3765,18 @@ function attachCloudinaryAdaptiveStream(
     video.setAttribute("preload", "auto");
     video.autoplay = true;
     video.playsInline = true;
+    if (attachNetworkProfile.desktopPlayback) {
+      retainedDesktopInflightMp4Requests.delete(video);
+    }
 
     let targetUrl = String(expectedProgressiveSource || fallbackUrl || "");
     if (attachNetworkProfile.desktopPlayback && !hasLocalUploadCopy) {
       console.info(
-        "[Spotli playback] Desktop MP4 fallback uses upload-time eager derivative",
+        "[Spotli playback] Desktop Auto startup uses upload-time eager MP4 derivative",
         {
           playbackId: playbackDiagnosticId,
-          bitrate: "800k",
-          maxDimension: 1280,
+          bitrate: getDesktopProgressiveBitrate(attachNetworkProfile),
+          maxDimension: attachNetworkProfile.fastDesktop ? 1920 : 1280,
           quality: "auto:eco",
           sourceAsset: sourceParts?.assetPath || null,
         },
@@ -3748,9 +3797,9 @@ function attachCloudinaryAdaptiveStream(
       video.src = expectedProgressiveSource || fallbackUrl;
       video.load();
     } else if (video.readyState > 0 || video.networkState === 2) {
-      const retainedRecord = retainedMobileProgressiveMedia.get(video);
+      const retainedRecord = retainedProgressiveMedia.get(video);
       const retainedBufferMatches = Boolean(
-        retainMobileProgressiveBufferOnDeactivate &&
+        retainProgressiveBufferOnDeactivate &&
         (retainedRecord?.sourceUrl === targetUrl || retainedSourceMatches) &&
         video.readyState >= 2 &&
         !video.error &&
@@ -3759,8 +3808,12 @@ function attachCloudinaryAdaptiveStream(
       reusedRetainedBufferAtActivation = retainedBufferMatches;
       console.info(
         retainedBufferMatches
-          ? "[Spotli playback] Reusing retained mobile MP4 buffer"
-          : "[Spotli playback] Reusing attached progressive MP4 source",
+          ? attachNetworkProfile.desktopPlayback
+            ? "[Spotli playback] Reusing retained desktop MP4 buffer"
+            : "[Spotli playback] Reusing retained mobile MP4 buffer"
+          : attachNetworkProfile.desktopPlayback
+            ? "[Spotli playback] Reusing attached desktop progressive MP4 source"
+            : "[Spotli playback] Reusing attached progressive MP4 source",
         {
           readyState: video.readyState,
           networkState: video.networkState,
@@ -3844,9 +3897,9 @@ function attachCloudinaryAdaptiveStream(
       video.canPlayType("application/vnd.apple.mpegurl"),
     );
 
-    // A just-published local Blob is still the fastest path and avoids a CDN
-    // round trip. Mobile Auto uses its retained progressive MP4 source; desktop
-    // Auto and explicit HLS quality choices use adaptive HLS delivery.
+    // A just-published local Blob is still the fastest path. Auto playback on
+    // mobile, tablet and desktop starts from the retained progressive MP4 feed
+    // element; HLS is loaded only if the MP4 recovery handler needs it.
     if (hasLocalUploadCopy && !forceHls) {
       console.info(
         "[Spotli playback] Starting just-uploaded local MP4; skipping CDN startup",
@@ -3856,24 +3909,36 @@ function attachCloudinaryAdaptiveStream(
       return;
     }
 
-    if (
-      !forceHls &&
-      initialQualityKey === "auto" &&
-      !startupNetworkProfile.desktopPlayback &&
-      !directMp4Failed
-    ) {
+    if (!forceHls && progressiveAutoPrimary && !directMp4Failed) {
+      const desktopFast = Boolean(
+        startupNetworkProfile.desktopPlayback &&
+        startupNetworkProfile.fastDesktop,
+      );
       console.info(
-        "[Spotli playback] Mobile Auto using retained progressive MP4 for instant return-to-video resume",
+        startupNetworkProfile.desktopPlayback
+          ? "[Spotli playback] Desktop Auto starting eagerly generated progressive MP4 on the persistent feed element"
+          : "[Spotli playback] Mobile Auto using retained progressive MP4 for instant return-to-video resume",
         {
           playbackId: playbackDiagnosticId,
-          targetHeight: startupNetworkProfile.progressiveFallbackHeight,
-          targetBitrate:
-            startupNetworkProfile.progressiveFallbackBitrate || "800k",
+          targetHeight: startupNetworkProfile.desktopPlayback
+            ? desktopFast
+              ? 1080
+              : 720
+            : startupNetworkProfile.progressiveFallbackHeight,
+          targetBitrate: startupNetworkProfile.desktopPlayback
+            ? getDesktopProgressiveBitrate(startupNetworkProfile)
+            : startupNetworkProfile.progressiveFallbackBitrate || "800k",
+          maxDimension: startupNetworkProfile.desktopPlayback
+            ? desktopFast
+              ? 1920
+              : 1280
+            : startupNetworkProfile.progressiveFallbackMaxDimension || null,
           downlinkMbps: startupNetworkProfile.downlinkMbps,
           effectiveType: startupNetworkProfile.effectiveType,
           dataSaver: startupNetworkProfile.dataSaver,
           weakNetwork: startupNetworkProfile.weakNetwork,
           sourceRetention: true,
+          hlsMode: "recovery-fallback-only",
         },
       );
       useProgressiveFallback();
@@ -4951,12 +5016,8 @@ function attachCloudinaryAdaptiveStream(
     video.removeEventListener("loadedmetadata", restoreResumePosition);
     video.removeEventListener("durationchange", restoreResumePosition);
     video.removeEventListener("seeked", onResumeSeeked);
-    const canRetainMobileProgressiveBuffer = (() => {
-      if (
-        !retainMobileProgressiveBufferOnDeactivate ||
-        hls ||
-        !video.isConnected
-      ) {
+    const canRetainProgressiveBuffer = (() => {
+      if (!retainProgressiveBufferOnDeactivate || hls || !video.isConnected) {
         return false;
       }
 
@@ -4970,6 +5031,12 @@ function attachCloudinaryAdaptiveStream(
         // Keep the original strings if URL normalization is unavailable.
       }
 
+      const desktopRequestStillLoading = Boolean(
+        attachNetworkProfile.desktopPlayback &&
+        video.readyState === 0 &&
+        video.networkState === 2 &&
+        !video.error,
+      );
       return Boolean(
         currentSrc &&
         expectedSrc &&
@@ -4977,7 +5044,7 @@ function attachCloudinaryAdaptiveStream(
         (/\.mp4(?:[?#]|$)/i.test(currentSrc) ||
           currentSrc.startsWith("blob:")) &&
         !video.error &&
-        video.readyState > 0,
+        (video.readyState > 0 || desktopRequestStillLoading),
       );
     })();
 
@@ -4989,7 +5056,7 @@ function attachCloudinaryAdaptiveStream(
     onQualityOptionsChange?.([]);
     video.pause();
     if (video.isConnected) {
-      if (canRetainMobileProgressiveBuffer) {
+      if (canRetainProgressiveBuffer) {
         // Do not clear src or call load(): both operations discard the decoded
         // frame and buffered media. The same per-post element is reused when
         // the user scrolls back. Metadata preload avoids aggressively fetching
@@ -5001,30 +5068,47 @@ function attachCloudinaryAdaptiveStream(
           Number.isFinite(liveTimeAtDeactivate) && liveTimeAtDeactivate >= 0
             ? liveTimeAtDeactivate
             : savedResumeTime;
-        retainedMobileProgressiveMedia.set(video, {
+        const retainedRecord = {
           sourceUrl: expectedProgressiveSource,
           assetKey: sourceParts?.assetPathWithoutExtension || null,
           currentTime: retainedCurrentTime,
           retainedAt: Date.now(),
           readyState: video.readyState,
+          networkState: video.networkState,
           bufferedAheadSeconds: getSpotliBufferedAheadSeconds(video),
           postId: video.dataset?.postId || null,
-        });
+        };
+        retainedProgressiveMedia.set(video, retainedRecord);
+        const desktopRequestStillLoading = Boolean(
+          attachNetworkProfile.desktopPlayback &&
+          video.readyState === 0 &&
+          video.networkState === 2 &&
+          !video.error,
+        );
+        if (desktopRequestStillLoading) {
+          trackRetainedDesktopInflightMp4Request(video, retainedRecord);
+        }
         onRememberPosition?.(retainedCurrentTime);
         console.info(
-          "[Spotli playback] Retaining paused mobile MP4 source and buffer for instant resume",
+          desktopRequestStillLoading
+            ? "[Spotli playback] Retaining in-flight desktop MP4 request before metadata"
+            : attachNetworkProfile.desktopPlayback
+              ? "[Spotli playback] Retaining paused desktop MP4 source and buffer for instant resume"
+              : "[Spotli playback] Retaining paused mobile MP4 source and buffer for instant resume",
           {
             playbackId: playbackDiagnosticId,
             asset: sourceParts?.assetPath || null,
             currentTimeSeconds: Math.round(retainedCurrentTime * 100) / 100,
             readyState: video.readyState,
+            networkState: video.networkState,
+            requestPreserved: desktopRequestStillLoading,
             bufferedAheadSeconds:
               Math.round(getSpotliBufferedAheadSeconds(video) * 100) / 100,
             sourceUrlMatches: true,
           },
         );
       } else {
-        retainedMobileProgressiveMedia.delete(video);
+        retainedProgressiveMedia.delete(video);
         video.removeAttribute("src");
         video.load();
       }
@@ -5055,6 +5139,8 @@ function createTabletViewerImplementation() {
   const Captions = tablet_Captions;
   const Bookmark = tablet_Bookmark;
   const Trash2 = tablet_Trash2;
+  const ChevronUp = tablet_ChevronUp;
+  const ChevronDown = tablet_ChevronDown;
 
   const API_ORIGIN = (
     import.meta.env.VITE_API_URL || "http://localhost:5000/api"
@@ -5559,8 +5645,9 @@ function createTabletViewerImplementation() {
     const activePost = posts[activeIndex];
     const activePostId = getPostId(activePost);
 
-    // Cloudinary sources remain attached in the React tree while preload=none
-    // prevents inactive cards from downloading until the HLS/MP4 prewarmer selects them.
+    // Cloudinary sources are attached only when the actual per-post MP4
+    // preloader or active player claims that element. This avoids detached
+    // HLS requests and lets the same element become active after a swipe.
 
     useEffect(() => {
       // Every newly selected post should show its poster until its own video
@@ -5572,8 +5659,9 @@ function createTabletViewerImplementation() {
     const shouldPlayActiveVideoRef = useRef(!paused);
     shouldPlayActiveVideoRef.current = !paused;
 
-    // Prefer adaptive HLS delivery for the active Cloudinary video. The helper
-    // falls back to a small progressive MP4 if HLS is unavailable or fails.
+    // Auto starts the actual per-post progressive MP4 element. The helper
+    // retains that source/buffer for instant mobile/tablet resume and uses HLS
+    // only if Cloudinary MP4 delivery fails.
     useEffect(() => {
       if (!activePostId || activePostIsPhoto || !activeOriginalVideoUrl) {
         return undefined;
@@ -5749,7 +5837,7 @@ function createTabletViewerImplementation() {
 
       const pauseSpeculativePreloads = (reason) => {
         if (mobileMp4Queue) {
-          setMobileFeedPreloadPriority(false, activeVideo, reason);
+          setFeedVideoPreloadPriority(false, activeVideo, reason);
         }
       };
 
@@ -5767,7 +5855,7 @@ function createTabletViewerImplementation() {
           bufferedAhead >= policy.minimumBufferedAheadSeconds,
         );
         if (mobileMp4Queue) {
-          setMobileFeedPreloadPriority(
+          setFeedVideoPreloadPriority(
             canResume,
             activeVideo,
             canResume ? "active-buffer-recovered" : "active-buffer-still-low",
@@ -5794,10 +5882,10 @@ function createTabletViewerImplementation() {
             !activeVideoWaiting &&
             !activeVideo.paused &&
             !activeVideo.ended &&
-            (mobileFeedPreloadsAllowed
+            (feedVideoPreloadsAllowed
               ? bufferedAhead >= yieldThreshold
               : bufferedAhead >= policy.minimumBufferedAheadSeconds);
-          setMobileFeedPreloadPriority(
+          setFeedVideoPreloadPriority(
             canContinueSpeculativeWork,
             activeVideo,
             activeVideoWaiting
@@ -5807,7 +5895,7 @@ function createTabletViewerImplementation() {
                 : bufferedAhead < yieldThreshold
                   ? "active-buffer-below-2s"
                   : bufferedAhead < policy.minimumBufferedAheadSeconds &&
-                      !mobileFeedPreloadsAllowed
+                      !feedVideoPreloadsAllowed
                     ? "active-buffer-below-preload-start-threshold"
                     : "active-buffer-recovered",
           );
@@ -5932,7 +6020,7 @@ function createTabletViewerImplementation() {
       activeVideo.addEventListener("timeupdate", maybePreloadUpcomingChunks);
       activeVideo.addEventListener("progress", maybePreloadUpcomingChunks);
       if (mobileMp4Queue) {
-        setMobileFeedPreloadPriority(
+        setFeedVideoPreloadPriority(
           false,
           activeVideo,
           "waiting-for-active-buffer-headroom",
@@ -5948,7 +6036,7 @@ function createTabletViewerImplementation() {
           const currentActiveVideo = currentActivePost
             ? videoRefs.current[getPostId(currentActivePost)]
             : null;
-          setMobileFeedPreloadPriority(
+          setFeedVideoPreloadPriority(
             false,
             currentActiveVideo,
             "active-player-changed",
@@ -6516,7 +6604,7 @@ function createTabletViewerImplementation() {
                   ? feedVideoPreloadStates.get(intentVideoElement)
                   : null;
                 const canContinueExistingPreload =
-                  mobileFeedPreloadsAllowed &&
+                  feedVideoPreloadsAllowed &&
                   existingIntentPreload?.sourceUrl === intentOptimizedSource &&
                   activeBufferAhead >=
                     (intentPolicy.yieldBelowBufferedAheadSeconds || 2);
@@ -6528,7 +6616,7 @@ function createTabletViewerImplementation() {
                     intentPolicy.minimumBufferedAheadSeconds ||
                     canContinueExistingPreload),
                 );
-                setMobileFeedPreloadPriority(
+                setFeedVideoPreloadPriority(
                   mobileIntentAllowed,
                   currentActiveVideo,
                   mobileIntentAllowed
@@ -6625,6 +6713,23 @@ function createTabletViewerImplementation() {
         }
       });
     }, [posts, revealDetails]);
+
+    function navigateFeedBy(direction) {
+      const feed = feedRef.current;
+      const targetIndex = activeIndexRef.current + direction;
+      if (!feed || targetIndex < 0 || targetIndex >= posts.length) return;
+
+      const targetPost = posts[targetIndex];
+      const targetElement = postRefs.current[getPostId(targetPost)];
+      if (!targetElement) return;
+
+      const feedTop = feed.getBoundingClientRect().top;
+      const targetTop = targetElement.getBoundingClientRect().top;
+      feed.scrollTo({
+        top: Math.max(0, feed.scrollTop + targetTop - feedTop),
+        behavior: "smooth",
+      });
+    }
 
     function togglePlayback(postId) {
       const video = videoRefs.current[postId];
@@ -7005,7 +7110,7 @@ function createTabletViewerImplementation() {
     if (!posts.length || !activePost) return null;
 
     return (
-      <div className="fixed inset-0 z-100 block overflow-hidden bg-[#080808] text-white lg:hidden">
+      <div className="fixed inset-0 z-100 block overflow-hidden bg-[#080808] text-white lg:inset-y-0 lg:left-16 lg:right-0 lg:bg-[#101214]">
         {dataSaverEnabled && (
           <div
             role="status"
@@ -7027,6 +7132,13 @@ function createTabletViewerImplementation() {
             <span>{networkQualityNotice}</span>
           </div>
         )}
+
+        <div
+          aria-label="Spotli"
+          className="fixed left-0 top-0 z-[115] hidden h-16 w-16 items-center justify-center bg-[#0f0f0f] text-[25px] font-black tracking-tight text-white lg:flex"
+        >
+          S<span className="text-[#FF2D4A]">.</span>
+        </div>
 
         <main
           ref={feedRef}
@@ -7099,7 +7211,7 @@ function createTabletViewerImplementation() {
               >
                 <div
                   aria-hidden="true"
-                  className="pointer-events-none absolute inset-0 scale-110 bg-cover bg-center blur-2xl"
+                  className="pointer-events-none absolute inset-0 scale-110 bg-cover bg-center blur-2xl lg:hidden"
                   style={{
                     backgroundImage: thumbnail
                       ? `url("${thumbnail}")`
@@ -7107,23 +7219,18 @@ function createTabletViewerImplementation() {
                   }}
                 />
 
-                <div className="pointer-events-none absolute inset-0 bg-black/55" />
+                <div className="pointer-events-none absolute inset-0 bg-black/55 lg:bg-[#101214]" />
 
                 <div
                   className={`absolute overflow-hidden bg-black shadow-2xl ${
                     isLandscape && !photoPost
-                      ? "left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 rounded-3xl"
+                      ? "left-1/2 top-1/2 h-[min(100vh,56.25vw)] w-[min(100vw,177.7778vh)] -translate-x-1/2 -translate-y-1/2 rounded-3xl"
                       : "inset-0 h-full w-full"
-                  }`}
-                  style={
+                  } lg:left-[calc(50%_-_42px)] lg:top-1/2 lg:right-auto lg:bottom-auto ${
                     isLandscape && !photoPost
-                      ? {
-                          width: "min(100vw, 177.7778vh)",
-
-                          height: "min(100vh, 56.25vw)",
-                        }
-                      : undefined
-                  }
+                      ? "lg:aspect-video lg:h-auto lg:max-h-[80dvh] lg:w-[min(68vw,142.2222dvh,1100px)]"
+                      : "lg:h-[94dvh] lg:w-[min(430px,52.875dvh)]"
+                  } lg:-translate-x-1/2 lg:-translate-y-1/2 lg:rounded-xl lg:ring-1 lg:ring-white/10`}
                 >
                   {photoPost ? (
                     <div className="relative h-full w-full">
@@ -7344,7 +7451,7 @@ function createTabletViewerImplementation() {
 
                 {!photoPost && isActive && playbackVisible && (
                   <div
-                    className="absolute inset-x-0 bottom-0 z-60 w-full bg-transparent px-3 pb-[max(12px,env(safe-area-inset-bottom))] pt-2 text-white transition-opacity duration-300"
+                    className="absolute inset-x-0 bottom-0 z-60 w-full bg-transparent px-3 pb-[max(12px,env(safe-area-inset-bottom))] pt-2 text-white transition-opacity duration-300 lg:bottom-3 lg:left-auto lg:right-3 lg:flex lg:w-auto lg:justify-end lg:px-0 lg:pb-0"
                     onClick={(event) => event.stopPropagation()}
                     onTouchStart={(event) => event.stopPropagation()}
                   >
@@ -7353,7 +7460,7 @@ function createTabletViewerImplementation() {
                         type="button"
                         onClick={() => togglePlayback(postId)}
                         aria-label={paused ? "Play video" : "Pause video"}
-                        className="grid h-9 w-9 shrink-0 place-items-center rounded-md transition-colors hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
+                        className="grid h-9 w-9 shrink-0 place-items-center rounded-md transition-colors hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white lg:hidden"
                       >
                         {paused ? (
                           <Play size={17} fill="currentColor" />
@@ -7361,14 +7468,14 @@ function createTabletViewerImplementation() {
                           <Pause size={17} />
                         )}
                       </button>
-                      <span className="shrink-0 tabular-nums text-[10px] sm:text-xs">
+                      <span className="shrink-0 tabular-nums text-[10px] sm:text-xs lg:hidden">
                         {formatTime(currentTime)} / {formatTime(duration)}
                       </span>
                       <button
                         type="button"
                         onClick={() => toggleMute(postId)}
                         aria-label={muted ? "Unmute video" : "Mute video"}
-                        className="grid h-9 w-9 shrink-0 place-items-center rounded-md transition-colors hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
+                        className="grid h-9 w-9 shrink-0 place-items-center rounded-md transition-colors hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white lg:h-10 lg:w-10 lg:rounded-full lg:bg-black/50"
                       >
                         {muted ? <VolumeX size={17} /> : <Volume2 size={17} />}
                       </button>
@@ -7380,11 +7487,11 @@ function createTabletViewerImplementation() {
                             ? "Turn captions off"
                             : "Turn captions on"
                         }
-                        className={`grid h-9 w-9 shrink-0 place-items-center rounded-md transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white ${captionsEnabled ? "bg-[#FF2D4A]/15 text-[#FF2D4A]" : "text-white hover:bg-white/10"}`}
+                        className={`grid h-9 w-9 shrink-0 place-items-center rounded-md transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white lg:hidden ${captionsEnabled ? "bg-[#FF2D4A]/15 text-[#FF2D4A]" : "text-white hover:bg-white/10"}`}
                       >
                         <Captions size={17} />
                       </button>
-                      <div className="relative shrink-0">
+                      <div className="relative shrink-0 lg:hidden">
                         <button
                           type="button"
                           onClick={() => setSettingsOpen((open) => !open)}
@@ -7421,7 +7528,7 @@ function createTabletViewerImplementation() {
                           else video.requestFullscreen?.();
                         }}
                         aria-label="Fullscreen video"
-                        className="grid h-9 w-9 shrink-0 place-items-center rounded-md transition-colors hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
+                        className="grid h-9 w-9 shrink-0 place-items-center rounded-md transition-colors hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white lg:hidden"
                       >
                         <Maximize size={17} />
                       </button>
@@ -7436,7 +7543,7 @@ function createTabletViewerImplementation() {
                         seekVideo(postId, event.target.value)
                       }
                       aria-label="Seek video"
-                      className="mt-1 block h-7 w-full cursor-pointer touch-pan-x accent-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
+                      className="mt-1 block h-7 w-full cursor-pointer touch-pan-x accent-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white lg:hidden"
                     />
                   </div>
                 )}
@@ -7445,7 +7552,7 @@ function createTabletViewerImplementation() {
 
                 <div className="pointer-events-none absolute inset-x-0 bottom-0 z-10 h-72 bg-linear-to-t from-black/90 via-black/35 to-transparent" />
 
-                <header className="absolute left-4 right-4 top-4 z-40 flex items-center gap-3">
+                <header className="absolute left-4 right-4 top-4 z-40 flex items-center gap-3 lg:hidden">
                   <button
                     type="button"
                     onClick={onBack}
@@ -7460,14 +7567,20 @@ function createTabletViewerImplementation() {
                   </span>
                 </header>
 
-                <aside className="absolute bottom-32 right-2 z-40 flex flex-col items-center gap-3">
+                <aside
+                  className={`absolute bottom-32 right-2 z-40 flex flex-col items-center gap-3 ${
+                    isLandscape && !photoPost
+                      ? "lg:bottom-auto lg:left-[calc(50%_-_42px_+_min(34vw,71.1111dvh,550px)_+_16px)] lg:right-auto lg:top-1/2 lg:-translate-y-1/2 lg:gap-2"
+                      : "lg:bottom-6 lg:left-[calc(50%_+_193px)] lg:right-auto lg:top-auto lg:translate-y-0 lg:gap-2"
+                  }`}
+                >
                   <button
                     type="button"
                     onClick={() => toggleLike(postId)}
                     aria-label={
                       likedPosts[postId] ? "Unlike post" : "Like post"
                     }
-                    className="flex min-h-11 min-w-11 flex-col items-center gap-0.5"
+                    className="flex min-h-11 min-w-11 flex-col items-center gap-0.5 lg:order-1"
                   >
                     <span
                       className={`grid h-10 w-10 place-items-center rounded-full bg-black/35 backdrop-blur-sm ${
@@ -7497,7 +7610,7 @@ function createTabletViewerImplementation() {
                     type="button"
                     onClick={() => openComments(post)}
                     aria-label="Comments"
-                    className="flex min-h-11 min-w-11 flex-col items-center gap-0.5"
+                    className="flex min-h-11 min-w-11 flex-col items-center gap-0.5 lg:order-2"
                   >
                     <span className="grid h-10 w-10 place-items-center rounded-full bg-black/35 backdrop-blur-sm">
                       <MessageCircle size={27} />
@@ -7518,18 +7631,18 @@ function createTabletViewerImplementation() {
                     type="button"
                     onClick={() => sharePost(post)}
                     aria-label="Share post"
-                    className="flex min-h-11 min-w-11 flex-col items-center gap-0.5"
+                    className="flex min-h-11 min-w-11 flex-col items-center gap-0.5 lg:order-3"
                   >
                     <span className="grid h-9 w-9 place-items-center rounded-full bg-black/35 backdrop-blur-sm">
                       <Share2 size={20} />
                     </span>
 
-                    <span className="text-[11px] font-semibold">
+                    <span className="text-[11px] font-semibold lg:hidden">
                       {formatCount(post.shares || 0)}
                     </span>
                   </button>
 
-                  <div className="relative">
+                  <div className="relative lg:order-5">
                     <button
                       type="button"
                       onClick={() => openPostMenu(post)}
@@ -7574,7 +7687,7 @@ function createTabletViewerImplementation() {
                         ? "Remove from saved posts"
                         : "Save post"
                     }
-                    className="flex min-h-11 min-w-11 flex-col items-center gap-0.5"
+                    className="flex min-h-11 min-w-11 flex-col items-center gap-0.5 lg:order-4"
                   >
                     <span className="grid h-9 w-9 place-items-center rounded-full bg-black/35 backdrop-blur-sm">
                       <Bookmark
@@ -7586,12 +7699,30 @@ function createTabletViewerImplementation() {
                         }
                       />
                     </span>
-                    <span className="text-[10px] font-semibold">Save</span>
+                    <span className="text-[10px] font-semibold lg:hidden">
+                      Save
+                    </span>
                   </button>
+
+                  {profilePicture ? (
+                    <img
+                      src={profilePicture}
+                      alt={`${creatorName}'s profile`}
+                      className="order-6 mt-1 hidden h-8 w-8 rounded-lg border border-white/80 object-cover lg:block"
+                      onError={(event) => {
+                        event.currentTarget.onerror = null;
+                        event.currentTarget.style.display = "none";
+                      }}
+                    />
+                  ) : (
+                    <span className="order-6 mt-1 hidden h-8 w-8 place-items-center rounded-lg border border-white/80 bg-white/15 text-xs font-bold lg:grid">
+                      {(creatorName || "S").slice(0, 1).toUpperCase()}
+                    </span>
+                  )}
                 </aside>
 
                 <div
-                  className={`absolute bottom-24 left-5 right-28 z-30 max-w-4xl transition-opacity duration-300 ${
+                  className={`absolute bottom-24 left-5 right-28 z-30 max-w-4xl transition-opacity duration-300 lg:bottom-8 lg:left-[clamp(110px,9.5vw,190px)] lg:right-auto lg:max-w-[320px] ${
                     isActive && detailsVisible
                       ? "opacity-100"
                       : "pointer-events-none opacity-0"
@@ -7665,6 +7796,28 @@ function createTabletViewerImplementation() {
                     </p>
                   )}
                 </div>
+                {isActive && posts.length > 1 && (
+                  <div className="absolute right-12 top-1/2 z-50 hidden -translate-y-1/2 flex-col gap-4 lg:flex">
+                    <button
+                      type="button"
+                      onClick={() => navigateFeedBy(-1)}
+                      disabled={activeIndex <= 0}
+                      aria-label="Previous video"
+                      className="grid h-14 w-14 place-items-center rounded-full bg-[#25272a] text-white shadow-lg transition hover:bg-[#34373b] disabled:cursor-not-allowed disabled:opacity-35"
+                    >
+                      <ChevronUp size={30} strokeWidth={2} />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => navigateFeedBy(1)}
+                      disabled={activeIndex >= posts.length - 1}
+                      aria-label="Next video"
+                      className="grid h-14 w-14 place-items-center rounded-full bg-[#25272a] text-white shadow-lg transition hover:bg-[#34373b] disabled:cursor-not-allowed disabled:opacity-35"
+                    >
+                      <ChevronDown size={30} strokeWidth={2} />
+                    </button>
+                  </div>
+                )}
               </section>
             );
           })}
@@ -7703,2499 +7856,10 @@ function createTabletViewerImplementation() {
 }
 const TabletViewerImplementation = createTabletViewerImplementation();
 
-function createDesktopViewerImplementation() {
-  // Keep the original desktop viewer's imports scoped to its implementation.
-  const useEffect = desktop_useEffect;
-  const useMemo = desktop_useMemo;
-  const useRef = desktop_useRef;
-  const useState = desktop_useState;
-  const ArrowLeft = desktop_ArrowLeft;
-  const ArrowUp = desktop_ArrowUp;
-  const ArrowDown = desktop_ArrowDown;
-  const Heart = desktop_Heart;
-  const MessageCircle = desktop_MessageCircle;
-  const Share2 = desktop_Share2;
-  const MoreVertical = desktop_MoreVertical;
-  const Play = desktop_Play;
-  const Pause = desktop_Pause;
-  const Volume2 = desktop_Volume2;
-  const VolumeX = desktop_VolumeX;
-  const Maximize = desktop_Maximize;
-  const Captions = desktop_Captions;
-  const CheckCircle2 = desktop_CheckCircle2;
-  const Bookmark = desktop_Bookmark;
-  const Trash2 = desktop_Trash2;
-  const TopBar = desktop_TopBar;
-  const CommentSection = desktop_CommentSection;
-  const api = desktop_api;
-
-  const API_ORIGIN = (
-    import.meta.env.VITE_API_URL || "http://localhost:5000/api"
-  ).replace(/\/api\/?$/, "");
-
-  function getCreatorName(post) {
-    const creator = post?.creator;
-
-    if (typeof creator === "string" && creator.trim()) return creator;
-
-    return (
-      creator?.name ||
-      [creator?.firstName, creator?.lastName].filter(Boolean).join(" ") ||
-      post?.creatorName ||
-      post?.user?.name ||
-      post?.user?.username ||
-      "Spotli creator"
-    );
-  }
-
-  function getCreatorAvatar(post) {
-    const creator = post?.creator;
-
-    const rawAvatar =
-      creator?.avatar ||
-      creator?.profileImage ||
-      creator?.profilePicture ||
-      creator?.photoURL ||
-      creator?.image ||
-      post?.creatorAvatar ||
-      post?.avatar ||
-      post?.profileImage ||
-      post?.profilePicture ||
-      post?.user?.avatar ||
-      post?.user?.profileImage ||
-      post?.user?.profilePicture ||
-      post?.user?.photoURL ||
-      post?.user?.image ||
-      "";
-
-    if (typeof rawAvatar !== "string" || !rawAvatar.trim()) return "";
-
-    if (/^(https?:|data:|blob:)/i.test(rawAvatar)) return rawAvatar;
-
-    if (rawAvatar.startsWith("/")) return `${API_ORIGIN}${rawAvatar}`;
-
-    return rawAvatar;
-  }
-
-  function getPostImages(post) {
-    const toUrl = (value) => {
-      if (typeof value === "string") return value;
-      if (value && typeof value === "object") {
-        return (
-          value.url ||
-          value.src ||
-          value.imageUrl ||
-          value.secure_url ||
-          value.path ||
-          ""
-        );
-      }
-      return "";
-    };
-
-    // Prefer explicit video thumbnails/posters. Some Spotli posts store the
-    // uploaded thumbnail as an object (customThumbnail.url), not a string.
-    const thumbnailCandidates = [
-      post?.customThumbnail,
-      post?.thumbnailUrl,
-      post?.thumbnail,
-      post?.posterUrl,
-      post?.poster,
-      post?.previewImage,
-      post?.coverImage,
-      post?.imageUrl,
-      post?.image,
-      post?.photoUrl,
-    ]
-      .map(toUrl)
-      .filter(Boolean);
-
-    const collections = [post?.mediaUrls, post?.images, post?.photos];
-    const collectionImages = collections
-      .filter(Array.isArray)
-      .flat()
-      .map(toUrl)
-      .filter(Boolean);
-
-    const photoMedia = isPhotoMediaPost(post)
-      ? [toUrl(post?.mediaUrl), toUrl(post?.media)].filter(Boolean)
-      : [];
-
-    return [
-      ...new Set([...thumbnailCandidates, ...photoMedia, ...collectionImages]),
-    ];
-  }
-
-  function isPhotoMediaPost(post) {
-    const mediaType = String(post?.mediaType || "")
-      .trim()
-      .toLowerCase();
-    if (["photo", "image", "photos", "gallery"].includes(mediaType))
-      return true;
-    if (["video", "reel"].includes(mediaType)) return false;
-
-    const types = [post?.type, post?.postType, post?.kind]
-      .map((value) =>
-        String(value || "")
-          .trim()
-          .toLowerCase(),
-      )
-      .filter(Boolean);
-    if (
-      types.some((type) =>
-        ["photo", "image", "photos", "gallery"].includes(type),
-      )
-    )
-      return true;
-    if (types.some((type) => ["video", "reel"].includes(type))) return false;
-    if (post?.isImagePost === true || post?.isPhotoPost === true) return true;
-    if (post?.isVideoPost === true) return false;
-
-    const sourceUrl = (value) => {
-      if (typeof value === "string") return value;
-      if (!value || typeof value !== "object") return "";
-      return (
-        value.url ||
-        value.src ||
-        value.imageUrl ||
-        value.videoUrl ||
-        value.secure_url ||
-        value.path ||
-        ""
-      );
-    };
-    const looksImage = (value) =>
-      /(?:\.(?:avif|bmp|gif|jpe?g|png|webp)(?:[?#]|$)|\/image\/upload\/|^data:image\/)/i.test(
-        sourceUrl(value),
-      );
-    const looksVideo = (value) =>
-      /(?:\.(?:mp4|mov|m4v|webm|avi|mkv|m3u8|mpd)(?:[?#]|$)|\/video\/upload\/|^data:video\/)/i.test(
-        sourceUrl(value),
-      );
-
-    if (
-      [post?.videoUrl, post?.video, post?.videoFile, post?.videos?.[0]].some(
-        looksVideo,
-      )
-    )
-      return false;
-    if ([post?.mediaUrl, post?.media, post?.mediaUrls?.[0]].some(looksVideo))
-      return false;
-    if ([post?.mediaUrl, post?.media, post?.mediaUrls?.[0]].some(looksImage))
-      return true;
-    if (Array.isArray(post?.photos) && post.photos.length) return true;
-    if (
-      Array.isArray(post?.images) &&
-      post.images.length &&
-      !post?.videoUrl &&
-      !post?.video
-    )
-      return true;
-    return false;
-  }
-
-  function resolveMediaUrl(value) {
-    if (typeof value !== "string" || !value.trim()) return "";
-
-    const url = value.trim();
-
-    if (/^(https?:|data:|blob:)/i.test(url)) return url;
-
-    if (url.startsWith("//")) {
-      return `${window.location.protocol}${url}`;
-    }
-
-    if (url.startsWith("/")) {
-      return `${API_ORIGIN}${url}`;
-    }
-
-    // API responses may return relative paths such as "uploads/thumb.jpg".
-    // Resolve those against the backend instead of the frontend page URL.
-    if (!/^[a-z][a-z0-9+.-]*:/i.test(url)) {
-      return `${API_ORIGIN}/${url.replace(/^\.\//, "")}`;
-    }
-
-    return url;
-  }
-
-  function getOriginalVideoUrl(post) {
-    // One canonical resolver is shared with Home and MainLayout so every
-    // prewarm and the active player request the exact same Cloudinary asset.
-    const rawUrl = getSpotliPrefetchOriginalVideoUrl(post);
-    return rawUrl ? resolveMediaUrl(rawUrl) : "";
-  }
-
-  function getVideoUrl(post) {
-    return getOptimizedPlaybackUrl(getOriginalVideoUrl(post));
-  }
-
-  function getPostImage(post, width = 1200) {
-    const image = getPostImages(post)[0];
-
-    if (!image) return "";
-
-    // Preserve support for legacy Unsplash photo IDs.
-    if (image.startsWith("photo-")) {
-      return `https://images.unsplash.com/${image}?auto=format&fit=crop&w=${width}&q=85`;
-    }
-
-    return resolveMediaUrl(image);
-  }
-
-  function formatTime(seconds) {
-    if (!Number.isFinite(seconds)) return "0:00";
-
-    const minutes = Math.floor(seconds / 60);
-
-    const remainingSeconds = Math.floor(seconds % 60);
-
-    return `${minutes}:${String(remainingSeconds).padStart(2, "0")}`;
-  }
-
-  function formatCount(value) {
-    const number = Number(value) || 0;
-
-    if (number >= 1_000_000) {
-      return `${(number / 1_000_000).toFixed(1).replace(/.0$/, "")}M`;
-    }
-
-    if (number >= 1_000) {
-      return `${(number / 1_000).toFixed(1).replace(/.0$/, "")}K`;
-    }
-
-    return String(number);
-  }
-
-  function getPostId(post) {
-    return post?._id ?? post?.id;
-  }
-
-  function getPostLikeCount(post) {
-    return Math.max(0, Number(post?.likesCount ?? post?.likes) || 0);
-  }
-
-  function DesktopVideoViewer({
-    posts = [],
-    initialPost,
-    preservePostOrder = false,
-    initialPostIndex = null,
-    onBack,
-    onNavigateFromViewer,
-    currentUserId = "",
-    onDeletePost,
-  }) {
-    function openPostMenu(post) {
-      const postId = String(getPostId(post) || "");
-      if (!postId) return;
-      setOpenPostOptionsId((current) => (current === postId ? null : postId));
-    }
-
-    async function deletePostFromViewer(post) {
-      if (
-        !isPostOwnedBy(post, currentUserId) ||
-        typeof onDeletePost !== "function"
-      )
-        return;
-      const postId = String(getPostId(post) || "");
-      if (!postId) return;
-      setOpenPostOptionsId(null);
-      const confirmed = window.confirm(
-        "Delete this post permanently? Its likes, comments, and saved copies will also be removed.",
-      );
-      if (!confirmed) return;
-      try {
-        await onDeletePost(post);
-      } catch (error) {
-        window.alert(error?.message || "Unable to delete this post.");
-      }
-    }
-
-    const availablePosts = useMemo(
-      () => posts.filter((post) => getPostId(post) != null),
-      [posts],
-    );
-
-    const initialPostId = getPostId(initialPost);
-
-    const matchingInitialPost = availablePosts.find(
-      (post) => String(getPostId(post)) === String(initialPostId),
-    );
-
-    // Profile viewers preserve the supplied grid order. Other entry points keep
-    // their existing selected-first shuffled behavior.
-    const viewerPosts = useMemo(() => {
-      if (preservePostOrder) {
-        const containsInitial = availablePosts.some(
-          (post) =>
-            post === initialPost ||
-            String(getPostId(post)) === String(initialPostId),
-        );
-        if (containsInitial) return availablePosts;
-        if (!initialPost) return availablePosts;
-
-        // Keep the profile sequence when ID shapes differ; don't move the
-        // selected post to index zero, otherwise earlier posts disappear above.
-        if (Number.isInteger(initialPostIndex) && initialPostIndex >= 0) {
-          const ordered = [...availablePosts];
-          const safeIndex = Math.min(initialPostIndex, ordered.length);
-          if (safeIndex < ordered.length) ordered[safeIndex] = initialPost;
-          else ordered.splice(safeIndex, 0, initialPost);
-          return ordered;
-        }
-
-        return [initialPost, ...availablePosts];
-      }
-
-      if (initialPostId == null) return availablePosts;
-
-      const selectedPost = matchingInitialPost || initialPost;
-      if (!selectedPost) return availablePosts;
-
-      const remainingPosts = availablePosts.filter(
-        (post) => String(getPostId(post)) !== String(initialPostId),
-      );
-
-      for (let i = remainingPosts.length - 1; i > 0; i -= 1) {
-        const j = Math.floor(Math.random() * (i + 1));
-        [remainingPosts[i], remainingPosts[j]] = [
-          remainingPosts[j],
-          remainingPosts[i],
-        ];
-      }
-
-      return [selectedPost, ...remainingPosts];
-    }, [
-      availablePosts,
-      initialPost,
-      initialPostId,
-      matchingInitialPost,
-      preservePostOrder,
-      initialPostIndex,
-    ]);
-
-    // A stable key prevents effects from rerunning just because the parent
-    // creates a fresh `posts` array on each render.
-    const viewerPostIdsKey = viewerPosts
-      .map((post) => String(getPostId(post)))
-      .join("|");
-
-    // Effects keyed by stable post IDs read the latest post objects through this ref.
-    const viewerPostsRef = useRef(viewerPosts);
-
-    useEffect(() => {
-      viewerPostsRef.current = viewerPosts;
-    }, [viewerPosts]);
-
-    const firstPostId = initialPostId ?? getPostId(viewerPosts[0]);
-
-    const [activeId, setActiveId] = useState(firstPostId);
-    const [initialPlacementReady, setInitialPlacementReady] = useState(false);
-
-    const [likedPosts, setLikedPosts] = useState({});
-    const [openPostOptionsId, setOpenPostOptionsId] = useState(null);
-
-    const [bookmarkedPosts, setBookmarkedPosts] = useState({});
-    const bookmarkRequestsRef = useRef(new Set());
-    const userChangedBookmarksRef = useRef(new Set());
-
-    const [likeCountOverrides, setLikeCountOverrides] = useState({});
-
-    const [animatedLikePostId, setAnimatedLikePostId] = useState(null);
-
-    const [followedCreators, setFollowedCreators] = useState({});
-
-    const [photoIndexes, setPhotoIndexes] = useState({});
-
-    const [videoRatios, setVideoRatios] = useState({});
-    const [viewerViewport, setViewerViewport] = useState(() => ({
-      width:
-        typeof window !== "undefined"
-          ? Math.max(320, window.innerWidth - 64)
-          : 1280,
-      height: typeof window !== "undefined" ? window.innerHeight : 800,
-    }));
-
-    useEffect(() => {
-      const updateViewerViewport = () =>
-        setViewerViewport({
-          width: Math.max(320, window.innerWidth - 64),
-          height: window.innerHeight,
-        });
-      window.addEventListener("resize", updateViewerViewport, {
-        passive: true,
-      });
-      return () => window.removeEventListener("resize", updateViewerViewport);
-    }, []);
-
-    const [muted, setMuted] = useState(() =>
-      Boolean(getSavedPlaybackPreference("startMuted", true)),
-    );
-
-    const [paused, setPaused] = useState(false);
-    const [playingVideoPostId, setPlayingVideoPostId] = useState(null);
-
-    const [captionsEnabled, setCaptionsEnabled] = useState(false);
-
-    const [networkQualityNotice, setNetworkQualityNotice] = useState("");
-    const [dataSaverEnabled, setDataSaverEnabled] = useState(
-      () => getNetworkPlaybackProfile().dataSaver,
-    );
-    const qualityNoticeTimerRef = useRef(null);
-    function showNetworkQualityNotice(message) {
-      setNetworkQualityNotice(message);
-      if (qualityNoticeTimerRef.current) {
-        window.clearTimeout(qualityNoticeTimerRef.current);
-      }
-      qualityNoticeTimerRef.current = window.setTimeout(() => {
-        setNetworkQualityNotice("");
-        qualityNoticeTimerRef.current = null;
-      }, 4800);
-    }
-    useEffect(
-      () => () => {
-        if (qualityNoticeTimerRef.current) {
-          window.clearTimeout(qualityNoticeTimerRef.current);
-        }
-      },
-      [],
-    );
-    useEffect(() => {
-      const handlePlaybackSettingsUpdate = (event) => {
-        const hasManualChoice =
-          event?.detail?.dataSaverUserChoice === true &&
-          typeof event?.detail?.dataSaver === "boolean";
-        setDataSaverEnabled(
-          hasManualChoice
-            ? event.detail.dataSaver
-            : getNetworkPlaybackProfile().dataSaver,
-        );
-      };
-      const connection =
-        typeof navigator !== "undefined"
-          ? navigator.connection ||
-            navigator.mozConnection ||
-            navigator.webkitConnection
-          : null;
-      window.addEventListener(
-        "spotli:settings-updated",
-        handlePlaybackSettingsUpdate,
-      );
-      connection?.addEventListener?.("change", handlePlaybackSettingsUpdate);
-      return () => {
-        window.removeEventListener(
-          "spotli:settings-updated",
-          handlePlaybackSettingsUpdate,
-        );
-        connection?.removeEventListener?.(
-          "change",
-          handlePlaybackSettingsUpdate,
-        );
-      };
-    }, []);
-
-    const [playbackFeedback, setPlaybackFeedback] = useState(null);
-
-    const [progress, setProgress] = useState(0);
-
-    const [duration, setDuration] = useState(0);
-
-    const [currentTime, setCurrentTime] = useState(0);
-
-    const [commentsOpen, setCommentsOpen] = useState(false);
-
-    const [, setShowCreatorOverlay] = useState(true);
-
-    const creatorOverlayTimerRef = useRef(null);
-
-    const feedRef = useRef(null);
-
-    const videoRef = useRef(null);
-    const desktopVideoElementsRef = useRef({});
-    const playbackPositionsRef = useRef(new Map());
-
-    const postRefs = useRef({});
-
-    const playbackFeedbackTimerRef = useRef(null);
-
-    const likeAnimationTimerRef = useRef(null);
-
-    const likeRequestsRef = useRef(new Set());
-
-    const likedPostsRef = useRef({});
-
-    const userChangedLikesRef = useRef(new Set());
-
-    const lastTapRef = useRef({ time: 0, postId: null, x: 0, y: 0 });
-
-    const activeIndex = Math.max(
-      0,
-
-      viewerPosts.findIndex(
-        (post) => String(getPostId(post)) === String(activeId),
-      ),
-    );
-    const activeIndexRef = useRef(activeIndex);
-    activeIndexRef.current = activeIndex;
-    const scrollDirectionRef = useRef(1);
-    const scrollIntentStartedRef = useRef(false);
-    const scrollIntentPrewarmedPostIdsRef = useRef(new Set());
-
-    const activePost = viewerPosts[activeIndex];
-
-    const activePostId = getPostId(activePost);
-    useEffect(() => {
-      // Keep the cover visible whenever the desktop viewer changes videos.
-      setPlayingVideoPostId(null);
-    }, [activeId]);
-    const activeOriginalVideoUrl = getOriginalVideoUrl(activePost);
-    const activePostIsPhoto = isPhotoMediaPost(activePost);
-    const shouldPlayActiveVideoRef = useRef(!paused);
-    shouldPlayActiveVideoRef.current = !paused;
-
-    useEffect(() => {
-      if (!activePostId || activePostIsPhoto || !activeOriginalVideoUrl) {
-        return undefined;
-      }
-
-      const video = videoRef.current;
-      if (!video || !getCloudinaryHlsUrl(activeOriginalVideoUrl)) {
-        return undefined;
-      }
-
-      return attachCloudinaryAdaptiveStream(
-        video,
-        activeOriginalVideoUrl,
-        getOptimizedPlaybackUrl(activeOriginalVideoUrl),
-        () => shouldPlayActiveVideoRef.current,
-        () => setMuted(true),
-        undefined,
-        undefined,
-        "auto",
-        playbackPositionsRef.current.get(String(activePostId)) || 0,
-        (time) => {
-          if (Number.isFinite(time) && time >= 0) {
-            playbackPositionsRef.current.set(String(activePostId), time);
-          }
-        },
-        showNetworkQualityNotice,
-      );
-    }, [
-      activePostId,
-      activeOriginalVideoUrl,
-      activePostIsPhoto,
-      dataSaverEnabled,
-    ]);
-
-    // Prewarm one upcoming video while the current video is playing. Rebuild
-    // the observer after each active-index change so the next card is observed
-    // anew even when it already intersects the root margin; without this, the
-    // observer can skip it once and never notify again during a fast swipe.
-    useEffect(() => {
-      const playbackProfile = getNetworkPlaybackProfile();
-      if (playbackProfile.constrained) return undefined;
-      const feed = feedRef.current;
-      if (!feed || typeof IntersectionObserver === "undefined") {
-        return undefined;
-      }
-
-      const candidateByElement = new Map();
-      viewerPosts.forEach((post, index) => {
-        const element = postRefs.current[String(getPostId(post))];
-        if (element) candidateByElement.set(element, { post, index });
-      });
-      if (!candidateByElement.size) return undefined;
-
-      const observer = new IntersectionObserver(
-        (entries) => {
-          for (const entry of entries) {
-            if (!entry.isIntersecting) continue;
-
-            const candidate = candidateByElement.get(entry.target);
-            if (!candidate) {
-              observer.unobserve(entry.target);
-              continue;
-            }
-
-            const currentIndex = activeIndexRef.current;
-            if (candidate.index <= currentIndex) {
-              observer.unobserve(entry.target);
-              continue;
-            }
-            if (candidate.index !== currentIndex + 1) continue;
-            const currentVideo = videoRef.current;
-            if (!currentVideo || currentVideo.readyState < 2) continue;
-            const currentBufferedAhead =
-              getSpotliBufferedAheadSeconds(currentVideo);
-            const minimumAheadForEarlySegment = getNetworkPlaybackProfile()
-              .constrained
-              ? 1.0
-              : 0.5;
-            if (currentBufferedAhead < minimumAheadForEarlySegment) continue;
-
-            observer.unobserve(entry.target);
-            const nextPost =
-              viewerPostsRef.current[candidate.index] || candidate.post;
-            if (
-              nextPost?.mediaType === "photo" ||
-              nextPost?.mediaType === "image" ||
-              nextPost?.type === "photo" ||
-              nextPost?.type === "image" ||
-              nextPost?.isImagePost === true ||
-              nextPost?.isPhotoPost === true
-            ) {
-              continue;
-            }
-
-            const nextUrl = getOriginalVideoUrl(nextPost);
-            if (getCloudinaryHlsUrl(nextUrl)) {
-              console.info(
-                "[Spotli playback] Early next HLS segment prewarm started",
-                {
-                  source: "viewer-viewport-observer",
-                  bufferedAheadSeconds:
-                    Math.round(currentBufferedAhead * 100) / 100,
-                  nextAsset:
-                    getSpotliCloudinaryAssetParts(nextUrl)
-                      ?.assetPathWithoutExtension || null,
-                },
-              );
-              const nextPolicy = getUpcomingVideoChunkPreloadPolicy();
-              preloadNextVideoPlayback(nextUrl, {
-                partialBytes: nextPolicy.segmentBytes,
-                fallbackMp4OnWarmFailure: false,
-                aggressive: false,
-              });
-            }
-          }
-        },
-        {
-          root: feed,
-          rootMargin: "0px 0px 100% 0px",
-          threshold: 0.01,
-        },
-      );
-
-      candidateByElement.forEach(({ index }, element) => {
-        if (index > activeIndex) observer.observe(element);
-      });
-
-      return () => observer.disconnect();
-    }, [viewerPostIdsKey, activeIndex]);
-
-    // Warm the next two videos ahead of the scroll position on desktop too.
-    // The media prefixes are strictly byte-capped and serialized behind the
-    // active video's buffer, so the current stream keeps priority.
-    useEffect(() => {
-      if (
-        !activePostId ||
-        String(playingVideoPostId) !== String(activePostId) ||
-        !browserCanUseHlsJs()
-      ) {
-        return undefined;
-      }
-
-      const activeVideo = videoRef.current;
-      if (!activeVideo) return undefined;
-
-      const candidates = getNextVideoWarmCandidates(
-        viewerPosts,
-        activeIndex,
-        2,
-      );
-      if (!candidates.length) return undefined;
-
-      const policy = getUpcomingVideoChunkPreloadPolicy();
-      let disposed = false;
-      let preloading = false;
-      let candidateIndex = 0;
-      let lastAttemptAt = 0;
-      // The serialized chunk queue owns each candidate's playlist and media
-      // prefix. Avoid a separate metadata-only request for the same asset;
-      // swipe intent and viewport observers join this exact queued task.
-
-      const cleanupListeners = () => {
-        activeVideo.removeEventListener(
-          "timeupdate",
-          maybePreloadUpcomingChunks,
-        );
-        activeVideo.removeEventListener("progress", maybePreloadUpcomingChunks);
-        activeVideo.removeEventListener("playing", maybePreloadUpcomingChunks);
-      };
-
-      const maybePreloadUpcomingChunks = async () => {
-        if (
-          disposed ||
-          preloading ||
-          candidateIndex >= candidates.length ||
-          activeVideo.paused ||
-          activeVideo.ended
-        )
-          return;
-
-        const now = Date.now();
-        if (now - lastAttemptAt < 900) return;
-        const bufferedAhead = getSpotliBufferedAheadSeconds(activeVideo);
-        // The next video gets the lower buffer threshold. The second upcoming
-        // video is delayed until a little more active playback is safely buffered.
-        const requiredBufferedAheadSeconds =
-          candidateIndex === 0
-            ? policy.minimumBufferedAheadSeconds
-            : policy.secondVideoBufferedAheadSeconds ||
-              policy.minimumBufferedAheadSeconds + 0.5;
-        if (bufferedAhead < requiredBufferedAheadSeconds) return;
-
-        const candidate = candidates[candidateIndex];
-        if (!candidate) return;
-        preloading = true;
-        lastAttemptAt = now;
-
-        console.info(
-          "[Spotli playback] Preloading upcoming video startup chunk",
-          {
-            source: "desktop-active-playback-buffer",
-            upcomingIndex: candidate.index,
-            queuePosition: candidateIndex + 1,
-            segmentBytesBudget: policy.segmentBytes,
-            profile: policy.label,
-            priority:
-              candidateIndex === 0 ? "next-video" : "second-upcoming-video",
-            activeBufferedAheadSeconds: Math.round(bufferedAhead * 100) / 100,
-            requiredBufferedAheadSeconds,
-          },
-        );
-
-        try {
-          const warmed = await preloadNextVideoPlayback(candidate.url, {
-            partialBytes: policy.segmentBytes,
-            fallbackMp4OnWarmFailure: false,
-          });
-          if (disposed) return;
-          candidateIndex += 1;
-          console.info("[Spotli playback] Upcoming video chunk result", {
-            queuePosition: candidateIndex,
-            warmed: warmed === true,
-            nextCandidateAvailable: candidateIndex < candidates.length,
-          });
-        } catch (error) {
-          candidateIndex += 1;
-          console.warn(
-            "[Spotli playback] Upcoming video chunk preload failed",
-            {
-              reason: error?.message || String(error || "unknown error"),
-              upcomingIndex: candidate.index,
-            },
-          );
-        } finally {
-          preloading = false;
-        }
-
-        if (candidateIndex >= candidates.length) {
-          cleanupListeners();
-          return;
-        }
-        if (
-          getSpotliBufferedAheadSeconds(activeVideo) >=
-          policy.minimumBufferedAheadSeconds
-        ) {
-          maybePreloadUpcomingChunks();
-        }
-      };
-
-      activeVideo.addEventListener("timeupdate", maybePreloadUpcomingChunks);
-      activeVideo.addEventListener("progress", maybePreloadUpcomingChunks);
-      activeVideo.addEventListener("playing", maybePreloadUpcomingChunks);
-      maybePreloadUpcomingChunks();
-
-      return () => {
-        disposed = true;
-        cleanupListeners();
-      };
-    }, [viewerPostIdsKey, activeIndex, activePostId, playingVideoPostId]);
-
-    const [comments, setComments] = useState([]);
-
-    const [commentsLoading, setCommentsLoading] = useState(false);
-
-    const [commentsError, setCommentsError] = useState("");
-
-    // Restore saved bookmarks for the current viewer posts.
-    useEffect(() => {
-      let cancelled = false;
-
-      api.bookmarks
-        .getMine()
-        .then((response) => {
-          if (cancelled) return;
-
-          const savedIds = new Set(
-            (Array.isArray(response?.posts) ? response.posts : [])
-              .map((post) => getPostId(post))
-              .filter((id) => id != null)
-              .map(String),
-          );
-
-          setBookmarkedPosts((previous) => {
-            const next = { ...previous };
-            viewerPostsRef.current.forEach((post) => {
-              const key = String(getPostId(post));
-              if (!userChangedBookmarksRef.current.has(key)) {
-                next[key] = savedIds.has(key);
-              }
-            });
-            return next;
-          });
-        })
-        .catch(() => {
-          // Keep the viewer usable when the user is signed out.
-        });
-
-      return () => {
-        cancelled = true;
-      };
-    }, [viewerPostIdsKey]);
-
-    async function toggleBookmark(postId) {
-      if (postId == null) return;
-      const key = String(postId);
-      if (bookmarkRequestsRef.current.has(key)) return;
-
-      const wasBookmarked = Boolean(bookmarkedPosts[key]);
-      bookmarkRequestsRef.current.add(key);
-      userChangedBookmarksRef.current.add(key);
-      setBookmarkedPosts((previous) => ({
-        ...previous,
-        [key]: !wasBookmarked,
-      }));
-
-      try {
-        if (wasBookmarked) {
-          await api.bookmarks.remove(postId);
-        } else {
-          await api.bookmarks.add(postId);
-        }
-      } catch (error) {
-        setBookmarkedPosts((previous) => ({
-          ...previous,
-          [key]: wasBookmarked,
-        }));
-        userChangedBookmarksRef.current.delete(key);
-        if (typeof window !== "undefined") {
-          window.alert(error?.message || "Please sign in to save posts.");
-        }
-      } finally {
-        bookmarkRequestsRef.current.delete(key);
-      }
-    }
-
-    // Restore the signed-in user's saved likes from the server.
-    useEffect(() => {
-      let cancelled = false;
-
-      api.posts
-
-        .getMyLikes()
-
-        .then((response) => {
-          if (cancelled) return;
-
-          const likedIds = new Set(
-            (Array.isArray(response?.postIds) ? response.postIds : []).map(
-              String,
-            ),
-          );
-
-          setLikedPosts((previous) => {
-            const next = { ...previous, ...likedPostsRef.current };
-
-            viewerPostsRef.current.forEach((post) => {
-              const ids = [post.id, post._id].filter(Boolean).map(String);
-
-              const key = String(getPostId(post));
-
-              // Never let the initial server response overwrite a user's click.
-              if (!userChangedLikesRef.current.has(key)) {
-                next[key] = ids.some((id) => likedIds.has(id));
-              }
-            });
-
-            likedPostsRef.current = next;
-
-            return next;
-          });
-        })
-
-        .catch((error) => {
-          console.error(
-            "Unable to restore liked posts:",
-
-            error?.message || error,
-          );
-        });
-
-      return () => {
-        cancelled = true;
-      };
-    }, [viewerPostIdsKey]);
-
-    // Load comments only while the desktop comments panel is open. Fetching a
-    // complete thread on every video switch competes with HLS startup traffic.
-    useEffect(() => {
-      if (!activePostId || !commentsOpen) return undefined;
-
-      let cancelled = false;
-
-      // Defer loading-state updates so the effect starts the request first.
-      Promise.resolve().then(() => {
-        if (cancelled) return;
-        setCommentsLoading(true);
-        setCommentsError("");
-      });
-
-      api.posts
-
-        .getComments(activePostId)
-
-        .then((result) => {
-          if (!cancelled) {
-            setComments(Array.isArray(result?.comments) ? result.comments : []);
-          }
-        })
-
-        .catch((error) => {
-          if (!cancelled) {
-            setCommentsError(error?.message || "Unable to load comments.");
-          }
-        })
-
-        .finally(() => {
-          if (!cancelled) setCommentsLoading(false);
-        });
-
-      return () => {
-        cancelled = true;
-      };
-    }, [activePostId, commentsOpen]);
-
-    // Position the feed on the selected post before the browser paints.
-    // Disable smooth scrolling for this initial placement so opening post 5 does
-    // not visibly animate through posts 1–4 first.
-    desktop_useLayoutEffect(() => {
-      const initialId = initialPostId;
-      const feed = feedRef.current;
-      const postElement =
-        initialId == null ? null : postRefs.current[String(initialId)];
-
-      if (!feed || !postElement) return undefined;
-
-      // Disable both smooth scrolling and snap while positioning the clicked
-      // post. Re-enable snap only after its offset has been applied, so a post
-      // opened from a grid never animates from the first post.
-      feed.style.scrollBehavior = "auto";
-      feed.style.scrollSnapType = "none";
-
-      const feedTop = feed.getBoundingClientRect().top;
-      const postTop = postElement.getBoundingClientRect().top;
-      feed.scrollTop = Math.max(0, feed.scrollTop + postTop - feedTop);
-
-      const selectedPost = viewerPostsRef.current.find(
-        (post) => String(getPostId(post)) === String(initialId),
-      );
-      if (selectedPost) setActiveId(getPostId(selectedPost));
-      setInitialPlacementReady(true);
-
-      return undefined;
-    }, [initialPostId, viewerPostIdsKey]);
-
-    // Keep every post's video element mounted, but only allow the active one
-    // to play. Inactive per-post elements retain their HLS MediaSource and
-    // buffered segments so returning to a recently watched post is immediate.
-    useEffect(() => {
-      const activeKey = String(activePostId ?? "");
-      Object.entries(desktopVideoElementsRef.current).forEach(
-        ([postId, item]) => {
-          if (!item || postId === activeKey) return;
-          if (!item.paused) item.pause();
-          item.preload = "metadata";
-        },
-      );
-
-      const video = videoRef.current;
-      if (!video) return;
-      video.muted = muted;
-      if (paused) {
-        video.pause();
-      } else {
-        video.play().catch(() => {});
-      }
-    }, [activeId, activePostId, paused, muted]);
-
-    // Keep creator details visible briefly whenever a new video becomes active.
-    const activePostMediaType = activePost?.mediaType;
-    const activePostType = activePost?.type;
-
-    useEffect(() => {
-      if (creatorOverlayTimerRef.current) {
-        window.clearTimeout(creatorOverlayTimerRef.current);
-
-        creatorOverlayTimerRef.current = null;
-      }
-
-      let revealFrameId = window.requestAnimationFrame(() => {
-        setShowCreatorOverlay(true);
-        revealFrameId = null;
-      });
-
-      if (
-        !activePostId ||
-        activePostMediaType === "photo" ||
-        activePostType === "photo"
-      ) {
-        return () => {
-          if (revealFrameId != null) window.cancelAnimationFrame(revealFrameId);
-        };
-      }
-
-      creatorOverlayTimerRef.current = window.setTimeout(() => {
-        setShowCreatorOverlay(false);
-        creatorOverlayTimerRef.current = null;
-      }, 5000);
-
-      return () => {
-        if (revealFrameId != null) window.cancelAnimationFrame(revealFrameId);
-        if (creatorOverlayTimerRef.current) {
-          window.clearTimeout(creatorOverlayTimerRef.current);
-          creatorOverlayTimerRef.current = null;
-        }
-      };
-    }, [activeId, activePostId, activePostMediaType, activePostType]);
-
-    // Reset playback controls after the active post changes.
-    useEffect(() => {
-      const frameId = window.requestAnimationFrame(() => {
-        const resumeTime = Number(
-          playbackPositionsRef.current.get(String(activeId)) || 0,
-        );
-        setProgress(0);
-        setCurrentTime(Number.isFinite(resumeTime) ? resumeTime : 0);
-        setDuration(0);
-        setPaused(false);
-        setPlaybackFeedback(null);
-      });
-
-      if (playbackFeedbackTimerRef.current) {
-        window.clearTimeout(playbackFeedbackTimerRef.current);
-        playbackFeedbackTimerRef.current = null;
-      }
-
-      return () => window.cancelAnimationFrame(frameId);
-    }, [activeId]);
-
-    useEffect(() => {
-      return () => {
-        if (playbackFeedbackTimerRef.current) {
-          window.clearTimeout(playbackFeedbackTimerRef.current);
-        }
-
-        if (likeAnimationTimerRef.current) {
-          window.clearTimeout(likeAnimationTimerRef.current);
-        }
-
-        if (creatorOverlayTimerRef.current) {
-          window.clearTimeout(creatorOverlayTimerRef.current);
-        }
-      };
-    }, []);
-
-    // Change the active post only when a slide is mostly visible.
-    useEffect(() => {
-      const feed = feedRef.current;
-
-      if (!feed || typeof IntersectionObserver === "undefined") return;
-
-      let previousScrollTop = feed.scrollTop;
-      const updateScrollDirection = () => {
-        const nextScrollTop = feed.scrollTop;
-        const delta = nextScrollTop - previousScrollTop;
-        if (Math.abs(delta) > 1) {
-          scrollDirectionRef.current = delta > 0 ? 1 : -1;
-          scrollIntentStartedRef.current = true;
-        }
-        previousScrollTop = nextScrollTop;
-      };
-      feed.addEventListener("scroll", updateScrollDirection, { passive: true });
-
-      const observer = new IntersectionObserver(
-        (entries) => {
-          // A deliberate scroll is a request for the adjacent video. Warm just
-          // its first adaptive segment before it becomes the active slide.
-          // This is not background preloading: nothing is fetched until the
-          // user scrolls, and Auto still uses the existing Data Saver cap.
-          if (scrollIntentStartedRef.current) {
-            let intendedEntry = null;
-            let intendedCandidateIndex = -1;
-            for (const entry of entries) {
-              // Playlist warming already happens in the background. Wait until
-              // the user is genuinely entering this slide before downloading
-              // its first media segment; this avoids wasting bytes on overscroll.
-              if (!entry.isIntersecting || entry.intersectionRatio < 0.15)
-                continue;
-              const targetId = entry.target.dataset.postId;
-              const candidateIndex = viewerPostsRef.current.findIndex(
-                (post) => String(getPostId(post)) === String(targetId),
-              );
-              const isInScrollDirection =
-                scrollDirectionRef.current > 0
-                  ? candidateIndex > activeIndexRef.current
-                  : candidateIndex >= 0 &&
-                    candidateIndex < activeIndexRef.current;
-              if (!isInScrollDirection) continue;
-              if (
-                !intendedEntry ||
-                entry.intersectionRatio > intendedEntry.intersectionRatio
-              ) {
-                intendedEntry = entry;
-                intendedCandidateIndex = candidateIndex;
-              }
-            }
-
-            if (intendedEntry && intendedCandidateIndex >= 0) {
-              const candidate = viewerPostsRef.current[intendedCandidateIndex];
-              const candidateId = String(getPostId(candidate));
-              if (
-                candidate &&
-                !scrollIntentPrewarmedPostIdsRef.current.has(candidateId) &&
-                candidate?.mediaType !== "photo" &&
-                candidate?.mediaType !== "image" &&
-                candidate?.type !== "photo" &&
-                candidate?.type !== "image" &&
-                candidate?.isImagePost !== true &&
-                candidate?.isPhotoPost !== true
-              ) {
-                const candidateUrl = getOriginalVideoUrl(candidate);
-                if (getCloudinaryHlsUrl(candidateUrl)) {
-                  scrollIntentPrewarmedPostIdsRef.current.add(candidateId);
-                  console.info(
-                    "[Spotli playback] Swipe-intent HLS warmup started",
-                    {
-                      source: "desktop-scroll-intent",
-                      postId: candidateId,
-                      visiblePercent: Math.round(
-                        intendedEntry.intersectionRatio * 100,
-                      ),
-                      skippedToIndex:
-                        intendedCandidateIndex !==
-                        activeIndexRef.current + scrollDirectionRef.current,
-                      dataSaver: getNetworkPlaybackProfile().dataSaver,
-                    },
-                  );
-                  preloadNextVideoPlayback(candidateUrl, {
-                    partialBytes:
-                      getUpcomingVideoChunkPreloadPolicy().segmentBytes,
-                    fallbackMp4OnWarmFailure: false,
-                  });
-                }
-              }
-            }
-          }
-
-          let mostVisibleEntry = null;
-
-          for (const entry of entries) {
-            if (
-              entry.isIntersecting &&
-              (!mostVisibleEntry ||
-                entry.intersectionRatio > mostVisibleEntry.intersectionRatio)
-            ) {
-              mostVisibleEntry = entry;
-            }
-          }
-
-          if (!mostVisibleEntry || mostVisibleEntry.intersectionRatio < 0.35) {
-            return;
-          }
-
-          const postId = mostVisibleEntry.target.dataset.postId;
-
-          if (postId == null) return;
-
-          const matchingPost = viewerPostsRef.current.find(
-            (post) => String(getPostId(post)) === postId,
-          );
-
-          if (matchingPost) {
-            setActiveId((currentId) =>
-              String(currentId) === String(getPostId(matchingPost))
-                ? currentId
-                : getPostId(matchingPost),
-            );
-          }
-        },
-
-        {
-          root: feed,
-
-          threshold: [0.01, 0.03, 0.08, 0.12, 0.2, 0.35, 0.5, 0.6, 0.75, 0.9],
-        },
-      );
-
-      Object.values(postRefs.current).forEach((element) => {
-        if (element) observer.observe(element);
-      });
-
-      return () => {
-        feed.removeEventListener("scroll", updateScrollDirection);
-        observer.disconnect();
-      };
-    }, [viewerPostIdsKey]);
-
-    function selectPost(post) {
-      if (!post) return;
-
-      const selectedVideoUrl = getOriginalVideoUrl(post);
-      if (getCloudinaryHlsUrl(selectedVideoUrl)) {
-        const selectionPolicy = getUpcomingVideoChunkPreloadPolicy();
-        preloadNextVideoPlayback(selectedVideoUrl, {
-          partialBytes: selectionPolicy.segmentBytes,
-          fallbackMp4OnWarmFailure: false,
-        });
-      }
-
-      const postId = getPostId(post);
-
-      const feed = feedRef.current;
-
-      const element = postRefs.current[String(postId)];
-
-      if (!feed || !element) return;
-
-      setActiveId(postId);
-
-      feed.scrollTo({
-        top: element.offsetTop,
-
-        behavior: "smooth",
-      });
-    }
-
-    function revealCreatorOverlay() {
-      setShowCreatorOverlay(true);
-
-      if (creatorOverlayTimerRef.current) {
-        window.clearTimeout(creatorOverlayTimerRef.current);
-      }
-
-      creatorOverlayTimerRef.current = window.setTimeout(() => {
-        setShowCreatorOverlay(false);
-
-        creatorOverlayTimerRef.current = null;
-      }, 5000);
-    }
-
-    function showPlaybackFeedback(icon) {
-      setPlaybackFeedback(icon);
-
-      if (playbackFeedbackTimerRef.current) {
-        window.clearTimeout(playbackFeedbackTimerRef.current);
-      }
-
-      playbackFeedbackTimerRef.current = window.setTimeout(() => {
-        setPlaybackFeedback(null);
-
-        playbackFeedbackTimerRef.current = null;
-      }, 650);
-    }
-
-    function togglePlayback() {
-      const video = videoRef.current;
-
-      if (!video) return;
-
-      if (video.paused) {
-        video.play().catch(() => {});
-
-        setPaused(false);
-
-        showPlaybackFeedback("play");
-      } else {
-        video.pause();
-
-        setPaused(true);
-
-        showPlaybackFeedback("pause");
-      }
-    }
-
-    function toggleCaptions() {
-      const tracks = videoRef.current?.textTracks;
-      if (!tracks || tracks.length === 0) {
-        setCaptionsEnabled(false);
-        return;
-      }
-
-      const nextEnabled = !Array.from(tracks).some(
-        (track) => track.mode === "showing",
-      );
-      Array.from(tracks).forEach((track) => {
-        track.mode = nextEnabled ? "showing" : "hidden";
-      });
-      setCaptionsEnabled(nextEnabled);
-    }
-
-    function handleTimeUpdate() {
-      const video = videoRef.current;
-
-      if (!video || !video.duration) return;
-      playbackPositionsRef.current.set(String(activePostId), video.currentTime);
-
-      setCurrentTime(video.currentTime);
-
-      setDuration(video.duration);
-
-      setProgress((video.currentTime / video.duration) * 100);
-    }
-
-    function handleSeek(event) {
-      const video = videoRef.current;
-
-      if (!video || !video.duration) return;
-
-      const nextTime = Number(event.target.value);
-
-      video.currentTime = nextTime;
-
-      setCurrentTime(nextTime);
-
-      setProgress((nextTime / video.duration) * 100);
-    }
-
-    // Update the heart/count on the first click, then serialize server changes.
-    async function toggleLike(postId) {
-      const post = viewerPosts.find(
-        (item) => String(getPostId(item)) === String(postId),
-      );
-
-      const requestPostId = getPostId(post);
-
-      if (!post || requestPostId == null) return;
-
-      const key = String(requestPostId);
-
-      userChangedLikesRef.current.add(key);
-
-      // Read from a ref so fast clicks never depend on a stale React render.
-      const wasLiked = Boolean(likedPostsRef.current[key] ?? likedPosts[key]);
-
-      const nextLiked = !wasLiked;
-
-      likedPostsRef.current = { ...likedPostsRef.current, [key]: nextLiked };
-
-      setLikedPosts((previous) => ({ ...previous, [key]: nextLiked }));
-
-      const currentCount = likeCountOverrides[key] ?? getPostLikeCount(post);
-
-      setLikeCountOverrides((previous) => ({
-        ...previous,
-
-        [key]: Math.max(0, currentCount + (nextLiked ? 1 : -1)),
-      }));
-
-      // Don't drop a second click while a request is pending. The running loop
-      // checks the latest desired state after each request completes.
-      if (likeRequestsRef.current.has(key)) return;
-
-      likeRequestsRef.current.add(key);
-
-      let serverLiked = wasLiked;
-
-      try {
-        while (serverLiked !== Boolean(likedPostsRef.current[key])) {
-          const desiredLiked = Boolean(likedPostsRef.current[key]);
-
-          if (desiredLiked) {
-            await api.posts.like(requestPostId);
-          } else {
-            await api.posts.unlike(requestPostId);
-          }
-
-          serverLiked = desiredLiked;
-        }
-      } catch (error) {
-        console.error("Unable to update post like:", error?.message || error);
-      } finally {
-        likeRequestsRef.current.delete(key);
-      }
-    }
-
-    function handleDoubleTapLike(postId, event) {
-      event?.preventDefault?.();
-
-      // A double tap adds a like but never removes an existing one.
-      if (!likedPosts[String(postId)]) {
-        void toggleLike(postId);
-      }
-
-      // Restart the animation so every double tap gets immediate feedback.
-      setAnimatedLikePostId(null);
-
-      if (likeAnimationTimerRef.current) {
-        window.clearTimeout(likeAnimationTimerRef.current);
-      }
-
-      requestAnimationFrame(() => setAnimatedLikePostId(postId));
-
-      likeAnimationTimerRef.current = window.setTimeout(() => {
-        setAnimatedLikePostId(null);
-
-        likeAnimationTimerRef.current = null;
-      }, 700);
-    }
-
-    function handlePointerUp(postId, event) {
-      // Use pointer events for reliable mobile/tablet double-tap detection.
-      if (event.pointerType !== "touch") return;
-
-      // Don't treat taps on interactive controls as taps on the media.
-      if (event.target.closest("button, input, [role='button']")) {
-        lastTapRef.current = { time: 0, postId: null, x: 0, y: 0 };
-
-        return;
-      }
-
-      const now = Date.now();
-
-      const key = String(postId);
-
-      const lastTap = lastTapRef.current;
-
-      const elapsed = now - lastTap.time;
-
-      const distance = Math.hypot(
-        event.clientX - lastTap.x,
-
-        event.clientY - lastTap.y,
-      );
-
-      if (
-        lastTap.postId === key &&
-        elapsed > 0 &&
-        elapsed < 350 &&
-        distance < 72
-      ) {
-        lastTapRef.current = { time: 0, postId: null, x: 0, y: 0 };
-
-        handleDoubleTapLike(postId, event);
-
-        return;
-      }
-
-      lastTapRef.current = {
-        time: now,
-
-        postId: key,
-
-        x: event.clientX,
-
-        y: event.clientY,
-      };
-    }
-
-    function toggleFollow(postId) {
-      setFollowedCreators((previous) => ({
-        ...previous,
-
-        [postId]: !previous[postId],
-      }));
-    }
-
-    async function submitComment(text) {
-      if (!activePostId || !text?.trim()) {
-        throw new Error("Choose a post and enter a comment first.");
-      }
-
-      const result = await api.posts.addComment(activePostId, text.trim());
-
-      if (result?.comment) {
-        setComments((previous) => [result.comment, ...previous]);
-      }
-    }
-
-    function toggleFullscreen(postId) {
-      const postElement = postRefs.current[String(postId)];
-
-      const videoStage = postElement?.querySelector("[data-video-stage]");
-
-      if (!videoStage) return;
-
-      if (document.fullscreenElement) {
-        document.exitFullscreen?.();
-      } else {
-        videoStage.requestFullscreen?.().catch(() => {});
-      }
-    }
-
-    function handlePhotoScroll(postId, event) {
-      const gallery = event.currentTarget;
-
-      const index = Math.round(gallery.scrollLeft / gallery.clientWidth);
-
-      setPhotoIndexes((previous) => ({
-        ...previous,
-
-        [postId]: index,
-      }));
-    }
-
-    function goToPhoto(postId, index) {
-      const gallery = document.getElementById(`photo-gallery-${postId}`);
-
-      if (!gallery) return;
-
-      gallery.scrollTo({
-        left: index * gallery.clientWidth,
-
-        behavior: "smooth",
-      });
-    }
-
-    if (!activePost) return null;
-
-    return (
-      <div className="fixed inset-y-0 left-16 right-0 z-[100] overflow-hidden bg-black text-white">
-        <style>{`
-
-        .spotli-double-tap-heart {
-
-          animation: spotli-heart-pop 700ms cubic-bezier(.18, .89, .32, 1.28) both;
-
-          transform-origin: center;
-
-          filter: drop-shadow(0 0 18px rgba(255, 45, 74, .65));
-
-        }
-
-        .spotli-like-button:active .spotli-like-icon {
-
-          transform: scale(1.35);
-
-        }
-
-        .spotli-like-icon {
-
-          transition: transform 140ms ease, color 160ms ease, fill 160ms ease;
-
-        }
-
-        @keyframes spotli-heart-pop {
-
-          0% { opacity: 0; transform: scale(.15) rotate(-24deg); }
-
-          18% { opacity: 1; transform: scale(1.35) rotate(10deg); }
-
-          36% { opacity: 1; transform: scale(.88) rotate(-6deg); }
-
-          52% { opacity: 1; transform: scale(1.12) rotate(3deg); }
-
-          68% { opacity: 1; transform: scale(1) rotate(0); }
-
-          100% { opacity: 0; transform: scale(1.45) translateY(-14px); }
-
-        }
-
-        .spotli-short-progress {
-          appearance: none;
-          -webkit-appearance: none;
-          border: 0;
-          border-radius: 999px;
-          outline: none;
-          overflow: hidden;
-        }
-        .spotli-short-progress::-webkit-slider-runnable-track {
-          height: 4px;
-          background: transparent;
-          border-radius: 999px;
-        }
-        .spotli-short-progress::-webkit-slider-thumb {
-          appearance: none;
-          -webkit-appearance: none;
-          width: 8px;
-          height: 8px;
-          margin-top: -2px;
-          border: 0;
-          border-radius: 50%;
-          background: #FF2D4A;
-        }
-        .spotli-short-progress::-moz-range-track {
-          height: 4px;
-          background: transparent;
-        }
-        .spotli-short-progress::-moz-range-thumb {
-          width: 8px;
-          height: 8px;
-          border: 0;
-          border-radius: 50%;
-          background: #FF2D4A;
-        }
-
-        [data-video-stage]:fullscreen {
-          position: fixed;
-          inset: 0 !important;
-          left: 0 !important;
-          right: 0 !important;
-          top: 0 !important;
-          bottom: 0 !important;
-          width: 100vw !important;
-          height: 100vh !important;
-          max-width: none;
-          overflow: hidden;
-          background: #000;
-        }
-        [data-video-stage]:fullscreen .spotli-video-details {
-          display: none !important;
-        }
-        [data-video-stage]:fullscreen .spotli-video-action-rail {
-          right: 16px !important;
-          top: 50% !important;
-          transform: translateY(-50%) !important;
-        }
-        [data-video-stage]:fullscreen .spotli-hide-in-fullscreen {
-          display: none !important;
-        }
-
-        [data-video-stage]:fullscreen video {
-          position: absolute;
-          inset: 0 0 36px;
-          width: 100%;
-          height: calc(100% - 36px);
-          max-width: none;
-          transform: none;
-          object-fit: contain;
-        }
-        [data-video-stage]:fullscreen .spotli-short-progress {
-          bottom: 0 !important;
-        }
-        [data-video-stage]:fullscreen + .spotli-video-details {
-          display: none !important;
-        }
-
-      `}</style>
-
-        {dataSaverEnabled && (
-          <div
-            role="status"
-            aria-live="polite"
-            className="pointer-events-none fixed left-1/2 top-4 z-[129] -translate-x-1/2 rounded-full border border-white/15 bg-[#171717]/90 px-3 py-2 text-xs font-medium text-white shadow-lg backdrop-blur-md"
-          >
-            Data Saver ON - You are saving data
-          </div>
-        )}
-        {networkQualityNotice && (
-          <div
-            role="status"
-            aria-live="polite"
-            className={`pointer-events-none fixed left-1/2 ${dataSaverEnabled ? "top-16" : "top-4"} z-[130] flex w-max max-w-[min(92vw,440px)] -translate-x-1/2 items-start gap-2 rounded-2xl border border-amber-300/30 bg-[#171717]/95 px-4 py-3 text-sm text-white shadow-2xl backdrop-blur-md`}
-          >
-            <span aria-hidden="true" className="mt-0.5 text-amber-300">
-              ⚠
-            </span>
-            <span>{networkQualityNotice}</span>
-          </div>
-        )}
-
-        <div className="flex h-full min-h-0 flex-col">
-          <div className="px-4 pt-4">
-            <TopBar
-              variant="viewer"
-              onCloseViewer={onBack}
-              onNavigateFromViewer={onNavigateFromViewer}
-            />
-          </div>
-
-          <div className="h-0 shrink-0" />
-
-          <div
-            className={`grid min-h-0 flex-1 overflow-hidden ${commentsOpen ? "grid-cols-[minmax(0,1fr)_minmax(300px,380px)]" : "grid-cols-1"}`}
-          >
-            <section
-              ref={feedRef}
-              className="relative min-h-0 min-w-0 overflow-x-hidden overflow-y-auto snap-y snap-mandatory overscroll-y-contain bg-[#080808] scrollbar-none [&::-webkit-scrollbar]:hidden"
-              style={{
-                scrollBehavior: "auto",
-                scrollSnapType: initialPlacementReady ? "y mandatory" : "none",
-                WebkitOverflowScrolling: "touch",
-              }}
-            >
-              {viewerPosts.map((post) => {
-                const postId = getPostId(post);
-
-                const explicitThumbnail = resolveMediaUrl(
-                  getExplicitPostThumbnail(post),
-                );
-                const videoUrl = getVideoUrl(post);
-                const originalVideoUrl = getOriginalVideoUrl(post);
-                const directMp4SourceUrl =
-                  getDirectSpotliMp4Url(originalVideoUrl);
-                const generatedVideoThumbnail =
-                  getCloudinaryVideoThumbnailUrl(originalVideoUrl);
-                const existingImageCandidate = getPostImage(post);
-                const postThumbnail =
-                  explicitThumbnail ||
-                  generatedVideoThumbnail ||
-                  (/\.(mp4|mov|m4v|webm|avi|mkv)(?:[?#]|$)/i.test(
-                    existingImageCandidate,
-                  )
-                    ? ""
-                    : existingImageCandidate);
-
-                const photoSet = getPostImages(post);
-
-                const postIsImage =
-                  isPhotoMediaPost(post) || (!videoUrl && photoSet.length > 0);
-
-                const photoIndex = photoIndexes[postId] || 0;
-
-                const isActive = String(postId) === String(activeId);
-                const detectedAspectRatio = Number(videoRatios[String(postId)]);
-                const mediaAspectRatio =
-                  Number.isFinite(detectedAspectRatio) &&
-                  detectedAspectRatio > 0.1
-                    ? Math.min(2.4, Math.max(0.35, detectedAspectRatio))
-                    : postIsImage
-                      ? 4 / 5
-                      : 16 / 9;
-                const viewerContentWidth = Math.max(
-                  320,
-                  viewerViewport.width - (commentsOpen ? 380 : 0),
-                );
-                const detailPanelWidth = Math.min(
-                  280,
-                  Math.max(220, Math.round(viewerContentWidth * 0.18)),
-                );
-                const stageBaseLeft = Math.max(
-                  detailPanelWidth + 50,
-                  Math.min(300, viewerContentWidth * 0.2),
-                );
-                const actionRailReserve = 164; // reserve space for actions and the far-right previous/next controls
-                const availableMediaWidth = Math.max(
-                  240,
-                  viewerContentWidth - stageBaseLeft - actionRailReserve,
-                );
-                const availableMediaHeight = Math.max(
-                  300,
-                  viewerViewport.height - 160,
-                );
-                const mediaFrameWidth = Math.max(
-                  240,
-                  Math.min(
-                    availableMediaWidth,
-                    availableMediaHeight * mediaAspectRatio,
-                  ),
-                );
-                const mediaFrameHeight = mediaFrameWidth / mediaAspectRatio;
-                const stageHeight = mediaFrameHeight + (postIsImage ? 32 : 36);
-                const stageLeft =
-                  stageBaseLeft +
-                  Math.max(0, (availableMediaWidth - mediaFrameWidth) / 2);
-                const articleHeight = Math.max(320, viewerViewport.height - 64);
-                const stageTop = Math.max(
-                  16,
-                  (articleHeight - stageHeight) / 2,
-                );
-
-                const isLiked = Boolean(likedPosts[String(postId)]);
-
-                const displayedLikeCount =
-                  likeCountOverrides[String(postId)] ?? getPostLikeCount(post);
-
-                return (
-                  <article
-                    key={postId}
-                    ref={(element) => {
-                      if (element) {
-                        postRefs.current[String(postId)] = element;
-                      } else {
-                        delete postRefs.current[String(postId)];
-                      }
-                    }}
-                    data-post-id={String(postId)}
-                    className="relative h-full min-h-full w-full snap-start snap-always overflow-hidden bg-black"
-                    style={{
-                      scrollSnapAlign: "start",
-
-                      scrollSnapStop: "always",
-                    }}
-                  >
-                    <button
-                      type="button"
-                      onClick={onBack}
-                      aria-label="Back to home"
-                      className="absolute left-3 top-3 z-30 grid h-9 w-9 place-items-center rounded-full bg-black/50 text-white hover:bg-black/75"
-                    >
-                      <ArrowLeft size={19} />
-                    </button>
-
-                    <button
-                      type="button"
-                      onClick={() => toggleFullscreen(postId)}
-                      aria-label="Fullscreen"
-                      className="absolute right-3 top-3 z-30 grid h-9 w-9 place-items-center rounded-full bg-black/50 text-white hover:bg-black/75"
-                    >
-                      <Maximize size={17} />
-                    </button>
-
-                    <nav
-                      aria-label="Post navigation"
-                      className="absolute right-5 top-1/2 z-40 flex -translate-y-1/2 flex-col gap-4"
-                    >
-                      <button
-                        type="button"
-                        onClick={() => selectPost(viewerPosts[activeIndex - 1])}
-                        disabled={activeIndex <= 0}
-                        aria-label="Previous post"
-                        title="Previous post"
-                        className="grid h-14 w-14 place-items-center rounded-full border border-white/10 bg-[#242424] text-white shadow-lg transition-colors hover:bg-[#383838] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white disabled:cursor-not-allowed disabled:opacity-35"
-                      >
-                        <ArrowUp size={27} strokeWidth={2.2} />
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => selectPost(viewerPosts[activeIndex + 1])}
-                        disabled={activeIndex >= viewerPosts.length - 1}
-                        aria-label="Next post"
-                        title="Next post"
-                        className="grid h-14 w-14 place-items-center rounded-full border border-white/10 bg-[#242424] text-white shadow-lg transition-colors hover:bg-[#383838] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white disabled:cursor-not-allowed disabled:opacity-35"
-                      >
-                        <ArrowDown size={27} strokeWidth={2.2} />
-                      </button>
-                    </nav>
-
-                    <div
-                      data-video-stage
-                      onPointerDown={() => {
-                        if (isActive && !postIsImage) revealCreatorOverlay();
-                      }}
-                      onMouseMove={() => {
-                        if (isActive && !postIsImage) revealCreatorOverlay();
-                      }}
-                      onDoubleClick={(event) =>
-                        handleDoubleTapLike(postId, event)
-                      }
-                      onPointerUp={(event) => handlePointerUp(postId, event)}
-                      className="absolute overflow-visible rounded-[2.25rem] bg-black touch-manipulation"
-                      style={{
-                        left: `${stageLeft}px`,
-                        top: `${stageTop}px`,
-                        width: `${mediaFrameWidth}px`,
-                        height: `${stageHeight}px`,
-                        right: "auto",
-                        bottom: "auto",
-                      }}
-                    >
-                      {postIsImage ? (
-                        <>
-                          <div
-                            id={`photo-gallery-${postId}`}
-                            onScroll={(event) =>
-                              handlePhotoScroll(postId, event)
-                            }
-                            className="absolute inset-x-0 top-0 bottom-8 snap-x snap-mandatory overflow-x-auto overflow-y-hidden rounded-[2.25rem] scrollbar-none [&::-webkit-scrollbar]:hidden"
-                          >
-                            <div className="flex h-full w-full">
-                              {photoSet.map((photo, index) => (
-                                <div
-                                  key={`${postId}-${photo}-${index}`}
-                                  className="relative h-full w-full shrink-0 snap-center"
-                                >
-                                  <img
-                                    src={getPostImage({ image: photo })}
-                                    alt={`${post.caption} — photo ${index + 1}`}
-                                    draggable="false"
-                                    onLoad={(event) => {
-                                      const image = event.currentTarget;
-                                      if (
-                                        index !== photoIndex ||
-                                        !image.naturalWidth ||
-                                        !image.naturalHeight
-                                      )
-                                        return;
-                                      setVideoRatios((previous) => ({
-                                        ...previous,
-                                        [postId]:
-                                          image.naturalWidth /
-                                          image.naturalHeight,
-                                      }));
-                                    }}
-                                    className="h-full w-full select-none object-contain"
-                                  />
-                                </div>
-                              ))}
-                            </div>
-                          </div>
-
-                          {photoSet.length > 1 && (
-                            <>
-                              <span className="absolute right-5 top-5 z-30 rounded-full bg-black/60 px-3 py-1 text-xs text-white">
-                                {photoIndex + 1} / {photoSet.length}
-                              </span>
-
-                              <div className="absolute bottom-1 left-1/2 z-30 flex -translate-x-1/2 items-center gap-1.5">
-                                {photoSet.map((_, index) => (
-                                  <button
-                                    key={`${postId}-dot-${index}`}
-                                    type="button"
-                                    aria-label={`Go to photo ${index + 1}`}
-                                    aria-current={
-                                      photoIndex === index ? "true" : undefined
-                                    }
-                                    onClick={() => goToPhoto(postId, index)}
-                                    className={`h-1.5 rounded-full transition-all duration-200 ${
-                                      photoIndex === index
-                                        ? "w-4 bg-[#FF2D4A]"
-                                        : "w-1.5 bg-white/60 hover:bg-white"
-                                    }`}
-                                  />
-                                ))}
-                              </div>
-                            </>
-                          )}
-                        </>
-                      ) : (
-                        <>
-                          <video
-                            key={postId}
-                            ref={(node) => {
-                              const key = String(postId);
-                              if (node) {
-                                desktopVideoElementsRef.current[key] = node;
-                                node.dataset.postId = key;
-                                if (isActive) videoRef.current = node;
-                              } else {
-                                delete desktopVideoElementsRef.current[key];
-                                if (videoRef.current?.dataset?.postId === key) {
-                                  videoRef.current = null;
-                                }
-                              }
-                            }}
-                            src={
-                              getCloudinaryHlsUrl(originalVideoUrl)
-                                ? undefined
-                                : videoUrl || undefined
-                            }
-                            poster={postThumbnail || undefined}
-                            autoPlay={
-                              isActive &&
-                              !paused &&
-                              !getCloudinaryHlsUrl(originalVideoUrl)
-                            }
-                            preload={
-                              isActive
-                                ? getCloudinaryHlsUrl(originalVideoUrl)
-                                  ? "none"
-                                  : "auto"
-                                : "metadata"
-                            }
-                            muted={muted}
-                            loop
-                            playsInline
-                            onClick={isActive ? togglePlayback : undefined}
-                            onTimeUpdate={(event) => {
-                              if (!isActive) return;
-                              const currentVideo = event.currentTarget;
-                              playbackPositionsRef.current.set(
-                                String(postId),
-                                Math.max(
-                                  0,
-                                  Number(currentVideo.currentTime) || 0,
-                                ),
-                              );
-                              handleTimeUpdate();
-                            }}
-                            onLoadedMetadata={(event) => {
-                              const currentVideo = event.currentTarget;
-                              if (isActive)
-                                setDuration(currentVideo.duration || 0);
-                              setVideoRatios((previous) => ({
-                                ...previous,
-                                [postId]:
-                                  currentVideo.videoWidth /
-                                  Math.max(currentVideo.videoHeight, 1),
-                              }));
-                            }}
-                            onError={(event) => {
-                              console.error("Spotli video failed to load", {
-                                postId,
-                                src: event.currentTarget.currentSrc || videoUrl,
-                                error:
-                                  event.currentTarget.error?.message ||
-                                  "Unknown media error",
-                              });
-                            }}
-                            onPlay={() => {
-                              if (isActive) setPaused(false);
-                            }}
-                            onPause={() => {
-                              if (isActive) setPaused(true);
-                            }}
-                            onLoadedData={() => {
-                              if (isActive && !paused) {
-                                setPlayingVideoPostId(String(postId));
-                              }
-                            }}
-                            onPlaying={() => {
-                              if (isActive)
-                                setPlayingVideoPostId(String(postId));
-                            }}
-                            className="absolute inset-x-0 top-0 w-full rounded-t-[2.25rem] object-contain"
-                            style={{
-                              height: "calc(100% - 36px)",
-                              borderTopLeftRadius: "36px",
-                              borderTopRightRadius: "36px",
-                              filter:
-                                "saturate(1.08) contrast(1.035) brightness(1.01)",
-                              opacity: isActive ? 1 : 0,
-                            }}
-                          />
-                          {!isActive && (
-                            <div className="absolute inset-0 flex items-center justify-center bg-black">
-                              {postThumbnail ? (
-                                <img
-                                  src={postThumbnail}
-                                  alt=""
-                                  loading="lazy"
-                                  fetchPriority="low"
-                                  decoding="async"
-                                  className="absolute inset-x-0 top-0 w-full rounded-t-[2.25rem] object-contain"
-                                  style={{
-                                    height: "calc(100% - 36px)",
-                                    borderTopLeftRadius: "36px",
-                                    borderTopRightRadius: "36px",
-                                  }}
-                                />
-                              ) : (
-                                <div className="flex flex-col items-center gap-2 text-white/70">
-                                  <Play size={36} />
-                                  <span className="text-xs">
-                                    Scroll to play
-                                  </span>
-                                </div>
-                              )}
-                              <span className="absolute bottom-5 right-5 rounded-full bg-black/60 p-2 text-white">
-                                <Play size={18} fill="currentColor" />
-                              </span>
-                            </div>
-                          )}
-                        </>
-                      )}
-
-                      {String(animatedLikePostId) === String(postId) && (
-                        <div className="pointer-events-none absolute inset-0 z-40 flex items-center justify-center">
-                          <Heart
-                            size={104}
-                            fill="#FF2D4A"
-                            color="#FF2D4A"
-                            strokeWidth={1.5}
-                            className="spotli-double-tap-heart drop-shadow-[0_8px_24px_rgba(255,45,74,0.45)]"
-                          />
-                        </div>
-                      )}
-
-                      {isActive && playbackFeedback && !postIsImage && (
-                        <div className="pointer-events-none absolute inset-0 z-30 flex items-center justify-center">
-                          <span className="flex h-16 w-16 items-center justify-center rounded-full bg-black/45 text-white shadow-lg backdrop-blur-sm">
-                            {playbackFeedback === "play" ? (
-                              <Play
-                                size={30}
-                                fill="currentColor"
-                                className="ml-1"
-                              />
-                            ) : (
-                              <Pause size={30} fill="currentColor" />
-                            )}
-                          </span>
-                        </div>
-                      )}
-
-                      <div
-                        className="spotli-video-details absolute z-20 text-white"
-                        style={{
-                          left: `${stageBaseLeft - detailPanelWidth - 18 - stageLeft}px`,
-                          width: `${detailPanelWidth}px`,
-                          right: "auto",
-                          bottom: "18px",
-                          maxHeight: "52vh",
-                          overflowY: "auto",
-                          overflowWrap: "anywhere",
-                        }}
-                      >
-                        <div className="mb-2 flex min-w-0 items-center gap-2">
-                          {getCreatorAvatar(post) ? (
-                            <img
-                              src={getCreatorAvatar(post)}
-                              alt={`${getCreatorName(post)}'s profile`}
-                              loading="lazy"
-                              decoding="async"
-                              onError={(event) => {
-                                event.currentTarget.onerror = null;
-
-                                event.currentTarget.style.display = "none";
-                              }}
-                              className="h-10 w-10 shrink-0 rounded-full border border-white/50 object-cover shadow-lg"
-                            />
-                          ) : (
-                            <span
-                              aria-label={`${getCreatorName(post)}'s profile`}
-                              className="grid h-10 w-10 shrink-0 place-items-center rounded-full border border-white/50 bg-[#FF2D4A] text-sm font-bold text-white shadow-lg"
-                            >
-                              {getCreatorName(post).charAt(0).toUpperCase()}
-                            </span>
-                          )}
-
-                          <div className="min-w-0">
-                            <p className="flex min-w-0 items-center gap-1 text-sm font-bold text-white">
-                              <span className="min-w-0 truncate whitespace-nowrap">
-                                {getCreatorName(post)}
-                              </span>
-                              <CheckCircle2
-                                size={12}
-                                className="shrink-0 text-sky-400"
-                              />
-                            </p>
-
-                            <p className="text-xs font-medium text-white/70">
-                              {post.time || "Recently"}
-                            </p>
-                          </div>
-
-                          <button
-                            type="button"
-                            onClick={() => toggleFollow(postId)}
-                            className="shrink-0 whitespace-nowrap rounded-full border border-white/80 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-white/10"
-                          >
-                            {followedCreators[postId] ? "Following" : "Follow"}
-                          </button>
-                        </div>
-
-                        {post.caption && (
-                          <p className="mt-3 max-w-full whitespace-pre-wrap break-words text-sm font-medium leading-relaxed text-white/95">
-                            <MentionText
-                              text={post.caption}
-                              mentions={post.mentions}
-                            />
-                          </p>
-                        )}
-
-                        <p className="mt-2 text-xs font-medium text-white/75">
-                          ♫ Original sound · {getCreatorName(post)}
-                        </p>
-                      </div>
-
-                      <aside className="spotli-video-action-rail absolute -right-[52px] top-1/2 z-20 flex -translate-y-1/2 flex-col items-center gap-3 text-white">
-                        <button
-                          type="button"
-                          onClick={() => toggleLike(postId)}
-                          aria-label={isLiked ? "Unlike post" : "Like post"}
-                          aria-pressed={isLiked}
-                          className="spotli-hide-in-fullscreen spotli-like-button group flex flex-col items-center gap-1 rounded-full focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
-                        >
-                          <span className="grid h-10 w-10 place-items-center rounded-full border border-white/15 bg-black/65 text-white shadow-lg backdrop-blur-md transition-colors group-hover:bg-black/85">
-                            <Heart
-                              size={22}
-                              fill={isLiked ? "#FF2D4A" : "none"}
-                              color={isLiked ? "#FF2D4A" : "white"}
-                              strokeWidth={2.2}
-                              className="spotli-like-icon transition-colors duration-200"
-                            />
-                          </span>
-
-                          <span className="rounded-full bg-black/55 px-2 py-0.5 text-[11px] font-semibold text-white [text-shadow:0_1px_3px_rgba(0,0,0,0.8)]">
-                            {formatCount(displayedLikeCount)}
-                          </span>
-                        </button>
-
-                        <button
-                          type="button"
-                          aria-label="Comments"
-                          aria-pressed={commentsOpen}
-                          onClick={() => setCommentsOpen((open) => !open)}
-                          className="spotli-hide-in-fullscreen group flex flex-col items-center gap-1 rounded-full focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
-                        >
-                          <span className="grid h-10 w-10 place-items-center rounded-full border border-white/15 bg-black/65 text-white shadow-lg backdrop-blur-md transition-colors group-hover:bg-black/85">
-                            <MessageCircle size={21} />
-                          </span>
-
-                          <span className="rounded-full bg-black/55 px-2 py-0.5 text-[11px] font-semibold text-white [text-shadow:0_1px_3px_rgba(0,0,0,0.8)]">
-                            {formatCount(
-                              activePost?.commentsCount ?? comments.length,
-                            )}
-                          </span>
-                        </button>
-
-                        <button
-                          type="button"
-                          aria-label="Share post"
-                          onClick={() => {
-                            if (navigator.share) {
-                              navigator
-
-                                .share({
-                                  title: "Spotli",
-
-                                  text: post.caption,
-
-                                  url: window.location.href,
-                                })
-
-                                .catch(() => {});
-                            } else if (navigator.clipboard) {
-                              navigator.clipboard
-
-                                .writeText(window.location.href)
-
-                                .catch(() => {});
-                            }
-                          }}
-                          className="group flex flex-col items-center gap-1 rounded-full focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
-                        >
-                          <span className="grid h-8 w-8 place-items-center rounded-full border border-white/15 bg-black/65 text-white shadow-lg backdrop-blur-md transition-colors group-hover:bg-black/85">
-                            <Share2 size={14} />
-                          </span>
-
-                          <span className="rounded-full bg-black/55 px-2 py-0.5 text-[11px] font-semibold text-white [text-shadow:0_1px_3px_rgba(0,0,0,0.8)]">
-                            Share
-                          </span>
-                        </button>
-
-                        <div className="relative">
-                          <button
-                            type="button"
-                            aria-label="More options"
-                            aria-expanded={openPostOptionsId === String(postId)}
-                            onClick={() => openPostMenu(post)}
-                            className="grid h-8 w-8 place-items-center rounded-full border border-white/15 bg-black/65 text-white shadow-lg backdrop-blur-md transition-colors hover:bg-black/85 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
-                          >
-                            <MoreVertical size={14} />
-                          </button>
-                          {openPostOptionsId === String(postId) && (
-                            <div className="absolute right-10 top-0 z-[160] min-w-40 rounded-2xl border border-white/10 bg-[#171717] p-1.5 text-white shadow-2xl">
-                              {isPostOwnedBy(post, currentUserId) ? (
-                                <button
-                                  type="button"
-                                  onClick={() =>
-                                    void deletePostFromViewer(post)
-                                  }
-                                  className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left text-sm font-semibold text-red-300 transition hover:bg-white/10"
-                                >
-                                  <Trash2 size={15} /> Delete post
-                                </button>
-                              ) : (
-                                <p className="px-3 py-2 text-xs text-white/60">
-                                  Only the creator can delete this post.
-                                </p>
-                              )}
-                            </div>
-                          )}
-                        </div>
-
-                        <button
-                          type="button"
-                          aria-label={
-                            bookmarkedPosts[String(postId)]
-                              ? "Remove bookmark"
-                              : "Bookmark post"
-                          }
-                          aria-pressed={Boolean(
-                            bookmarkedPosts[String(postId)],
-                          )}
-                          title={
-                            bookmarkedPosts[String(postId)]
-                              ? "Remove from saved posts"
-                              : "Save post"
-                          }
-                          onClick={() => toggleBookmark(postId)}
-                          className="group flex flex-col items-center gap-1 rounded-full focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
-                        >
-                          <span className="grid h-8 w-8 place-items-center rounded-full border border-white/15 bg-black/65 text-white shadow-lg backdrop-blur-md transition-colors group-hover:bg-black/85">
-                            <Bookmark
-                              size={16}
-                              fill={
-                                bookmarkedPosts[String(postId)]
-                                  ? "currentColor"
-                                  : "none"
-                              }
-                            />
-                          </span>
-                          <span className="rounded-full bg-black/55 px-1.5 py-0.5 text-[10px] font-semibold text-white">
-                            Save
-                          </span>
-                        </button>
-                      </aside>
-
-                      {isActive && !postIsImage && (
-                        <div className="absolute bottom-0 left-0 right-0 z-30 flex h-9 items-center gap-1 rounded-b-[2.25rem] bg-black/90 px-2 pb-0 pt-0 text-white">
-                          <button
-                            type="button"
-                            onClick={togglePlayback}
-                            aria-label={paused ? "Play" : "Pause"}
-                            className="grid h-7 w-7 shrink-0 place-items-center rounded-lg transition-colors hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
-                          >
-                            {paused ? <Play size={16} /> : <Pause size={16} />}
-                          </button>
-
-                          <span className="whitespace-nowrap text-[11px]">
-                            {formatTime(currentTime)} / {formatTime(duration)}
-                          </span>
-
-                          <input
-                            aria-label="Video progress"
-                            type="range"
-                            min="0"
-                            max={duration || 1}
-                            step="0.1"
-                            value={Math.min(currentTime, duration || 1)}
-                            onChange={handleSeek}
-                            className="spotli-short-progress absolute bottom-0 left-0 z-40 h-1 w-full cursor-pointer accent-[#FF2D4A] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#FF2D4A]"
-                            style={{
-                              position: "absolute",
-                              left: 0,
-                              bottom: 0,
-                              width: "100%",
-                              height: "4px",
-                              margin: 0,
-                              padding: 0,
-                              borderRadius: "999px",
-                              overflow: "hidden",
-                              background: `linear-gradient(to right, #FF2D4A ${progress}%, rgba(255,255,255,.28) ${progress}%)`,
-                            }}
-                          />
-
-                          <button
-                            type="button"
-                            onClick={() => setMuted((value) => !value)}
-                            aria-label={muted ? "Unmute" : "Mute"}
-                            className="grid h-7 w-7 shrink-0 place-items-center rounded-lg transition-colors hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
-                          >
-                            {muted ? (
-                              <VolumeX size={16} />
-                            ) : (
-                              <Volume2 size={16} />
-                            )}
-                          </button>
-
-                          <button
-                            type="button"
-                            aria-label={
-                              captionsEnabled
-                                ? "Turn captions off"
-                                : "Turn captions on"
-                            }
-                            aria-pressed={captionsEnabled}
-                            title="Toggle captions when available"
-                            onClick={toggleCaptions}
-                            className={`grid h-7 w-7 shrink-0 place-items-center rounded transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white ${captionsEnabled ? "bg-[#FF2D4A]/20 text-[#FF2D4A]" : "hover:bg-white/10"}`}
-                          >
-                            <Captions size={16} />
-                          </button>
-
-                          <button
-                            type="button"
-                            onClick={() => toggleFullscreen(postId)}
-                            aria-label="Fullscreen"
-                            className="grid h-7 w-7 shrink-0 place-items-center rounded-lg transition-colors hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
-                          >
-                            <Maximize size={16} />
-                          </button>
-                        </div>
-                      )}
-                    </div>
-                  </article>
-                );
-              })}
-            </section>
-
-            {commentsOpen && (
-              <aside className="flex min-h-0 min-w-0 flex-col overflow-hidden border-l border-white/10 bg-[#111111] text-white">
-                <div
-                  id="desktop-comments"
-                  className="flex min-h-0 flex-1 flex-col"
-                >
-                  <CommentSection
-                    post={activePost}
-                    comments={comments}
-                    loading={commentsLoading}
-                    error={commentsError}
-                    onSubmit={submitComment}
-                    onClose={() => setCommentsOpen(false)}
-                    variant="panel"
-                  />
-                </div>
-              </aside>
-            )}
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  return DesktopVideoViewer;
-}
-const DesktopViewerImplementation = createDesktopViewerImplementation();
-
 /**
- * One responsive Spotli video viewer entry point. Mobile and tablet share the
- * same tablet implementation, handlers, playback state, and interaction logic.
- * Desktop continues to use its existing implementation.
+ * Reuse the existing tablet viewer for desktop. The existing mobile/tablet
+ * responsive styling remains the default below the desktop breakpoint.
  */
-export default function VideoViewer({
-  posts = [],
-  initialPost,
-  preservePostOrder = false,
-  initialPostIndex = null,
-  onBack,
-  onNavigateFromViewer,
-  currentUserId = "",
-  onDeletePost,
-}) {
-  const getDevice = () => {
-    if (typeof window === "undefined") return "mobile";
-    if (window.matchMedia("(min-width: 1024px)").matches) return "desktop";
-    if (window.matchMedia("(min-width: 768px)").matches) return "tablet";
-    return "mobile";
-  };
-  const [device, setDevice] = useState(getDevice);
-
-  useEffect(() => {
-    const mobile = window.matchMedia("(max-width: 767px)");
-    const tablet = window.matchMedia(
-      "(min-width: 768px) and (max-width: 1023px)",
-    );
-    const desktop = window.matchMedia("(min-width: 1024px)");
-    const update = () => {
-      if (desktop.matches) setDevice("desktop");
-      else if (tablet.matches) setDevice("tablet");
-      else setDevice("mobile");
-    };
-    update();
-    mobile.addEventListener?.("change", update);
-    tablet.addEventListener?.("change", update);
-    desktop.addEventListener?.("change", update);
-    return () => {
-      mobile.removeEventListener?.("change", update);
-      tablet.removeEventListener?.("change", update);
-      desktop.removeEventListener?.("change", update);
-    };
-  }, []);
-
-  const viewerProps = {
-    posts,
-    initialPost,
-    preservePostOrder,
-    initialPostIndex,
-    onBack,
-    onNavigateFromViewer,
-    currentUserId,
-    onDeletePost,
-  };
-  if (device === "desktop")
-    return <DesktopViewerImplementation {...viewerProps} />;
-  // Mobile and tablet intentionally share the same implementation.
-  return <TabletViewerImplementation {...viewerProps} />;
+export default function VideoViewer(props) {
+  return <TabletViewerImplementation {...props} />;
 }

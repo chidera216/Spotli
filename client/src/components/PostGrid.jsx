@@ -3,7 +3,7 @@ import {
   getSpotliPrefetchOriginalVideoUrl,
   preloadCloudinaryVideoStream,
   prewarmCloudinaryVideoForOpen,
-  shouldSkipHlsPrewarmForMobileAuto,
+  shouldSkipDetachedHlsPrewarmForAuto,
 } from "./VideoViewer";
 
 import {
@@ -265,11 +265,12 @@ function PostCard({
   const activeImage = images[activeImageIndex] || "";
   const videoUrl = getPostVideoSource(post);
 
-  // Warm small HLS playlists as desktop cards enter the grid. Mobile Auto uses
-  // the viewer's shared progressive-MP4 element and skips this HLS prewarm.
+  // Auto playback is owned by the viewer's persistent per-post MP4 element on
+  // desktop, tablet and mobile. Avoid detached HLS warmups for a source Auto
+  // playback will not use unless MP4 recovery needs HLS.
   useEffect(() => {
     if (
-      shouldSkipHlsPrewarmForMobileAuto() ||
+      shouldSkipDetachedHlsPrewarmForAuto() ||
       !isVideo ||
       !isPriorityVideo ||
       !videoUrl ||
@@ -546,10 +547,10 @@ function PostCard({
     );
   }
 
-  // Hover warms lightweight playlists only on desktop, where Auto playback uses
-  // HLS. Mobile Auto is owned by the viewer's persistent progressive-MP4 element.
+  // Auto playback uses the persistent per-post MP4 element on every device.
+  // Do not start detached HLS playlist downloads from Home hover.
   function scheduleVideoPreload(event) {
-    if (isDataSaverEnabled() || shouldSkipHlsPrewarmForMobileAuto()) return;
+    if (isDataSaverEnabled() || shouldSkipDetachedHlsPrewarmForAuto()) return;
     if (event?.pointerType && event.pointerType !== "mouse") return;
     cancelScheduledVideoPreload();
     // A short hover is a useful head start; fast mouse movement across the feed
@@ -576,8 +577,8 @@ function PostCard({
             // intentional tap/click prewarm starts. This prevents a timer from
             // waking up after the viewer has already taken ownership.
             cancelScheduledVideoPreload();
-            // The shared helper selects HLS prewarming on desktop and skips
-            // detached HLS requests on mobile, where the feed MP4 element owns playback.
+            // Auto playback is owned by the viewer's per-post MP4 element on
+            // desktop, tablet and mobile; do not start a detached HLS request.
             prewarmCloudinaryVideoForOpen(videoUrl);
           }}
           onClick={openPost}
@@ -730,7 +731,7 @@ function PostGrid({
     .join("|");
 
   useEffect(() => {
-    if (!firstVideoPreloadKey || shouldSkipHlsPrewarmForMobileAuto()) {
+    if (!firstVideoPreloadKey || shouldSkipDetachedHlsPrewarmForAuto()) {
       return undefined;
     }
 
