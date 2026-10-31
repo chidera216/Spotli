@@ -22,26 +22,31 @@ import {
   FileText,
   ArrowLeft,
   LoaderCircle,
+  ArrowUpRight,
+  CheckCircle2,
 } from "lucide-react";
 
 const MAX_CAPTION_LENGTH = 2000;
 
-const MAX_IMAGE_SIZE = Number(import.meta.env.VITE_MAX_IMAGE_UPLOAD_BYTES) > 0
-  ? Number(import.meta.env.VITE_MAX_IMAGE_UPLOAD_BYTES)
-  : 10 * 1024 * 1024;
-const MAX_VIDEO_SIZE = Number(import.meta.env.VITE_MAX_VIDEO_UPLOAD_BYTES) > 0
-  ? Number(import.meta.env.VITE_MAX_VIDEO_UPLOAD_BYTES)
-  : 100 * 1024 * 1024;
+const MAX_IMAGE_SIZE =
+  Number(import.meta.env.VITE_MAX_IMAGE_UPLOAD_BYTES) > 0
+    ? Number(import.meta.env.VITE_MAX_IMAGE_UPLOAD_BYTES)
+    : 10 * 1024 * 1024;
+const MAX_VIDEO_SIZE =
+  Number(import.meta.env.VITE_MAX_VIDEO_UPLOAD_BYTES) > 0
+    ? Number(import.meta.env.VITE_MAX_VIDEO_UPLOAD_BYTES)
+    : 100 * 1024 * 1024;
 // Source videos may exceed Cloudinary's limit because Spotli can optimize them
 // locally before requesting a Cloudinary signature. This cap protects browsers
 // from attempting very large in-memory encodes on phones with limited RAM.
-const MAX_RAW_VIDEO_SIZE = Number(import.meta.env.VITE_MAX_SOURCE_VIDEO_BYTES) > 0
-  ? Number(import.meta.env.VITE_MAX_SOURCE_VIDEO_BYTES)
-  : 300 * 1024 * 1024;
+const MAX_RAW_VIDEO_SIZE =
+  Number(import.meta.env.VITE_MAX_SOURCE_VIDEO_BYTES) > 0
+    ? Number(import.meta.env.VITE_MAX_SOURCE_VIDEO_BYTES)
+    : 300 * 1024 * 1024;
 const VIDEO_COMPRESSION_THRESHOLD = 5 * 1024 * 1024;
 const SMALL_VIDEO_COMPRESSION_THRESHOLD = 15 * 1024 * 1024;
 const SMALL_VIDEO_TARGET_RATIO = 0.55;
-const STANDARD_VIDEO_TARGET_RATIO = 0.40;
+const STANDARD_VIDEO_TARGET_RATIO = 0.4;
 // Speed-first profile for large videos: reduce upload bytes enough to matter on
 // mobile connections, while the worker prefers a 720p encode when the source is
 // at least 50 MiB. This is a target, not a promise about exact output size.
@@ -120,7 +125,6 @@ function Create() {
 
   const replaceIndexRef = useRef(null);
 
-
   const activeUploadRequestsRef = useRef(new Set());
 
   // Video bytes now travel directly from the browser to Cloudinary. The API
@@ -159,9 +163,34 @@ function Create() {
 
   const [isPublishing, setIsPublishing] = useState(false);
 
-
+  // The launch overlay follows the real publish pipeline; success is shown only
+  // after the create-post API confirms that the post has been saved.
+  const [launchStage, setLaunchStage] = useState("idle");
+  const [launchError, setLaunchError] = useState("");
+  const [publishedMessage, setPublishedMessage] = useState(
+    "Your spot is now live on Spotli.",
+  );
 
   const [currentUser, setCurrentUser] = useState(null);
+
+  // After the post API confirms success, briefly show the confirmation state
+  // and then return to Home with a feed-refresh signal.
+  useEffect(() => {
+    if (launchStage !== "success") return undefined;
+
+    const redirectTimer = window.setTimeout(() => {
+      navigate("/home", {
+        replace: true,
+        state: {
+          refreshFeed: true,
+          postPublished: true,
+          message: publishedMessage,
+        },
+      });
+    }, 900);
+
+    return () => window.clearTimeout(redirectTimer);
+  }, [launchStage, publishedMessage, navigate]);
 
   useEffect(() => {
     let cancelled = false;
@@ -192,7 +221,8 @@ function Create() {
           void Promise.resolve(stagedUpload.cleanup()).catch(() => {});
           stagedUpload.cleanup = null;
         }
-        const cleanupPublicId = stagedUpload.asset?.public_id || stagedUpload.publicId;
+        const cleanupPublicId =
+          stagedUpload.asset?.public_id || stagedUpload.publicId;
         if (cleanupPublicId) {
           void api.posts
             .discardUpload({
@@ -375,7 +405,8 @@ function Create() {
         continue;
       }
 
-      const maxSize = postType === "video" ? MAX_RAW_VIDEO_SIZE : MAX_IMAGE_SIZE;
+      const maxSize =
+        postType === "video" ? MAX_RAW_VIDEO_SIZE : MAX_IMAGE_SIZE;
       if (file.size > maxSize) {
         setNotice(
           postType === "video"
@@ -671,7 +702,8 @@ function Create() {
         compressionMs: requestScope.encodingMs ?? null,
         compressed: requestScope.compressionResult?.compressed ?? false,
         durationSeconds:
-          media.find((item) => item.file === requestScope.file)?.duration ?? null,
+          media.find((item) => item.file === requestScope.file)?.duration ??
+          null,
       });
     }
 
@@ -723,21 +755,26 @@ function Create() {
         request.responseType = "json";
 
         if (chunked) {
-          request.setRequestHeader("Content-Range", `bytes ${start}-${end - 1}/${file.size}`);
+          request.setRequestHeader(
+            "Content-Range",
+            `bytes ${start}-${end - 1}/${file.size}`,
+          );
           request.setRequestHeader("X-Unique-Upload-Id", uniqueUploadId);
         }
 
         request.upload.addEventListener("progress", (event) => {
-          if (!event.lengthComputable || typeof onProgress !== "function") return;
+          if (!event.lengthComputable || typeof onProgress !== "function")
+            return;
           const transferred = start + event.loaded;
           onProgress(Math.min(99.9, (transferred / file.size) * 100));
         });
 
         request.addEventListener("load", () => {
           removeRequest();
-          const result = request.response && typeof request.response === "object"
-            ? request.response
-            : {};
+          const result =
+            request.response && typeof request.response === "object"
+              ? request.response
+              : {};
 
           if (request.status < 200 || request.status >= 300) {
             const error = new Error(
@@ -753,7 +790,9 @@ function Create() {
 
         request.addEventListener("error", () => {
           removeRequest();
-          const error = new Error("Network error uploading directly to Cloudinary.");
+          const error = new Error(
+            "Network error uploading directly to Cloudinary.",
+          );
           error.status = 0;
           reject(error);
         });
@@ -791,7 +830,9 @@ function Create() {
           attempt: attempt + 1,
           error: error?.message || String(error),
         });
-        await new Promise((resolve) => setTimeout(resolve, attempt === 0 ? 500 : 1500));
+        await new Promise((resolve) =>
+          setTimeout(resolve, attempt === 0 ? 500 : 1500),
+        );
         if (cancelUploadRequestedRef.current || requestScope?.cancelled) {
           throw new Error("UPLOAD_CANCELLED");
         }
@@ -844,7 +885,11 @@ function Create() {
       elapsedMs: Math.round(uploadElapsedMs),
       averageUploadMbps:
         uploadElapsedMs > 0
-          ? Number(((file.size * 8) / (uploadElapsedMs / 1000) / 1_000_000).toFixed(2))
+          ? Number(
+              ((file.size * 8) / (uploadElapsedMs / 1000) / 1_000_000).toFixed(
+                2,
+              ),
+            )
           : null,
     });
 
@@ -885,16 +930,27 @@ function Create() {
     if (!silent) setVideoPreuploadState(createVideoPreuploadState());
   }
 
-  function runVideoCompressionWorker(file, targetBytes, maxOutputBytes, staged, onProgress) {
+  function runVideoCompressionWorker(
+    file,
+    targetBytes,
+    maxOutputBytes,
+    staged,
+    onProgress,
+  ) {
     return new Promise((resolve, reject) => {
       let worker;
       try {
         worker = new Worker(
-          new URL("../workers/adaptiveVideoCompression.worker.js", import.meta.url),
+          new URL(
+            "../workers/adaptiveVideoCompression.worker.js",
+            import.meta.url,
+          ),
           { type: "module" },
         );
       } catch (error) {
-        reject(new Error(error?.message || "Could not start video optimization."));
+        reject(
+          new Error(error?.message || "Could not start video optimization."),
+        );
         return;
       }
 
@@ -903,8 +959,10 @@ function Create() {
         if (settled) return;
         settled = true;
         worker.terminate();
-        if (staged.compressionWorker === worker) staged.compressionWorker = null;
-        if (staged.cancelCompression === cancelCompression) staged.cancelCompression = null;
+        if (staged.compressionWorker === worker)
+          staged.compressionWorker = null;
+        if (staged.cancelCompression === cancelCompression)
+          staged.cancelCompression = null;
         callback(value);
       };
       const cancelCompression = () => {
@@ -920,9 +978,12 @@ function Create() {
       //   ?spotliEncoder=prefer-hardware (force hardware preference)
       //   ?spotliEncoder=no-preference (browser-selected default)
       // This is only a diagnostic override; normal users see no UI change.
-      const encoderPreferenceParam = new URLSearchParams(window.location.search).get("spotliEncoder");
+      const encoderPreferenceParam = new URLSearchParams(
+        window.location.search,
+      ).get("spotliEncoder");
       const hardwareAccelerationPreferenceOverride =
-        encoderPreferenceParam === "prefer-hardware" || encoderPreferenceParam === "no-preference"
+        encoderPreferenceParam === "prefer-hardware" ||
+        encoderPreferenceParam === "no-preference"
           ? encoderPreferenceParam
           : null;
 
@@ -935,7 +996,9 @@ function Create() {
           return;
         }
         if (message.type === "progress") {
-          onProgress?.(Math.max(0, Math.min(99, Number(message.progress) || 0)));
+          onProgress?.(
+            Math.max(0, Math.min(99, Number(message.progress) || 0)),
+          );
           return;
         }
         if (message.type === "info") {
@@ -947,30 +1010,52 @@ function Create() {
           return;
         }
         if (message.type === "error") {
-          finish(reject, new Error(message.message || "Video optimization failed."));
+          finish(
+            reject,
+            new Error(message.message || "Video optimization failed."),
+          );
           return;
         }
-        if (message.type === "complete" && message.buffer instanceof ArrayBuffer) {
+        if (
+          message.type === "complete" &&
+          message.buffer instanceof ArrayBuffer
+        ) {
           try {
-            const optimizedFile = new File([message.buffer], message.fileName || "spotli-video-optimized.mp4", {
-              type: "video/mp4",
-              lastModified: file.lastModified,
-            });
+            const optimizedFile = new File(
+              [message.buffer],
+              message.fileName || "spotli-video-optimized.mp4",
+              {
+                type: "video/mp4",
+                lastModified: file.lastModified,
+              },
+            );
             console.info("[Spotli upload] compression finished", {
               timestamp: new Date().toISOString(),
               fileName: file.name,
               originalSizeBytes: file.size,
               compressedSizeBytes: optimizedFile.size,
-              savingsPercent: Number((((file.size - optimizedFile.size) / file.size) * 100).toFixed(1)),
+              savingsPercent: Number(
+                (((file.size - optimizedFile.size) / file.size) * 100).toFixed(
+                  1,
+                ),
+              ),
               compressionMs: Number(message.elapsedMs) || null,
               metadataMs: Number(message.metadataMs) || 0,
               frameRateProbeMs: Number(message.frameRateProbeMs) || 0,
               encodeMs: Number(message.encodeMs) || 0,
               encodingPasses: Number(message.encodingPasses) || 1,
-              hardwareAccelerationPreference: message.hardwareAccelerationPreference || "no-preference",
-              outputDimensions: message.width && message.height ? `${message.width}x${message.height}` : null,
-              sourceFrameRate: Number.isFinite(Number(message.sourceFrameRate)) ? Number(message.sourceFrameRate) : null,
-              outputFrameRate: Number.isFinite(Number(message.outputFrameRate)) ? Number(message.outputFrameRate) : null,
+              hardwareAccelerationPreference:
+                message.hardwareAccelerationPreference || "no-preference",
+              outputDimensions:
+                message.width && message.height
+                  ? `${message.width}x${message.height}`
+                  : null,
+              sourceFrameRate: Number.isFinite(Number(message.sourceFrameRate))
+                ? Number(message.sourceFrameRate)
+                : null,
+              outputFrameRate: Number.isFinite(Number(message.outputFrameRate))
+                ? Number(message.outputFrameRate)
+                : null,
               dimensionsReduced: message.dimensionsReduced === true,
             });
             finish(resolve, {
@@ -980,7 +1065,8 @@ function Create() {
               frameRateProbeMs: Number(message.frameRateProbeMs) || 0,
               encodeMs: Number(message.encodeMs) || 0,
               encodingPasses: Number(message.encodingPasses) || 1,
-              hardwareAccelerationPreference: message.hardwareAccelerationPreference || "no-preference",
+              hardwareAccelerationPreference:
+                message.hardwareAccelerationPreference || "no-preference",
               targetBytes: Number(message.targetBytes) || targetBytes,
               outputWidth: Number(message.width) || null,
               outputHeight: Number(message.height) || null,
@@ -989,12 +1075,20 @@ function Create() {
               dimensionsReduced: message.dimensionsReduced === true,
             });
           } catch (error) {
-            finish(reject, new Error(error?.message || "Could not prepare the optimized video."));
+            finish(
+              reject,
+              new Error(
+                error?.message || "Could not prepare the optimized video.",
+              ),
+            );
           }
         }
       };
       worker.onerror = (event) => {
-        finish(reject, new Error(event.message || "Video optimization worker failed."));
+        finish(
+          reject,
+          new Error(event.message || "Video optimization worker failed."),
+        );
       };
       try {
         worker.postMessage({
@@ -1009,11 +1103,20 @@ function Create() {
           // 720p. This reduces encoder work on high-pixel-count videos.
           prefer720p: file.size >= SPEED_OPTIMIZED_DOWNSCALE_THRESHOLD,
           ...(hardwareAccelerationPreferenceOverride
-            ? { hardwareAccelerationPreference: hardwareAccelerationPreferenceOverride }
+            ? {
+                hardwareAccelerationPreference:
+                  hardwareAccelerationPreferenceOverride,
+              }
             : {}),
         });
       } catch (error) {
-        finish(reject, new Error(error?.message || "Could not send the video to the optimization worker."));
+        finish(
+          reject,
+          new Error(
+            error?.message ||
+              "Could not send the video to the optimization worker.",
+          ),
+        );
       }
     });
   }
@@ -1021,31 +1124,38 @@ function Create() {
   async function prepareVideoForUpload(file, staged) {
     const mustCompress =
       file.size >= VIDEO_COMPRESSION_THRESHOLD || file.size > MAX_VIDEO_SIZE;
-    const uploadSafetyMargin = Math.min(5 * 1024 * 1024, Math.floor(MAX_VIDEO_SIZE * 0.05));
+    const uploadSafetyMargin = Math.min(
+      5 * 1024 * 1024,
+      Math.floor(MAX_VIDEO_SIZE * 0.05),
+    );
     const maxOutputBytes = Math.max(1, MAX_VIDEO_SIZE - uploadSafetyMargin);
 
     if (!mustCompress) {
+      if (isPublishingRef.current) setLaunchStage("uploading");
       staged.uploadFile = file;
       staged.encodingMs = 0;
       staged.compressionResult = {
         file,
         compressed: false,
-        reason: "Video below the compression threshold: uploading directly to Cloudinary.",
+        reason:
+          "Video below the compression threshold: uploading directly to Cloudinary.",
         originalSize: file.size,
         compressedSize: file.size,
         savingsPercent: 0,
       };
-      setVideoPreuploadState(createVideoPreuploadState({
-        status: "uploading",
-        progress: 0,
-        compressionProgress: 100,
-        originalSize: file.size,
-        uploadSize: file.size,
-        encodingMs: 0,
-        compressed: false,
-        savingsPercent: 0,
-        reason: staged.compressionResult.reason,
-      }));
+      setVideoPreuploadState(
+        createVideoPreuploadState({
+          status: "uploading",
+          progress: 0,
+          compressionProgress: 100,
+          originalSize: file.size,
+          uploadSize: file.size,
+          encodingMs: 0,
+          compressed: false,
+          savingsPercent: 0,
+          reason: staged.compressionResult.reason,
+        }),
+      );
       return staged.compressionResult;
     }
 
@@ -1053,9 +1163,10 @@ function Create() {
     // 15 MiB target 55% of their source size; larger files target 40%, capped at
     // 20 MiB for large files. Files at/above 50 MiB prefer 720p to reduce the
     // pixel count; the worker avoids unnecessary repeat encoding when the first result is safe.
-    const targetRatio = file.size < SMALL_VIDEO_COMPRESSION_THRESHOLD
-      ? SMALL_VIDEO_TARGET_RATIO
-      : STANDARD_VIDEO_TARGET_RATIO;
+    const targetRatio =
+      file.size < SMALL_VIDEO_COMPRESSION_THRESHOLD
+        ? SMALL_VIDEO_TARGET_RATIO
+        : STANDARD_VIDEO_TARGET_RATIO;
     const targetBytes = Math.max(
       1,
       Math.min(
@@ -1072,22 +1183,31 @@ function Create() {
       targetSizeBytes: targetBytes,
       targetSizeMiB: Number((targetBytes / (1024 * 1024)).toFixed(1)),
       targetRatio,
-      targetSizeCapMiB: Number((VIDEO_COMPRESSION_TARGET_MAX / (1024 * 1024)).toFixed(1)),
-      speedProfile: file.size >= SPEED_OPTIMIZED_DOWNSCALE_THRESHOLD ? "prefer-720p" : "preserve-source-when-practical",
+      targetSizeCapMiB: Number(
+        (VIDEO_COMPRESSION_TARGET_MAX / (1024 * 1024)).toFixed(1),
+      ),
+      speedProfile:
+        file.size >= SPEED_OPTIMIZED_DOWNSCALE_THRESHOLD
+          ? "prefer-720p"
+          : "preserve-source-when-practical",
       maxOutputBytes,
     });
     staged.status = "compressing";
     staged.compressionProgress = 0;
-    setVideoPreuploadState(createVideoPreuploadState({
-      status: "compressing",
-      progress: 0,
-      compressionProgress: 0,
-      originalSize: file.size,
-      uploadSize: file.size,
-      encodingMs: 0,
-      compressed: false,
-      reason: "Optimizing this video before upload to reduce mobile data transfer.",
-    }));
+    if (isPublishingRef.current) setLaunchStage("compressing");
+    setVideoPreuploadState(
+      createVideoPreuploadState({
+        status: "compressing",
+        progress: 0,
+        compressionProgress: 0,
+        originalSize: file.size,
+        uploadSize: file.size,
+        encodingMs: 0,
+        compressed: false,
+        reason:
+          "Optimizing this video before upload to reduce mobile data transfer.",
+      }),
+    );
     if (isPublishingRef.current) {
       setNotice("Optimizing video for faster upload… 0%");
     }
@@ -1100,16 +1220,19 @@ function Create() {
         staged,
         (progress) => {
           staged.compressionProgress = progress;
-          setVideoPreuploadState(createVideoPreuploadState({
-            status: "compressing",
-            progress: 0,
-            compressionProgress: progress,
-            originalSize: file.size,
-            uploadSize: file.size,
-            encodingMs: Math.round(performance.now() - compressionStartedAt),
-            compressed: false,
-            reason: "Optimizing this video before upload to reduce mobile data transfer.",
-          }));
+          setVideoPreuploadState(
+            createVideoPreuploadState({
+              status: "compressing",
+              progress: 0,
+              compressionProgress: progress,
+              originalSize: file.size,
+              uploadSize: file.size,
+              encodingMs: Math.round(performance.now() - compressionStartedAt),
+              compressed: false,
+              reason:
+                "Optimizing this video before upload to reduce mobile data transfer.",
+            }),
+          );
           if (isPublishingRef.current) {
             setNotice(`Optimizing video for faster upload… ${progress}%`);
           }
@@ -1120,16 +1243,24 @@ function Create() {
       }
 
       const optimizedFile = result.file;
-      const savingsPercent = Number((((file.size - optimizedFile.size) / file.size) * 100).toFixed(1));
-      if (optimizedFile.size >= file.size * 0.90) {
-        throw new Error("Optimization did not reduce this file enough to justify the extra processing time.");
+      const savingsPercent = Number(
+        (((file.size - optimizedFile.size) / file.size) * 100).toFixed(1),
+      );
+      if (optimizedFile.size >= file.size * 0.9) {
+        throw new Error(
+          "Optimization did not reduce this file enough to justify the extra processing time.",
+        );
       }
       if (optimizedFile.size > maxOutputBytes) {
-        throw new Error("The optimized video still exceeds the configured Cloudinary upload limit.");
+        throw new Error(
+          "The optimized video still exceeds the configured Cloudinary upload limit.",
+        );
       }
 
       staged.uploadFile = optimizedFile;
-      staged.encodingMs = result.elapsedMs || Math.round(performance.now() - compressionStartedAt);
+      staged.encodingMs =
+        result.elapsedMs ||
+        Math.round(performance.now() - compressionStartedAt);
       staged.compressionResult = {
         file: optimizedFile,
         compressed: true,
@@ -1151,24 +1282,28 @@ function Create() {
         encodingPasses: result.encodingPasses,
         hardwareAccelerationPreference: result.hardwareAccelerationPreference,
         savingsPercent,
-        outputDimensions: result.outputWidth && result.outputHeight
-          ? `${result.outputWidth}x${result.outputHeight}`
-          : "source dimensions retained by encoder",
+        outputDimensions:
+          result.outputWidth && result.outputHeight
+            ? `${result.outputWidth}x${result.outputHeight}`
+            : "source dimensions retained by encoder",
         sourceFrameRate: result.sourceFrameRate,
         outputFrameRate: result.outputFrameRate,
         dimensionsReduced: result.dimensionsReduced,
       });
-      setVideoPreuploadState(createVideoPreuploadState({
-        status: "uploading",
-        progress: 0,
-        compressionProgress: 100,
-        originalSize: file.size,
-        uploadSize: optimizedFile.size,
-        encodingMs: staged.encodingMs,
-        compressed: true,
-        savingsPercent,
-        reason: staged.compressionResult.reason,
-      }));
+      if (isPublishingRef.current) setLaunchStage("uploading");
+      setVideoPreuploadState(
+        createVideoPreuploadState({
+          status: "uploading",
+          progress: 0,
+          compressionProgress: 100,
+          originalSize: file.size,
+          uploadSize: optimizedFile.size,
+          encodingMs: staged.encodingMs,
+          compressed: true,
+          savingsPercent,
+          reason: staged.compressionResult.reason,
+        }),
+      );
       return staged.compressionResult;
     } catch (error) {
       if (staged.cancelled || error?.message === "UPLOAD_CANCELLED") {
@@ -1180,13 +1315,19 @@ function Create() {
       // the exact limit after compression fails, because provider-side size
       // accounting can differ and the upload may be rejected.
       if (file.size <= maxOutputBytes) {
-        console.warn("Spotli adaptive compression skipped; uploading original instead", {
-          fileName: file.name,
-          originalSizeBytes: file.size,
-          reason: error?.message || String(error),
-        });
+        console.warn(
+          "Spotli adaptive compression skipped; uploading original instead",
+          {
+            fileName: file.name,
+            originalSizeBytes: file.size,
+            reason: error?.message || String(error),
+          },
+        );
         staged.uploadFile = file;
-        staged.encodingMs = Math.round(performance.now() - compressionStartedAt);
+        if (isPublishingRef.current) setLaunchStage("uploading");
+        staged.encodingMs = Math.round(
+          performance.now() - compressionStartedAt,
+        );
         staged.compressionResult = {
           file,
           compressed: false,
@@ -1195,17 +1336,19 @@ function Create() {
           compressedSize: file.size,
           savingsPercent: 0,
         };
-        setVideoPreuploadState(createVideoPreuploadState({
-          status: "uploading",
-          progress: 0,
-          compressionProgress: 100,
-          originalSize: file.size,
-          uploadSize: file.size,
-          encodingMs: staged.encodingMs,
-          compressed: false,
-          savingsPercent: 0,
-          reason: staged.compressionResult.reason,
-        }));
+        setVideoPreuploadState(
+          createVideoPreuploadState({
+            status: "uploading",
+            progress: 0,
+            compressionProgress: 100,
+            originalSize: file.size,
+            uploadSize: file.size,
+            encodingMs: staged.encodingMs,
+            compressed: false,
+            savingsPercent: 0,
+            reason: staged.compressionResult.reason,
+          }),
+        );
         return staged.compressionResult;
       }
 
@@ -1228,7 +1371,11 @@ function Create() {
       if (existing.status === "ready" && existing.asset) {
         return Promise.resolve(existing.asset);
       }
-      if (["compressing", "uploading", "confirming"].includes(existing.status) && existing.promise) return existing.promise;
+      if (
+        ["compressing", "uploading", "confirming"].includes(existing.status) &&
+        existing.promise
+      )
+        return existing.promise;
     }
 
     if (existing) cancelStagedVideoUpload({ silent: true });
@@ -1292,7 +1439,8 @@ function Create() {
       const loadedBytes = uploadFile.size * Math.min(1, staged.progress / 100);
       const elapsedSeconds = (now - staged.lastSampleAt) / 1000;
       if (elapsedSeconds >= 0.6) {
-        const sampleSpeed = Math.max(0, loadedBytes - staged.lastSampleBytes) / elapsedSeconds;
+        const sampleSpeed =
+          Math.max(0, loadedBytes - staged.lastSampleBytes) / elapsedSeconds;
         if (sampleSpeed > 0) {
           staged.speedBytesPerSecond = staged.speedBytesPerSecond
             ? staged.speedBytesPerSecond * 0.7 + sampleSpeed * 0.3
@@ -1312,7 +1460,8 @@ function Create() {
           speedBytesPerSecond: staged.speedBytesPerSecond,
           secondsRemaining:
             staged.speedBytesPerSecond > 0
-              ? Math.max(0, uploadFile.size - loadedBytes) / staged.speedBytesPerSecond
+              ? Math.max(0, uploadFile.size - loadedBytes) /
+                staged.speedBytesPerSecond
               : Number.NaN,
           encodingMs: staged.encodingMs,
           uploadMs: staged.uploadMs,
@@ -1325,6 +1474,7 @@ function Create() {
       );
 
       if (isPublishingRef.current) {
+        setLaunchStage("uploading");
         setUploadProgress(Math.round(staged.progress));
         setNotice(
           staged.progress >= 99.9
@@ -1346,14 +1496,23 @@ function Create() {
         const uploadFile = staged.uploadFile || file;
         // uploadToCloudinary starts transfer timing after the signing request
         // returns, so signature latency is not counted as Cloudinary transfer.
-        const asset = await uploadToCloudinary(uploadFile, "video", reportProgress, staged);
-        staged.uploadMs = performance.now() - (staged.transferStartedAt || startedAt);
+        const asset = await uploadToCloudinary(
+          uploadFile,
+          "video",
+          reportProgress,
+          staged,
+        );
+        staged.uploadMs =
+          performance.now() - (staged.transferStartedAt || startedAt);
         staged.transferStartedAt = null;
 
         if (staged.cancelled || videoPreuploadRef.current !== staged) {
           if (asset?.public_id) {
             void api.posts
-              .discardUpload({ publicId: asset.public_id, resourceType: "video" })
+              .discardUpload({
+                publicId: asset.public_id,
+                resourceType: "video",
+              })
               .catch(() => {});
           }
           throw new Error("UPLOAD_CANCELLED");
@@ -1378,7 +1537,8 @@ function Create() {
             savingsPercent: staged.compressionResult.savingsPercent,
             outputWidth: staged.compressionResult.outputWidth || null,
             outputHeight: staged.compressionResult.outputHeight || null,
-            dimensionsReduced: staged.compressionResult.dimensionsReduced || false,
+            dimensionsReduced:
+              staged.compressionResult.dimensionsReduced || false,
             optimizationQueued: false,
           }),
         );
@@ -1403,8 +1563,12 @@ function Create() {
             status: "error",
             progress: 0,
             compressionProgress: 100,
-            error: error?.message || error?.error?.message || "Cloudinary upload failed.",
-            reason: "The direct Cloudinary upload did not finish. Your video was not published; retry after checking the error.",
+            error:
+              error?.message ||
+              error?.error?.message ||
+              "Cloudinary upload failed.",
+            reason:
+              "The direct Cloudinary upload did not finish. Your video was not published; retry after checking the error.",
             speedBytesPerSecond: staged.speedBytesPerSecond,
             secondsRemaining: Number.NaN,
             encodingMs: staged.encodingMs,
@@ -1439,7 +1603,7 @@ function Create() {
       postType,
       mediaCount: media.length,
       originalVideoSizeBytes:
-        postType === "video" ? media[0]?.file?.size ?? null : null,
+        postType === "video" ? (media[0]?.file?.size ?? null) : null,
     });
 
     if (postType === "text" && !caption.trim()) {
@@ -1473,14 +1637,18 @@ function Create() {
       postType === "video" &&
       media.some((item) => item.file.size > MAX_RAW_VIDEO_SIZE)
     ) {
-      setNotice(`Source videos must be ${formatFileSize(MAX_RAW_VIDEO_SIZE)} or smaller. Try a shorter clip.`);
+      setNotice(
+        `Source videos must be ${formatFileSize(MAX_RAW_VIDEO_SIZE)} or smaller. Try a shorter clip.`,
+      );
       return;
     }
     if (
       postType === "photo" &&
       media.some((item) => item.file.size > MAX_IMAGE_SIZE)
     ) {
-      setNotice(`Images must be ${formatFileSize(MAX_IMAGE_SIZE)} or smaller in this configuration.`);
+      setNotice(
+        `Images must be ${formatFileSize(MAX_IMAGE_SIZE)} or smaller in this configuration.`,
+      );
       return;
     }
 
@@ -1498,9 +1666,15 @@ function Create() {
     isPublishingRef.current = true;
     cancelUploadRequestedRef.current = false;
     setUploadProgress(0);
-    setNotice("");
+    setNotice("Preparing your post…");
+    setLaunchError("");
+    setLaunchStage(postType === "video" ? "compressing" : "uploading");
 
     try {
+      if (cancelUploadRequestedRef.current) {
+        throw new Error("UPLOAD_CANCELLED");
+      }
+
       const resourceType = postType === "photo" ? "image" : "video";
       let mediaAssets = [];
       // Upload media bytes directly from the browser to Cloudinary. The backend
@@ -1570,10 +1744,14 @@ function Create() {
           staged = videoPreuploadRef.current;
         }
         if (!staged?.promise) {
-          throw new Error("Unable to start the direct Cloudinary upload. Please try again.");
+          throw new Error(
+            "Unable to start the direct Cloudinary upload. Please try again.",
+          );
         }
 
-        setNotice(`Uploading video directly to Cloudinary… ${Math.round(staged.progress || 0)}%`);
+        setNotice(
+          `Uploading video directly to Cloudinary… ${Math.round(staged.progress || 0)}%`,
+        );
         mediaAssets.push(
           staged.status === "ready" && staged.asset
             ? staged.asset
@@ -1616,6 +1794,7 @@ function Create() {
       if (cancelUploadRequestedRef.current) throw new Error("UPLOAD_CANCELLED");
 
       setUploadProgress(0);
+      setLaunchStage("publishing");
       setNotice("Publishing your post…");
       const postCreationStartedAt = performance.now();
       console.info("[Spotli publish] post creation started", {
@@ -1631,7 +1810,7 @@ function Create() {
       try {
         result = await api.posts.createWithAssets({
           type: postType,
-          caption,
+          caption: caption.trim(),
           topics: selectedTopics,
           mediaAssets,
           ...(thumbnailAsset ? { thumbnailAsset } : {}),
@@ -1697,19 +1876,9 @@ function Create() {
       }
 
       setIsDraftSaved(false);
-      clearMedia();
-      clearCustomThumbnail();
-      setCaption("");
-      setSelectedTopics([]);
-
-      navigate("/home", {
-        replace: true,
-        state: {
-          refreshFeed: true,
-          postPublished: true,
-          message: result.message || "Post published successfully.",
-        },
-      });
+      setPublishedMessage(result.message || "Your spot is now live on Spotli.");
+      setLaunchError("");
+      setLaunchStage("success");
     } catch (error) {
       // Stop any other concurrent photo uploads if one request fails or is cancelled.
       activeUploadRequestsRef.current.forEach((request) => request.abort());
@@ -1717,10 +1886,15 @@ function Create() {
         cancelUploadRequestedRef.current ||
         error.message === "UPLOAD_CANCELLED"
       ) {
-        setNotice("Upload cancelled. Your post was not published.");
+        const message = "Launch cancelled. Your post was not published.";
+        setNotice(message);
+        setLaunchError(message);
       } else {
-        setNotice(error.message || "Unable to publish your post.");
+        const message = error.message || "Unable to publish your post.";
+        setNotice(message);
+        setLaunchError(message);
       }
+      setLaunchStage("error");
     } finally {
       activeUploadRequestsRef.current.clear();
       cancelUploadRequestedRef.current = false;
@@ -1730,7 +1904,9 @@ function Create() {
   }
 
   function cancelUpload() {
-    if (!isPublishing || !ACTIVE_UPLOAD_NOTICE_PATTERN.test(notice)) {
+    // The post-creation request is not abortable here; once the Publishing
+    // stage starts, avoid presenting a cancel action that could mislead users.
+    if (!isPublishing || launchStage === "publishing") {
       return;
     }
 
@@ -1757,6 +1933,28 @@ function Create() {
     currentUser?.avatar ||
     currentUser?.profilePicture ||
     currentUser?.profileImage;
+
+  // Captions are optional for video/photo posts. Text-only posts still need
+  // text because the caption is the post content in that mode.
+  const canLaunch =
+    postType === "text" ? Boolean(caption.trim()) : media.length > 0;
+
+  const launchStageIndex =
+    { compressing: 0, uploading: 1, publishing: 2, success: 3 }[launchStage] ??
+    -1;
+  const compressionProgress =
+    postType !== "video"
+      ? 100
+      : launchStage === "success" ||
+          launchStageIndex > 0 ||
+          videoPreuploadState.status === "ready"
+        ? 100
+        : Math.round(videoPreuploadState.compressionProgress || 0);
+  const cloudUploadProgress =
+    postType === "video" &&
+    !(customThumbnail && /Uploading thumbnail/i.test(notice))
+      ? Math.round(videoPreuploadState.progress || 0)
+      : Math.round(uploadProgress || 0);
 
   function renderPreviewCard() {
     const hasText = Boolean(caption.trim());
@@ -2053,9 +2251,11 @@ function Create() {
                                   ? `Cloudinary upload failed: ${videoPreuploadState.error || "Try again"}. Your post has not been published.`
                                   : videoPreuploadState.status === "compressing"
                                     ? `Optimizing video for faster upload… ${Math.round(videoPreuploadState.compressionProgress)}%`
-                                    : videoPreuploadState.status === "cloudinary"
+                                    : videoPreuploadState.status ===
+                                        "cloudinary"
                                       ? `Uploading directly to Cloudinary… ${Math.round(videoPreuploadState.progress)}%${videoPreuploadState.speedBytesPerSecond > 0 ? ` · ${formatFileSize(videoPreuploadState.speedBytesPerSecond)}/s` : ""}`
-                                      : videoPreuploadState.status === "confirming"
+                                      : videoPreuploadState.status ===
+                                          "confirming"
                                         ? "Waiting for Cloudinary upload confirmation…"
                                         : `Uploading ${videoPreuploadState.compressed ? "optimized" : "original"} video directly to Cloudinary… ${Math.round(videoPreuploadState.progress)}%${videoPreuploadState.speedBytesPerSecond > 0 ? ` · ${formatFileSize(videoPreuploadState.speedBytesPerSecond)}/s` : ""}${Number.isFinite(videoPreuploadState.secondsRemaining) ? ` · ${formatTimeRemaining(videoPreuploadState.secondsRemaining)}` : ""}`}
                             </p>
@@ -2309,7 +2509,16 @@ function Create() {
                 htmlFor="post-caption"
                 className="mb-2 block text-sm font-semibold"
               >
-                {postType === "text" ? "Your post" : "Caption"}
+                {postType === "text" ? (
+                  "Your post"
+                ) : (
+                  <>
+                    Caption{" "}
+                    <span className="font-normal text-gray-500">
+                      (optional)
+                    </span>
+                  </>
+                )}
               </label>
 
               <MentionField
@@ -2326,7 +2535,7 @@ function Create() {
                 placeholder={
                   postType === "text"
                     ? "Share your thoughts with the community..."
-                    : "Write a caption..."
+                    : "Write a caption (optional)..."
                 }
                 className="w-full resize-y rounded-xl border border-gray-200 bg-white p-4 text-sm outline-none transition placeholder:text-gray-600 focus:border-gray-400"
               />
@@ -2462,40 +2671,33 @@ function Create() {
             {/* Sticky form action bar */}
 
             <div className="sticky bottom-0 z-30 -mx-3 mt-7 border-t border-gray-200 bg-white/95 px-3 py-3 pb-[calc(0.75rem+env(safe-area-inset-bottom))] shadow-[0_-8px_24px_rgba(0,0,0,0.06)] backdrop-blur sm:-mx-5 sm:px-5 lg:-mx-6 lg:px-6">
-              {!(
-                (postType === "text" && caption.trim()) ||
-                (postType !== "text" && media.length > 0)
-              ) && (
-                <p className="mb-2 text-xs font-medium text-gray-600">
-                  {postType === "text"
+              <p className="mb-2 text-xs font-medium text-gray-600">
+                {canLaunch
+                  ? "Ready to launch? Your caption is optional."
+                  : postType === "text"
                     ? "Add text to enable publishing."
-                    : `Add ${postType === "video" ? "a video" : "at least one photo"} to enable publishing.`}
-                </p>
-              )}
+                    : postType === "video"
+                      ? "Add a video to start your launch."
+                      : "Add at least one photo to start your launch."}
+              </p>
 
               <div className="flex flex-col gap-2 sm:flex-row">
                 <button
                   type="button"
                   onClick={publishPost}
-                  disabled={
-                    isPublishing ||
-                    (postType === "text" ? !caption.trim() : media.length === 0)
-                  }
+                  disabled={isPublishing || !canLaunch}
                   className="flex min-h-12 flex-1 items-center justify-center gap-2 rounded-full bg-black px-5 py-3 text-sm font-semibold text-white transition hover:bg-gray-800 disabled:cursor-not-allowed disabled:opacity-45"
                 >
                   {isPublishing ? (
                     <LoaderCircle size={18} className="animate-spin" />
                   ) : (
-                    <UploadCloud size={18} />
+                    <ArrowUpRight
+                      size={18}
+                      className={canLaunch ? "text-[#FF2D4A]" : "text-gray-500"}
+                    />
                   )}
 
-                  {isPublishing
-                    ? ACTIVE_UPLOAD_NOTICE_PATTERN.test(notice)
-                      ? `Uploading… ${uploadProgress}%`
-                      : notice === "Cancelling upload…"
-                        ? "Cancelling…"
-                        : "Publishing…"
-                    : "Publish post"}
+                  {isPublishing ? "Launching…" : "LAUNCH SPOT"}
                 </button>
 
                 {isPublishing && ACTIVE_UPLOAD_NOTICE_PATTERN.test(notice) && (
@@ -2597,6 +2799,324 @@ function Create() {
           </aside>
         </div>
       </main>
+
+      {launchStage !== "idle" && (
+        <div
+          className="fixed inset-0 z-[100] flex items-center justify-center overflow-y-auto bg-black/90 p-3 backdrop-blur-md sm:p-5"
+          role="presentation"
+        >
+          <section
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="spotli-launch-title"
+            className="relative flex w-full max-w-[620px] flex-col overflow-hidden rounded-[28px] border border-white/15 bg-[#090909] text-white shadow-[0_28px_100px_rgba(0,0,0,0.78)]"
+            style={{
+              height: "min(91dvh, 760px)",
+              minHeight: "min(510px, 91dvh)",
+            }}
+          >
+            <style>{`
+              @keyframes spotli-launch-progress-indeterminate {
+                0% { transform: translateX(-120%); }
+                100% { transform: translateX(340%); }
+              }
+              @keyframes spotli-launch-orbit-pulse {
+                0%, 100% { transform: scale(.94); opacity: .48; }
+                50% { transform: scale(1.06); opacity: .92; }
+              }
+              @keyframes spotli-launch-light-sweep {
+                0% { transform: translateX(-120%) scaleX(.45); opacity: 0; }
+                18% { opacity: .8; }
+                82% { opacity: .8; }
+                100% { transform: translateX(220%) scaleX(1.05); opacity: 0; }
+              }
+              .spotli-launch-orbit {
+                animation: spotli-launch-orbit-pulse 3.2s ease-in-out infinite;
+              }
+              .spotli-launch-light-sweep {
+                animation: spotli-launch-light-sweep 2.8s ease-in-out infinite;
+              }
+              @media (prefers-reduced-motion: reduce) {
+                .spotli-launch-orbit, .spotli-launch-light-sweep,
+                .spotli-launch-progress-indeterminate {
+                  animation-duration: .01ms !important;
+                  animation-iteration-count: 1 !important;
+                }
+              }
+            `}</style>
+
+            <div className="flex h-full min-h-0 flex-col">
+              <div className="relative flex h-[34%] min-h-[170px] w-full shrink-0 items-center justify-center overflow-hidden bg-[#080808]">
+                <div
+                  aria-hidden="true"
+                  className="absolute inset-0"
+                  style={{
+                    background:
+                      "radial-gradient(ellipse at 50% 70%, rgba(255,45,74,.19) 0%, transparent 44%), radial-gradient(ellipse at 18% 20%, rgba(255,45,74,.10) 0%, transparent 42%), linear-gradient(145deg, #080808 0%, #13090c 56%, #070707 100%)",
+                  }}
+                />
+                <div
+                  aria-hidden="true"
+                  className="spotli-launch-orbit absolute left-1/2 top-[56%] h-44 w-44 -translate-x-1/2 -translate-y-1/2 rounded-full border border-[#FF2D4A]/25 shadow-[0_0_70px_rgba(255,45,74,.12)] sm:h-52 sm:w-52"
+                />
+                <div
+                  aria-hidden="true"
+                  className="absolute left-1/2 top-[56%] h-28 w-28 -translate-x-1/2 -translate-y-1/2 rounded-full border border-white/[0.06] bg-[radial-gradient(circle,rgba(255,45,74,.12),rgba(255,45,74,.025)_58%,transparent_72%)] sm:h-36 sm:w-36"
+                />
+                <div className="absolute inset-x-0 top-0 z-20 flex items-center justify-center px-5 pt-4 sm:pt-5">
+                  <div className="text-[18px] font-black tracking-[-0.06em] text-white sm:text-xl">
+                    Spotli<span className="text-[#FF2D4A]">.</span>
+                  </div>
+                </div>
+                {launchStage !== "success" && (
+                  <button
+                    type="button"
+                    aria-label="Cancel launch"
+                    disabled={launchStage === "publishing"}
+                    onClick={cancelUpload}
+                    className="absolute right-4 top-3 z-30 flex h-9 w-9 items-center justify-center rounded-full border border-white/15 bg-black/45 text-white/90 backdrop-blur transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-35 sm:right-5 sm:top-4 sm:h-10 sm:w-10"
+                    title={
+                      launchStage === "publishing"
+                        ? "Publishing is being finalized"
+                        : "Cancel launch"
+                    }
+                  >
+                    <X size={19} />
+                  </button>
+                )}
+                <div
+                  aria-hidden="true"
+                  className="absolute bottom-[24%] left-0 right-0 h-px overflow-hidden bg-white/[0.08]"
+                >
+                  <span className="spotli-launch-light-sweep absolute inset-y-0 left-0 w-1/3 bg-gradient-to-r from-transparent via-[#FF2D4A] to-transparent shadow-[0_0_12px_2px_rgba(255,45,74,.45)]" />
+                </div>
+                <p className="absolute bottom-[10%] text-[10px] font-semibold tracking-[0.28em] text-white/40">
+                  SPOTLI PUBLISHING
+                </p>
+              </div>
+
+              {launchStage === "success" ? (
+                <div className="relative flex min-h-0 flex-1 flex-col items-center justify-center overflow-hidden px-6 pb-8 pt-3 text-center sm:px-10">
+                  <div className="mb-5 flex h-16 w-16 items-center justify-center rounded-full border border-[#FF2D4A]/35 bg-[#FF2D4A]/12 text-[#FF536D] shadow-[0_0_36px_rgba(255,45,74,.18)]">
+                    <CheckCircle2 size={34} strokeWidth={1.8} />
+                  </div>
+                  <p className="text-[10px] font-bold tracking-[0.28em] text-[#FF8290]">
+                    POST PUBLISHED
+                  </p>
+                  <h2
+                    id="spotli-launch-title"
+                    className="mt-3 text-4xl font-black tracking-[-0.045em] sm:text-5xl"
+                  >
+                    SPOTTED<span className="text-[#FF2D4A]">!</span>
+                  </h2>
+                  <p className="mt-3 max-w-sm text-sm leading-6 text-white/70">
+                    {publishedMessage}
+                  </p>
+                  <p className="mt-6 text-xs font-medium text-white/45">
+                    Taking you to your homepage...
+                  </p>
+                </div>
+              ) : launchStage === "error" ? (
+                <div className="relative flex min-h-0 flex-1 flex-col items-center justify-center overflow-hidden px-6 pb-8 pt-3 text-center sm:px-10">
+                  <div className="mb-5 flex h-16 w-16 items-center justify-center rounded-full border border-[#FF2D4A]/30 bg-[#FF2D4A]/10 text-[#FF536D]">
+                    <X size={30} strokeWidth={1.8} />
+                  </div>
+                  <p className="text-[10px] font-bold tracking-[0.25em] text-[#FF8290]">
+                    PUBLISHING FAILED
+                  </p>
+                  <h2
+                    id="spotli-launch-title"
+                    className="mt-3 text-2xl font-extrabold tracking-tight sm:text-3xl"
+                  >
+                    We couldn't publish your post.
+                  </h2>
+                  <p className="mt-3 max-w-md text-sm leading-6 text-white/65">
+                    {launchError ||
+                      "Your media is still here. You can return to editing and try again."}
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setLaunchStage("idle");
+                      setLaunchError("");
+                    }}
+                    className="mt-7 flex min-h-12 w-full max-w-xs items-center justify-center rounded-full border border-white/20 bg-white/[0.05] px-5 py-3 text-sm font-semibold text-white transition hover:bg-white/10"
+                  >
+                    Back to editing
+                  </button>
+                </div>
+              ) : (
+                <>
+                  <div className="shrink-0 px-5 pb-2 pt-3 text-center sm:px-8 sm:pt-4">
+                    <h2
+                      id="spotli-launch-title"
+                      className="text-[clamp(1.35rem,3.2vw,2rem)] font-extrabold leading-tight tracking-[-0.04em]"
+                    >
+                      Publishing{" "}
+                      <span className="text-[#FF2D4A]">your spot...</span>
+                    </h2>
+                    <p className="mt-1.5 text-xs leading-5 text-white/65 sm:text-sm">
+                      Your post is being prepared and sent to the feed.
+                    </p>
+                  </div>
+
+                  <div className="grid min-h-0 flex-1 grid-rows-3 px-5 pb-4 sm:px-8 sm:pb-6">
+                    <LaunchProgressStep
+                      kind="prepare"
+                      title={
+                        postType === "video"
+                          ? "Your video is going on a digital diet..."
+                          : "Your photo is looking camera-ready..."
+                      }
+                      description={
+                        postType === "video"
+                          ? "Less baggage, same beauty."
+                          : "No video compression needed. Looking good already."
+                      }
+                      status={
+                        postType !== "video" ||
+                        launchStageIndex > 0 ||
+                        (compressionProgress >= 100 &&
+                          videoPreuploadState.status !== "compressing")
+                          ? "done"
+                          : launchStage === "compressing" ||
+                              videoPreuploadState.status === "compressing"
+                            ? "active"
+                            : "pending"
+                      }
+                      progress={compressionProgress}
+                    />
+                    <LaunchProgressStep
+                      kind="upload"
+                      title="Houston, we have an upload!"
+                      description={
+                        postType === "video"
+                          ? "Your video is on its way to the cloud."
+                          : "Your photo is on its way to the cloud."
+                      }
+                      status={
+                        launchStageIndex > 1 ||
+                        videoPreuploadState.status === "ready"
+                          ? "done"
+                          : launchStage === "uploading" ||
+                              ["uploading", "confirming"].includes(
+                                videoPreuploadState.status,
+                              )
+                            ? "active"
+                            : "pending"
+                      }
+                      progress={cloudUploadProgress}
+                    />
+                    <LaunchProgressStep
+                      kind="publish"
+                      title="Make way! We've got a celebrity!"
+                      description="Your spot is getting ready for its big debut."
+                      status={
+                        launchStage === "publishing" ? "active" : "pending"
+                      }
+                      indeterminate={launchStage === "publishing"}
+                    />
+                  </div>
+                </>
+              )}
+            </div>
+          </section>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function LaunchProgressStep({
+  kind,
+  title,
+  description,
+  status,
+  progress = 0,
+  indeterminate = false,
+}) {
+  const isDone = status === "done";
+  const isActive = status === "active";
+  const visibleProgress = isDone
+    ? 100
+    : isActive
+      ? Math.max(0, Math.min(100, Math.round(progress || 0)))
+      : 0;
+
+  return (
+    <div className="flex min-h-0 flex-col justify-center border-b border-white/[0.09] py-2 last:border-b-0 sm:py-3">
+      <div className="flex min-w-0 items-center gap-3 sm:gap-4">
+        <div
+          className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-full border sm:h-12 sm:w-12 ${
+            isDone
+              ? "border-[#FF2D4A]/50 bg-[#FF2D4A] text-white shadow-[0_0_24px_rgba(255,45,74,0.22)]"
+              : isActive
+                ? "border-white/25 bg-white/[0.06] text-white"
+                : "border-white/15 bg-white/[0.035] text-white/55"
+          }`}
+        >
+          {isDone ? (
+            <CheckCircle2 size={23} strokeWidth={2.5} />
+          ) : kind === "upload" ? (
+            <UploadCloud size={23} strokeWidth={1.8} />
+          ) : kind === "publish" ? (
+            <LoaderCircle
+              size={22}
+              strokeWidth={1.8}
+              className={isActive ? "animate-spin" : ""}
+            />
+          ) : (
+            <LoaderCircle
+              size={22}
+              strokeWidth={1.8}
+              className={isActive ? "animate-spin" : "opacity-55"}
+            />
+          )}
+        </div>
+
+        <div className="min-w-0 flex-1">
+          <div className="flex items-start justify-between gap-2 sm:gap-4">
+            <div className="min-w-0">
+              <h3
+                className={`text-[12px] font-bold leading-snug sm:text-[15px] ${isActive ? "text-white" : isDone ? "text-white/90" : "text-white/65"}`}
+              >
+                {title}
+              </h3>
+              <p className="mt-1 text-[10px] leading-snug text-white/55 sm:text-[12px]">
+                {description}
+              </p>
+            </div>
+            <span
+              className={`shrink-0 pt-0.5 text-[13px] font-extrabold tabular-nums sm:text-[16px] ${isDone ? "text-white" : isActive ? "text-[#FF8290]" : "text-white/65"}`}
+            >
+              {isDone
+                ? "100%"
+                : isActive
+                  ? indeterminate
+                    ? "..."
+                    : `${visibleProgress}%`
+                  : "0%"}
+            </span>
+          </div>
+        </div>
+      </div>
+
+      <div className="ml-[52px] mt-2 h-[6px] overflow-hidden rounded-full bg-white/[0.17] sm:ml-16 sm:mt-2.5 sm:h-[8px]">
+        {indeterminate && isActive ? (
+          <div
+            className="h-full w-1/3 rounded-full bg-gradient-to-r from-[#FF2D4A] to-[#ff7a67]"
+            style={{
+              animation:
+                "spotli-launch-progress-indeterminate 1.2s ease-in-out infinite",
+            }}
+          />
+        ) : (
+          <div
+            className="h-full rounded-full bg-gradient-to-r from-[#FF2D4A] to-[#ff6478] transition-[width] duration-300"
+            style={{ width: `${visibleProgress}%` }}
+          />
+        )}
+      </div>
     </div>
   );
 }

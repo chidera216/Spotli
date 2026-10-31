@@ -256,8 +256,19 @@ function getOptimizedPlaybackUrl(value) {
   const networkProfile = getNetworkPlaybackProfile();
   // For 16:9 portrait/landscape clips, 640px on the long edge gives a
   // 360px short edge; 1280px on the long edge gives a 720px short edge.
-  const maxDimension = networkProfile.dataSaver ? 640 : 1280;
-  const maxBitrate = networkProfile.dataSaver ? "300k" : "800k";
+  // Keep progressive fallback aligned with the lower-data mobile Auto profile:
+  // 360p/300 kbps for Data Saver, 480p/500 kbps for ordinary touch devices,
+  // and the existing 720p/800 kbps desktop fallback.
+  const maxDimension = networkProfile.dataSaver
+    ? 640
+    : networkProfile.touchDevice
+      ? 854
+      : 1280;
+  const maxBitrate = networkProfile.dataSaver
+    ? "300k"
+    : networkProfile.touchDevice
+      ? "500k"
+      : "800k";
   const transformation = `br_${maxBitrate},c_limit,f_mp4,h_${maxDimension},q_auto:eco,vc_h264,w_${maxDimension}`;
   const inputAssetPath = `${parts.assetPathWithoutExtension}.mp4`;
   return `${parts.base}${transformation}/${inputAssetPath}`;
@@ -826,12 +837,13 @@ function getNetworkPlaybackProfile() {
   // Low-data mobile starts with a deliberately conservative bandwidth estimate.
   // Network Information's downlink is only an estimate, so use about 30% of it
   // for the first-fragment estimate rather than treating the full value as safe.
-  // Data Saver stays within Cloudinary's 360p full_hd rendition. That profile
-  // does not contain a true 480p 16:9 variant; 360p is the next reliable tier.
+  // Auto is deliberately data-conscious on touch devices: 360p in Data Saver
+  // and up to 480p in normal mobile/tablet mode. Desktop Auto keeps its existing
+  // best-available behaviour. Manual quality selections remain user-controlled.
   const startupHeight = dataSaver
     ? 360
     : touchDevice
-      ? 720
+      ? 480
       : MIN_AUTOMATIC_QUALITY_HEIGHT;
   let defaultBandwidthEstimate = dataSaver
     ? 180_000
@@ -859,8 +871,8 @@ function getNetworkPlaybackProfile() {
   }
 
   // On touch devices, keep the opening rendition within a low-data budget.
-  // HLS.js then adapts using measured fragment throughput, but Auto is capped
-  // at 720p; the user's manual 1030p option remains available and uncapped.
+  // Auto is capped at 360p/480p and then adapts using measured throughput;
+  // manual quality choices remain separate from this Auto profile.
   const startupBandwidthBudget = dataSaver
     ? hasDownlink
       ? Math.max(140_000, Math.min(320_000, downlink * 180_000))
@@ -918,11 +930,10 @@ function selectSpotliAutoStartupVariant(
   // If no rendition fits the active cap, use the best available source level
   // rather than rejecting the stream. The same rule is used by the active player.
   const selectable = autoHeightEligible.length ? autoHeightEligible : usable;
-  // Keep Auto at the best rendition permitted by the existing playback cap.
-  // Do not choose a lower starting rendition from a conservative bandwidth
-  // estimate: that estimate is volatile and can make a clear video look soft.
-  // The exact same selection is used by the active player below, so first-segment
-  // prewarming and playback target the same Cloudinary rendition.
+  // Start at the highest rendition inside the mobile Auto cap. The active
+  // player uses this same first rendition for the warm segment, then enables
+  // HLS adaptive bitrate after that segment is buffered. This keeps startup
+  // smooth without forcing every later segment to stay at the highest bitrate.
   return (
     [...selectable].sort(
       (a, b) =>
@@ -1978,8 +1989,9 @@ function attachCloudinaryAdaptiveStream(
     initialQualityKey === "NaN" ? "auto" : initialQualityKey;
   let streamHasPlayed = false;
   let streamLoadStarted = false;
-  // Auto and manual quality both remain fixed to their selected rendition for
-  // this clip; the active profile only determines the allowed maximum height.
+  let autoAbrUnlocked = false;
+  // Auto locks only the opening fragment to the prewarmed rendition, then
+  // returns to ABR within the active profile cap. Manual quality stays locked.
   const savedResumeTime = Number.isFinite(Number(resumeTime))
     ? Math.max(0, Number(resumeTime))
     : 0;
@@ -2459,9 +2471,9 @@ function attachCloudinaryAdaptiveStream(
       if (!available.length) return null;
 
       if (requestedQuality === "auto" || requestedQuality == null) {
-        // Auto respects the current low-data cap. Data Saver uses the 360p
-        // rendition; normal touch playback stays capped at 720p. Manual quality
-        // selections remain available and are not restricted by this Auto cap.
+        // Auto respects the current low-data cap. Data Saver uses 360p and
+        // normal touch playback is capped at 480p. Manual quality selections
+        // remain available and are not restricted by this Auto cap.
         const hasAutoHeightCap =
           networkProfile.dataSaver || networkProfile.touchDevice;
         const autoEligible = hasAutoHeightCap
@@ -2470,8 +2482,8 @@ function attachCloudinaryAdaptiveStream(
             )
           : available;
         const selectable = autoEligible.length ? autoEligible : available;
-        // Auto keeps the best quality allowed by the active profile. The
-        // startup bandwidth estimate is not used to force a lower resolution.
+        // Start at the best rendition allowed by the profile. After the first
+        // fragment is buffered, hls.js adapts within this cap based on throughput.
         return [...selectable].sort(
           (a, b) => b.height - a.height || b.bitrate - a.bitrate,
         )[0];
@@ -2565,19 +2577,15 @@ function attachCloudinaryAdaptiveStream(
         if (!target) return;
 
         if (selectedStreamQuality === "auto") {
-          // Auto means the best rendition allowed by the existing profile, not
-          // automatic quality reduction when a short bandwidth sample changes.
-          // Keep the selected level fixed for this video to preserve picture quality.
+          // Use the prewarmed rendition for startup. Once the first fragment is
+          // buffered, -1 releases HLS.js back to Auto while autoLevelCapping
+          // prevents it from exceeding the current 360p/480p mobile profile.
           hls.startLevel = target.index;
-          hls.loadLevel = target.index;
-          if (streamLoadStarted) {
-            if (video.paused) {
-              if (hls.currentLevel !== target.index) {
-                hls.currentLevel = target.index;
-              }
-            } else if (hls.nextLevel !== target.index) {
-              hls.nextLevel = target.index;
-            }
+          if (streamLoadStarted && autoAbrUnlocked) {
+            hls.loadLevel = -1;
+            hls.nextLevel = -1;
+          } else {
+            hls.loadLevel = target.index;
           }
           return;
         }
@@ -2746,6 +2754,27 @@ function attachCloudinaryAdaptiveStream(
         return;
       }
       firstMainFragmentBuffered = true;
+      if (
+        selectedStreamQuality === "auto" &&
+        !autoAbrUnlocked &&
+        hls &&
+        !cancelled
+      ) {
+        autoAbrUnlocked = true;
+        // Allow adaptive bitrate after the warmed first fragment has buffered.
+        // The cap remains active, so touch Auto cannot climb above 480p.
+        hls.loadLevel = -1;
+        hls.nextLevel = -1;
+        console.info(
+          "[Spotli playback] Auto adaptive bitrate enabled after startup",
+          {
+            playbackId: playbackDiagnosticId,
+            startupRendition: getHlsLevelDiagnostics(frag.level),
+            maxAutoHeight: networkProfile.startupHeight,
+            autoLevelCapping: hls.autoLevelCapping,
+          },
+        );
+      }
       console.info("[Spotli playback] First HLS media segment buffered", {
         playbackId: playbackDiagnosticId,
         elapsedMs: getPlaybackElapsedMs(),
@@ -2788,9 +2817,11 @@ function attachCloudinaryAdaptiveStream(
             playbackId: playbackDiagnosticId,
             elapsedMs: getPlaybackElapsedMs(),
             selectedQuality: selectedStreamQuality,
-            autoMaxHeight: networkProfile.touchDevice ? 720 : null,
+            autoMaxHeight: networkProfile.touchDevice
+              ? networkProfile.startupHeight
+              : null,
             autoLevelCapping: hls.autoLevelCapping,
-            autoQualityLocked: selectedStreamQuality === "auto",
+            autoAdaptiveAfterStartup: selectedStreamQuality === "auto",
             rendition: getHlsLevelDiagnostics(startupLevel.index),
             availableRenditions: availableLevels.map((level) => ({
               index: level.index,
@@ -2801,14 +2832,9 @@ function attachCloudinaryAdaptiveStream(
         );
         hls.startLevel = startupLevel.index;
 
-        if (selectedStreamQuality === "auto") {
-          // Keep Auto on the highest rendition allowed by this profile for the
-          // whole clip. This avoids quality drops after the first fragment and
-          // matches the exact rendition prepared by the feed prewarmer.
-          hls.loadLevel = startupLevel.index;
-        } else {
-          hls.loadLevel = startupLevel.index;
-        }
+        // Lock only the opening fragment to the exact rendition prepared by
+        // the prewarmer. Auto is released to adaptive selection after it buffers.
+        hls.loadLevel = startupLevel.index;
       }
       // Do not wait for any speculative preload here. On slow mobile links,
       // that promise can take several seconds because it fetches a playlist and
@@ -4305,11 +4331,9 @@ function createTabletViewerImplementation() {
           currentFeed.scrollTop - lastFeedScrollTopRef.current;
         const scrollDirection = scrollDelta > 1 ? 1 : scrollDelta < -1 ? -1 : 0;
 
-        // On mobile/tablet, keep media-segment downloads tied to real scroll
-        // intent. Start warming the identified adjacent video immediately when
-        // the feed begins moving, before that card becomes visibly prominent.
-        // Auto selection still observes the existing 360p Data Saver / 720p
-        // mobile caps.
+        // On mobile/tablet, keep media-segment downloads tied to a real swipe
+        // and wait until the target slide is at least 15% visible. Auto uses
+        // 360p in Data Saver and up to 480p on ordinary touch devices.
         if (scrollDirection !== 0) {
           let intentIndex = activeIndexRef.current + scrollDirection;
           let intentPost = posts[intentIndex];
@@ -4346,6 +4370,7 @@ function createTabletViewerImplementation() {
             intentPost &&
             intentElement &&
             intentIndex !== activeIndexRef.current &&
+            visibleRatio >= 0.15 &&
             !isPhotoPost(intentPost) &&
             !scrollIntentPrewarmedPostIdsRef.current.has(intentPostId)
           ) {
@@ -6640,7 +6665,10 @@ function createDesktopViewerImplementation() {
             let intendedEntry = null;
             let intendedCandidateIndex = -1;
             for (const entry of entries) {
-              if (!entry.isIntersecting || entry.intersectionRatio < 0.01)
+              // Playlist warming already happens in the background. Wait until
+              // the user is genuinely entering this slide before downloading
+              // its first media segment; this avoids wasting bytes on overscroll.
+              if (!entry.isIntersecting || entry.intersectionRatio < 0.15)
                 continue;
               const targetId = entry.target.dataset.postId;
               const candidateIndex = viewerPostsRef.current.findIndex(
