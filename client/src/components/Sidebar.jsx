@@ -51,7 +51,11 @@ const creators = [
   },
 ];
 
-function Sidebar({ activePage = "Home", onNavigate = () => {} }) {
+function Sidebar({
+  activePage = "Home",
+  onNavigate = () => {},
+  collapsed = false,
+}) {
   const [notificationUnreadCount, setNotificationUnreadCount] = useState(0);
 
   const refreshNotificationCount = useCallback(async () => {
@@ -88,7 +92,7 @@ function Sidebar({ activePage = "Home", onNavigate = () => {} }) {
 
   return (
     <aside
-      className="fixed inset-y-0 left-0 z-30 w-40 overflow-y-auto border-r border-black/[0.06] bg-white px-3 py-5 scrollbar-none [&::-webkit-scrollbar]:hidden"
+      className={`fixed inset-y-0 left-0 z-30 overflow-y-auto border-r py-5 scrollbar-none transition-[width,padding,background-color] duration-200 [&::-webkit-scrollbar]:hidden ${collapsed ? "w-16 border-white/10 bg-[#0f0f0f] px-1.5 text-white" : "w-40 border-black/[0.06] bg-white px-3 text-black"}`}
       style={{ msOverflowStyle: "none" }}
     >
       <a
@@ -97,12 +101,19 @@ function Sidebar({ activePage = "Home", onNavigate = () => {} }) {
           event.preventDefault();
           onNavigate("Home");
         }}
-        className="mb-8 block px-2 text-[20px] font-black tracking-tight text-black"
+        className={`mb-8 flex h-6 text-[20px] font-black tracking-tight text-black ${collapsed ? "justify-center px-0" : "px-2"}`}
+        aria-label="Spotli home"
       >
-        Spotli<span className="text-black">.</span>
+        {collapsed ? (
+          <span className="sr-only">Spotli.</span>
+        ) : (
+          <>
+            Spotli<span className="text-black">.</span>
+          </>
+        )}
       </a>
 
-      <nav className="space-y-1.5">
+      <nav className={collapsed ? "space-y-2" : "space-y-1.5"}>
         {navigation.map(({ label, icon: Icon, unread, unreadCount }) => {
           const active = activePage === label;
           const displayedUnreadCount =
@@ -113,29 +124,38 @@ function Sidebar({ activePage = "Home", onNavigate = () => {} }) {
               key={label}
               type="button"
               onClick={() => onNavigate(label)}
-              className={`relative flex w-full items-center gap-2 rounded-xl px-2 py-2.5 text-left text-[13px] transition-colors duration-200 ${
-                active
-                  ? "bg-neutral-100 font-semibold text-black"
-                  : "text-neutral-700 hover:bg-neutral-50 hover:text-black"
+              title={collapsed ? label : undefined}
+              className={`relative flex w-full items-center rounded-xl transition-colors duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#FF2D4A] ${
+                collapsed
+                  ? `h-12 justify-center px-1 ${active ? "bg-[#272727] font-semibold text-white" : "text-white/80 hover:bg-[#202020] hover:text-white"}`
+                  : `gap-2 px-2 py-2.5 text-left text-[13px] ${active ? "bg-neutral-100 font-semibold text-black" : "text-neutral-700 hover:bg-neutral-50 hover:text-black"}`
               }`}
             >
               {label === "Notifications" ? (
-                <span className="relative inline-flex h-[17px] w-[17px] flex-none items-center justify-center">
-                  <Icon size={17} strokeWidth={active ? 2.2 : 1.8} />
+                <span
+                  className={`relative inline-flex flex-none items-center justify-center ${collapsed ? "h-6 w-6" : "h-[17px] w-[17px]"}`}
+                >
+                  <Icon
+                    size={collapsed ? 18 : 17}
+                    strokeWidth={active ? 2.2 : 1.8}
+                  />
                   {displayedUnreadCount > 0 && (
                     <span
                       aria-label={`${displayedUnreadCount} unread notifications`}
-                      className="absolute -right-2.5 -top-2 z-10 grid h-[17px] min-w-[17px] place-items-center rounded-full border-2 border-white bg-[#FF2D4A] px-1 text-[9px] font-bold leading-none text-white"
+                      className={`absolute -right-2.5 -top-2 z-10 grid h-[17px] min-w-[17px] place-items-center rounded-full border-2 ${collapsed ? "border-[#0f0f0f]" : "border-white"} bg-[#FF2D4A] px-1 text-[9px] font-bold leading-none text-white`}
                     >
                       {displayedUnreadCount > 99 ? "99+" : displayedUnreadCount}
                     </span>
                   )}
                 </span>
               ) : (
-                <Icon size={17} strokeWidth={active ? 2.2 : 1.8} />
+                <Icon
+                  size={collapsed ? 18 : 17}
+                  strokeWidth={active ? 2.2 : 1.8}
+                />
               )}
 
-              <span className="flex-1">{label}</span>
+              {!collapsed && <span className="flex-1">{label}</span>}
 
               {label !== "Notifications" && displayedUnreadCount > 0 && (
                 <span
@@ -152,43 +172,45 @@ function Sidebar({ activePage = "Home", onNavigate = () => {} }) {
         })}
       </nav>
 
-      <section className="mt-7 border-t border-black/[0.08] pt-5">
-        <h2 className="mb-4 px-2 text-[12px] font-medium text-neutral-500">
-          Following
-        </h2>
+      {!collapsed && (
+        <section className="mt-7 border-t border-black/[0.08] pt-5">
+          <h2 className="mb-4 px-2 text-[12px] font-medium text-neutral-500">
+            Following
+          </h2>
 
-        <div className="space-y-2.5">
-          {creators.map((creator) => (
-            <div
-              key={creator.name}
-              className="flex min-w-0 items-center gap-2 px-1"
-            >
-              <div className="relative shrink-0">
-                <img
-                  src={`https://images.unsplash.com/${creator.image}?auto=format&fit=crop&w=64&h=64&q=80`}
-                  alt={creator.name}
-                  className="h-7 w-7 rounded-full object-cover ring-1 ring-black/5"
-                />
+          <div className="space-y-2.5">
+            {creators.map((creator) => (
+              <div
+                key={creator.name}
+                className="flex min-w-0 items-center gap-2 px-1"
+              >
+                <div className="relative shrink-0">
+                  <img
+                    src={`https://images.unsplash.com/${creator.image}?auto=format&fit=crop&w=64&h=64&q=80`}
+                    alt={creator.name}
+                    className="h-7 w-7 rounded-full object-cover ring-1 ring-black/5"
+                  />
 
-                {creator.online && (
-                  <span className="absolute -right-0.5 bottom-0 h-2 w-2 rounded-full border-2 border-white bg-neutral-500" />
-                )}
+                  {creator.online && (
+                    <span className="absolute -right-0.5 bottom-0 h-2 w-2 rounded-full border-2 border-white bg-neutral-500" />
+                  )}
+                </div>
+
+                <span className="truncate text-[11px] text-neutral-700">
+                  {creator.name}
+                </span>
               </div>
+            ))}
+          </div>
 
-              <span className="truncate text-[11px] text-neutral-700">
-                {creator.name}
-              </span>
-            </div>
-          ))}
-        </div>
-
-        <button
-          type="button"
-          className="mt-5 flex items-center gap-1 px-1 text-[12px] text-neutral-500 transition hover:text-black"
-        >
-          <MoreHorizontal size={16} /> Show more
-        </button>
-      </section>
+          <button
+            type="button"
+            className="mt-5 flex items-center gap-1 px-1 text-[12px] text-neutral-500 transition hover:text-black"
+          >
+            <MoreHorizontal size={16} /> Show more
+          </button>
+        </section>
+      )}
     </aside>
   );
 }

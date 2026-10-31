@@ -23,6 +23,7 @@ import {
   Settings as tablet_Settings,
   Captions as tablet_Captions,
   Bookmark as tablet_Bookmark,
+  Trash2 as tablet_Trash2,
 } from "lucide-react";
 import {
   useEffect as desktop_useEffect,
@@ -33,6 +34,8 @@ import {
 } from "react";
 import {
   ArrowLeft as desktop_ArrowLeft,
+  ArrowUp as desktop_ArrowUp,
+  ArrowDown as desktop_ArrowDown,
   Heart as desktop_Heart,
   MessageCircle as desktop_MessageCircle,
   Share2 as desktop_Share2,
@@ -42,15 +45,115 @@ import {
   Volume2 as desktop_Volume2,
   VolumeX as desktop_VolumeX,
   Maximize as desktop_Maximize,
-  Settings as desktop_Settings,
   Captions as desktop_Captions,
   CheckCircle2 as desktop_CheckCircle2,
   Bookmark as desktop_Bookmark,
+  Trash2 as desktop_Trash2,
 } from "lucide-react";
 import desktop_TopBar from "../components/TopBar";
 import desktop_CommentSection from "./comments/CommentSection";
 import desktop_api from "../services/api";
 import MentionText from "./MentionText";
+import { getRecentVideoPlaybackUrl } from "../utils/recentVideoPlaybackCache";
+
+const MIN_AUTOMATIC_QUALITY_HEIGHT = 1030;
+let nextSpotliPlaybackDiagnosticId = 0;
+
+function getSpotliHighResolutionNow() {
+  return typeof performance !== "undefined" &&
+    typeof performance.now === "function"
+    ? performance.now()
+    : Date.now();
+}
+
+function getSpotliResourceTiming(url) {
+  if (
+    typeof performance === "undefined" ||
+    typeof performance.getEntriesByName !== "function" ||
+    !url
+  ) {
+    return null;
+  }
+
+  try {
+    const entries = performance
+      .getEntriesByName(url)
+      .filter((entry) => entry.entryType === "resource");
+    const entry = entries[entries.length - 1];
+    if (!entry) return null;
+
+    const responseWaitMs =
+      Number(entry.responseStart) > 0 && Number(entry.requestStart) > 0
+        ? Math.max(0, entry.responseStart - entry.requestStart)
+        : null;
+    const responseTransferMs =
+      Number(entry.responseEnd) > 0 && Number(entry.responseStart) > 0
+        ? Math.max(0, entry.responseEnd - entry.responseStart)
+        : null;
+
+    return {
+      durationMs: Math.round(Number(entry.duration) || 0),
+      responseWaitMs:
+        responseWaitMs == null ? null : Math.round(responseWaitMs),
+      responseTransferMs:
+        responseTransferMs == null ? null : Math.round(responseTransferMs),
+      transferSizeBytes: Number(entry.transferSize) || 0,
+      encodedBodySizeBytes: Number(entry.encodedBodySize) || 0,
+      decodedBodySizeBytes: Number(entry.decodedBodySize) || 0,
+      nextHopProtocol: entry.nextHopProtocol || null,
+      timingAvailable: responseWaitMs != null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function getSpotliBufferedAheadSeconds(video) {
+  if (!video?.buffered?.length) return 0;
+  const currentTime = Number(video.currentTime) || 0;
+  for (let index = 0; index < video.buffered.length; index += 1) {
+    const start = video.buffered.start(index);
+    const end = video.buffered.end(index);
+    if (currentTime >= start - 0.15 && currentTime <= end + 0.15) {
+      return Math.max(0, end - currentTime);
+    }
+  }
+  return 0;
+}
+
+// Spotli quality tiers are orientation-neutral: landscape 1832x1030 and
+// portrait 1030x1832 both represent the 1030p tier. HLS level.height alone
+// mislabels portrait renditions as 1832p and can make the player miss them.
+function getQualityTierHeight(level) {
+  const width = Number(level?.width) || 0;
+  const height = Number(level?.height) || 0;
+  if (width > 0 && height > 0) return Math.min(width, height);
+  return height;
+}
+
+function getPostOwnerId(post) {
+  const creator = post?.creator;
+  const user = post?.user;
+  // Feed normalization may store the creator's display name in `creator`;
+  // prefer explicit owner IDs before considering legacy string creator values.
+  return (
+    post?.creatorId ||
+    post?.authorId ||
+    post?.userId ||
+    creator?._id ||
+    creator?.id ||
+    (typeof user === "string" ? user : user?._id || user?.id) ||
+    (typeof creator === "string" ? creator : "") ||
+    ""
+  );
+}
+
+function isPostOwnedBy(post, currentUserId) {
+  const ownerId = getPostOwnerId(post);
+  return Boolean(
+    ownerId && currentUserId && String(ownerId) === String(currentUserId),
+  );
+}
 
 function getSavedPlaybackPreference(key, fallback) {
   try {
@@ -63,43 +166,543 @@ function getSavedPlaybackPreference(key, fallback) {
   }
 }
 
-// Request a browser-friendly, bandwidth-conscious Cloudinary rendition for playback.
-// Non-Cloudinary media URLs are left unchanged.
-function getOptimizedPlaybackUrl(value) {
-  if (typeof value !== "string" || !value) return value;
+// Parse the canonical Spotli Cloudinary asset path. Stored URLs may include
+// transformation segments (including single-segment transforms like q_auto),
+// streaming profiles, or a version prefix. Build new URLs from the public ID
+// rather than stacking transformations or accidentally treating them as part
+// of the public ID.
+function getSpotliCloudinaryAssetParts(value) {
+  if (
+    typeof value !== "string" ||
+    !/^https?:\/\/res\.cloudinary\.com\//i.test(value)
+  ) {
+    return null;
+  }
 
   const marker = "/video/upload/";
   const markerIndex = value.indexOf(marker);
-  if (markerIndex === -1 || !/https?:\/\/res\.cloudinary\.com\//i.test(value)) {
-    return value;
-  }
+  if (markerIndex < 0) return null;
 
   const pathStart = markerIndex + marker.length;
-  const remainder = value.slice(pathStart);
-  const firstSegment = remainder.split("/")[0];
+  const pathOnly = value.slice(pathStart).split(/[?#]/, 1)[0];
+  const segments = pathOnly.split("/").filter(Boolean);
+  const publicIdIndex = segments.findIndex(
+    (segment, index) => segment === "spotli" && segments[index + 1] === "posts",
+  );
 
-  // Avoid stacking transformations on URLs that are already transformed.
-  if (firstSegment.includes(",")) return value;
+  // The app's video uploads are stored under spotli/posts. If this isn't one
+  // of our canonical assets, don't guess at a URL that might be invalid.
+  if (publicIdIndex < 0) return null;
 
-  // This is only a fallback when adaptive HLS cannot be used or is still being
-  // prepared. Keep it light on constrained links so a missing HLS manifest does
-  // not force a large progressive MP4 to download before the first frame.
-  const profile = getNetworkPlaybackProfile();
-  const width =
-    profile.startupHeight <= 240
-      ? 426
-      : profile.startupHeight <= 360
-        ? 640
-        : 960;
-  const bitrate =
-    profile.startupHeight <= 240
-      ? "350k"
-      : profile.startupHeight <= 360
-        ? "600k"
-        : "900k";
-  const quality = profile.constrained ? "q_auto:eco" : "q_auto:good";
-  const transformation = `c_limit,w_${width},br_${bitrate},vc_h264,${quality},f_mp4`;
-  return `${value.slice(0, pathStart)}${transformation}/${remainder}`;
+  const version = segments
+    .slice(0, publicIdIndex)
+    .reverse()
+    .find((segment) => /^v\d+$/.test(segment));
+  const assetPath = [
+    ...(version ? [version] : []),
+    ...segments.slice(publicIdIndex),
+  ].join("/");
+
+  const lastAssetSegment = segments[segments.length - 1] || "";
+  const formatMatch = lastAssetSegment.match(/\.([a-z0-9]+)$/i);
+  const sourceFormat = formatMatch ? formatMatch[1].toLowerCase() : "";
+
+  return {
+    base: value.slice(0, pathStart),
+    assetPath,
+    sourceFormat,
+    assetPathWithoutExtension: assetPath.replace(
+      /\.(mp4|mov|m4v|webm|avi|mkv|m3u8|mpd)$/i,
+      "",
+    ),
+  };
+}
+
+// A direct progressive URL is safe only when Cloudinary's stored source format
+// is actually MP4. Spotli also accepts MOV and WebM uploads (especially small
+// files that intentionally skip browser compression); forcing those assets to
+// a .mp4 URL produces 404s, after which the player waits for HLS or a fallback.
+function getDirectSpotliMp4Url(value) {
+  const parts = getSpotliCloudinaryAssetParts(value);
+  if (!parts || parts.sourceFormat !== "mp4") return "";
+
+  // Use the original verified Cloudinary URL path, including its actual version
+  // and format. Do not invent an MP4 extension for a MOV/WebM or extensionless
+  // public ID.
+  return `${parts.base}${parts.assetPath}`;
+}
+
+function getOptimizedPlaybackUrl(value) {
+  const parts = getSpotliCloudinaryAssetParts(value);
+  if (!parts) return value;
+
+  // Browser-compressed Spotli uploads are MP4. For a video just published in
+  // this SPA session, play the exact prepared File from a local Blob URL first.
+  const directMp4Url = getDirectSpotliMp4Url(value);
+  if (directMp4Url) {
+    const canonicalAssetPath = parts.assetPathWithoutExtension.replace(
+      /^v\d+\//i,
+      "",
+    );
+    const recentLocalUrl = getRecentVideoPlaybackUrl(canonicalAssetPath);
+    if (recentLocalUrl) return recentLocalUrl;
+  }
+
+  // Never use the uploaded original as the progressive fallback. The backend
+  // eagerly creates these two exact H.264 MP4 derivatives after publishing:
+  // a 1280px max edge / 800 kbps normally, or 640px / 300 kbps in Data Saver.
+  // On 16:9 portrait/landscape clips these correspond to about 720p and 360p.
+  // Those paths are also available for MOV/WebM originals and extensionless IDs.
+  const networkProfile = getNetworkPlaybackProfile();
+  // For 16:9 portrait/landscape clips, 640px on the long edge gives a
+  // 360px short edge; 1280px on the long edge gives a 720px short edge.
+  const maxDimension = networkProfile.dataSaver ? 640 : 1280;
+  const maxBitrate = networkProfile.dataSaver ? "300k" : "800k";
+  const transformation = `br_${maxBitrate},c_limit,f_mp4,h_${maxDimension},q_auto:eco,vc_h264,w_${maxDimension}`;
+  const inputAssetPath = `${parts.assetPathWithoutExtension}.mp4`;
+  return `${parts.base}${transformation}/${inputAssetPath}`;
+}
+
+// Keep the immediate next progressive MP4 actively preloading ahead of the
+// active feed item. Metadata-only warming often left the browser with no frame
+// data when the user swiped, so the active player still had to wait for bytes.
+const directMp4Preloaders = new Map();
+const directMp4PreloadRetryAfter = new Map();
+const DIRECT_MP4_PRELOAD_LIMIT = 2;
+const DIRECT_MP4_PRELOAD_RETRY_COOLDOWN_MS = 15000;
+
+function preloadDirectSpotliMp4(value, { aggressive = true } = {}) {
+  const directUrl = getDirectSpotliMp4Url(value);
+  if (!directUrl || typeof document === "undefined") {
+    return Promise.resolve(false);
+  }
+
+  const sourceUrl = getOptimizedPlaybackUrl(value);
+  if (typeof sourceUrl !== "string" || !sourceUrl) {
+    return Promise.resolve(false);
+  }
+  const retryAfter = directMp4PreloadRetryAfter.get(sourceUrl) || 0;
+  if (retryAfter > Date.now()) {
+    return Promise.resolve(false);
+  }
+  directMp4PreloadRetryAfter.delete(sourceUrl);
+  // A local Blob URL is already available in memory and does not need network
+  // preloading. The active player will consume it directly.
+  if (sourceUrl.startsWith("blob:")) return Promise.resolve(true);
+
+  const existing = directMp4Preloaders.get(sourceUrl);
+  if (existing) {
+    directMp4Preloaders.delete(sourceUrl);
+    directMp4Preloaders.set(sourceUrl, existing);
+    // Keep only the immediate next video warm. If its request is already in
+    // flight, never call load() again: that would restart the request and can
+    // discard useful buffered bytes just before the swipe.
+    if (aggressive && !existing.aggressive) {
+      existing.aggressive = true;
+      existing.video.preload = "auto";
+      const requestRestarted =
+        existing.video.readyState < 2 && existing.video.networkState !== 2;
+      if (requestRestarted) existing.video.load();
+      console.info(
+        "[Spotli playback] Promoted detached next MP4 preload to auto",
+        {
+          readyState: existing.video.readyState,
+          networkState: existing.video.networkState,
+          requestRestarted,
+        },
+      );
+      return existing.video.readyState >= 2
+        ? Promise.resolve(true)
+        : existing.promise;
+    }
+    return existing.promise;
+  }
+
+  const preloadVideo = document.createElement("video");
+  // This detached element is used only for the immediate next desktop-viewer
+  // item. Start with metadata, then promote to full media only after the active
+  // video has a healthy buffer. This limits speculative bandwidth competition.
+  const canPreloadWholeNextVideo = aggressive === true;
+  preloadVideo.preload = canPreloadWholeNextVideo ? "auto" : "metadata";
+  preloadVideo.muted = true;
+  preloadVideo.playsInline = true;
+  preloadVideo.setAttribute("aria-hidden", "true");
+
+  let timerId = null;
+  let settlePromise;
+  const preloadStartedAt = Date.now();
+  const promise = new Promise((resolve) => {
+    let settled = false;
+    settlePromise = (result) => {
+      if (settled) return;
+      settled = true;
+      if (timerId != null) clearTimeout(timerId);
+      if (result) {
+        directMp4PreloadRetryAfter.delete(sourceUrl);
+        console.info("[Spotli playback] Detached next MP4 frame data ready", {
+          elapsedMs: Date.now() - preloadStartedAt,
+          preloadMode: preloadVideo.preload,
+          readyState: preloadVideo.readyState,
+        });
+      } else {
+        const mediaErrorCode = preloadVideo.error?.code || null;
+        const failureReason = mediaErrorCode
+          ? {
+              1: "media-aborted",
+              2: "network-error",
+              3: "decode-error",
+              4: "unsupported-source",
+            }[mediaErrorCode] || "media-error"
+          : "first-frame-data-timeout";
+        console.warn(
+          `[Spotli playback] Detached next MP4 preload failed (${failureReason})`,
+          {
+            elapsedMs: Date.now() - preloadStartedAt,
+            mediaErrorCode,
+            networkState: preloadVideo.networkState,
+            readyState: preloadVideo.readyState,
+            source: sourceUrl,
+          },
+        );
+        const entry = directMp4Preloaders.get(sourceUrl);
+        if (mediaErrorCode) {
+          // A real media error is not useful to keep retrying speculatively.
+          // Back off, but leave active playback free to request/fallback itself.
+          directMp4PreloadRetryAfter.set(
+            sourceUrl,
+            Date.now() + DIRECT_MP4_PRELOAD_RETRY_COOLDOWN_MS,
+          );
+          if (entry?.promise === promise) {
+            directMp4Preloaders.delete(sourceUrl);
+            try {
+              preloadVideo.pause();
+              preloadVideo.removeAttribute("src");
+              preloadVideo.load();
+            } catch {
+              // Preload cleanup must never interrupt active playback.
+            }
+          }
+        } else {
+          // A timeout means the first frame has not arrived yet, not that the
+          // request failed. Keep it attached for the active player to reuse.
+          console.info(
+            "[Spotli playback] Keeping pending MP4 frame request attached",
+            {
+              networkState: preloadVideo.networkState,
+              readyState: preloadVideo.readyState,
+            },
+          );
+        }
+      }
+      resolve(result);
+    };
+    preloadVideo.addEventListener("loadeddata", () => settlePromise(true), {
+      once: true,
+    });
+    preloadVideo.addEventListener("error", () => settlePromise(false), {
+      once: true,
+    });
+    timerId = setTimeout(() => settlePromise(false), 12000);
+  });
+
+  directMp4Preloaders.set(sourceUrl, {
+    video: preloadVideo,
+    promise,
+    aggressive: canPreloadWholeNextVideo,
+    settle: (result) => settlePromise?.(result),
+  });
+  preloadVideo.src = sourceUrl;
+  preloadVideo.load();
+  if (preloadVideo.readyState >= 2) settlePromise?.(true);
+
+  while (directMp4Preloaders.size > DIRECT_MP4_PRELOAD_LIMIT) {
+    const oldestKey = directMp4Preloaders.keys().next().value;
+    if (!oldestKey) break;
+    const oldest = directMp4Preloaders.get(oldestKey);
+    directMp4Preloaders.delete(oldestKey);
+    if (oldest?.video) {
+      oldest.video.pause();
+      oldest.video.removeAttribute("src");
+      oldest.video.load();
+    }
+  }
+
+  return promise;
+}
+
+// Reuse the actual next feed card's video element for MP4 preloading. Keep its
+// source attached, start with metadata, and promote this same element to auto
+// only after the active card has enough buffered playback to spare bandwidth.
+const feedVideoPreloadStates = new WeakMap();
+
+function createFeedVideoReadinessWatch(videoElement, sourceUrl, state) {
+  const watchStartedAt = Date.now();
+  let settled = false;
+  let timerId = null;
+  let resolvePromise;
+  const promise = new Promise((resolve) => {
+    resolvePromise = resolve;
+  });
+
+  const cleanup = () => {
+    if (timerId != null) clearTimeout(timerId);
+    videoElement.removeEventListener("loadedmetadata", onMetadata);
+    videoElement.removeEventListener("loadeddata", onData);
+    videoElement.removeEventListener("canplay", onData);
+    videoElement.removeEventListener("error", onError);
+  };
+
+  const settle = (ready) => {
+    if (settled) return;
+    settled = true;
+    cleanup();
+
+    if (ready) {
+      console.info("[Spotli playback] Next feed MP4 frame data ready", {
+        elapsedMs: Date.now() - watchStartedAt,
+        preloadMode: videoElement.preload,
+        readyState: videoElement.readyState,
+        bufferedRanges: videoElement.buffered?.length || 0,
+      });
+    } else {
+      const mediaErrorCode = videoElement.error?.code || null;
+      const failureReason = mediaErrorCode
+        ? {
+            1: "media-aborted",
+            2: "network-error",
+            3: "decode-error",
+            4: "unsupported-source",
+          }[mediaErrorCode] || "media-error"
+        : "first-frame-data-timeout";
+      if (mediaErrorCode) state.failed = true;
+      console.warn(
+        `[Spotli playback] Next feed MP4 preload ${mediaErrorCode ? "failed" : "still loading"} (${failureReason})`,
+        {
+          elapsedMs: Date.now() - watchStartedAt,
+          mediaErrorCode,
+          networkState: videoElement.networkState,
+          readyState: videoElement.readyState,
+          source: sourceUrl,
+          keepingSourceAttached: !mediaErrorCode,
+        },
+      );
+    }
+    resolvePromise(ready);
+  };
+
+  const onMetadata = () => {
+    console.info("[Spotli playback] Next feed MP4 metadata available", {
+      elapsedMs: Date.now() - watchStartedAt,
+      readyState: videoElement.readyState,
+      preloadMode: videoElement.preload,
+    });
+  };
+  const onData = () => {
+    if (videoElement.readyState >= 2) settle(true);
+  };
+  const onError = () => settle(false);
+
+  videoElement.addEventListener("loadedmetadata", onMetadata, { once: true });
+  videoElement.addEventListener("loadeddata", onData, { once: true });
+  videoElement.addEventListener("canplay", onData, { once: true });
+  videoElement.addEventListener("error", onError, { once: true });
+  timerId = setTimeout(() => settle(false), 12000);
+  if (videoElement.readyState >= 2) settle(true);
+
+  return {
+    promise,
+    cleanup,
+    settle,
+    get settled() {
+      return settled;
+    },
+  };
+}
+
+function preloadFeedVideoElement(
+  value,
+  videoElement,
+  { aggressive = true } = {},
+) {
+  if (!videoElement || typeof document === "undefined") {
+    return Promise.resolve(false);
+  }
+
+  const sourceUrl = getOptimizedPlaybackUrl(value);
+  if (typeof sourceUrl !== "string" || !sourceUrl) {
+    return Promise.resolve(false);
+  }
+
+  let state = feedVideoPreloadStates.get(videoElement);
+  if (state?.sourceUrl === sourceUrl) {
+    if (state.failed) return Promise.resolve(false);
+
+    if (videoElement.readyState >= 2) {
+      state.watcher?.settle(true);
+      return Promise.resolve(true);
+    }
+
+    if (aggressive && !state.aggressive) {
+      state.aggressive = true;
+      videoElement.preload = "auto";
+      videoElement.setAttribute("preload", "auto");
+      // If metadata-only loading has gone idle, restart once in auto mode.
+      // Never restart a request that is already in flight: that discards its
+      // connection and any bytes the browser may already have received.
+      const requestRestarted =
+        videoElement.readyState < 2 && videoElement.networkState !== 2;
+      if (requestRestarted) {
+        try {
+          videoElement.load();
+        } catch {}
+      }
+      console.info("[Spotli playback] Promoted next feed MP4 element to auto", {
+        readyState: videoElement.readyState,
+        networkState: videoElement.networkState,
+        requestRestarted,
+        sourceStillAttached: Boolean(
+          videoElement.currentSrc || videoElement.getAttribute("src"),
+        ),
+      });
+    }
+
+    // A previous 12-second watchdog only records that the request is still
+    // pending; it must not permanently leave this element without readiness
+    // listeners. Re-arm the watcher without touching the in-flight request.
+    if (!state.watcher || state.watcher.settled) {
+      state.watcher = createFeedVideoReadinessWatch(
+        videoElement,
+        sourceUrl,
+        state,
+      );
+      state.promise = state.watcher.promise;
+    }
+    return state.promise || Promise.resolve(false);
+  }
+
+  // If this card was previously used for another post/source, detach only the
+  // old listeners. Assigning the new source below replaces that old request.
+  state?.cleanup?.();
+
+  const currentSource =
+    videoElement.currentSrc || videoElement.getAttribute("src") || "";
+  let currentMatches = false;
+  try {
+    currentMatches =
+      Boolean(currentSource) &&
+      new URL(currentSource, document.baseURI).href ===
+        new URL(sourceUrl, document.baseURI).href;
+  } catch {
+    currentMatches = currentSource === sourceUrl;
+  }
+
+  videoElement.muted = true;
+  videoElement.playsInline = true;
+  // Metadata starts the request early without letting the next full file
+  // compete with the active video's startup. The buffer guard promotes this
+  // same element as soon as the active video has enough headroom.
+  videoElement.preload = aggressive ? "auto" : "metadata";
+  videoElement.setAttribute("preload", aggressive ? "auto" : "metadata");
+
+  state = {
+    sourceUrl,
+    aggressive,
+    failed: false,
+    promise: null,
+    watcher: null,
+    cleanup: null,
+  };
+  feedVideoPreloadStates.set(videoElement, state);
+  state.watcher = createFeedVideoReadinessWatch(videoElement, sourceUrl, state);
+  state.promise = state.watcher.promise;
+  state.cleanup = () => state.watcher?.cleanup();
+
+  if (!currentMatches) {
+    videoElement.src = sourceUrl;
+    videoElement.dataset.spotliPreloadSrc = sourceUrl;
+    videoElement.load();
+  } else if (videoElement.readyState < 1 && videoElement.networkState !== 2) {
+    // React may have assigned src while this card was inactive with preload=none.
+    // Explicitly start the request now that this is the next preload target.
+    videoElement.load();
+  }
+
+  if (videoElement.readyState >= 2) state.watcher.settle(true);
+  console.info("[Spotli playback] Priming next feed video element", {
+    preloadMode: videoElement.preload,
+    sourceIsLocal: sourceUrl.startsWith("blob:"),
+    sourceAlreadyAttached: currentMatches,
+  });
+  return state.promise;
+}
+
+function preloadNextVideoPlayback(value, options = {}) {
+  const hlsUrl = getCloudinaryHlsUrl(value);
+  if (!hlsUrl) return Promise.resolve(false);
+
+  const networkProfile = getNetworkPlaybackProfile();
+  if (networkProfile.touchDevice || networkProfile.dataSaver) {
+    console.info(
+      "[Spotli playback] Skipping next-video preload for Data Saver / low-data mobile",
+      {
+        dataSaver: networkProfile.dataSaver,
+        saveData: networkProfile.saveData,
+        constrained: networkProfile.constrained,
+        downlinkMbps: networkProfile.downlinkMbps,
+      },
+    );
+    return Promise.resolve(false);
+  }
+
+  const requestedFirstSegment = options.includeFirstSegment === true;
+  const includeFirstSegment =
+    requestedFirstSegment &&
+    networkProfile.allowSpeculativeNextSegmentPreload === true;
+
+  if (requestedFirstSegment && !includeFirstSegment) {
+    console.info(
+      "[Spotli playback] Skipping speculative next-video segment to conserve data",
+      {
+        constrained: networkProfile.constrained,
+        saveData: networkProfile.saveData,
+        touchDevice: networkProfile.touchDevice,
+        downlinkMbps:
+          Number(
+            typeof navigator !== "undefined"
+              ? navigator.connection?.downlink
+              : 0,
+          ) || null,
+      },
+    );
+  }
+
+  const hlsWarmPromise = preloadCloudinaryVideoStream(value, "auto", {
+    includeFirstSegment,
+  });
+
+  if (
+    !includeFirstSegment ||
+    !getDirectSpotliMp4Url(value) ||
+    options.fallbackMp4OnWarmFailure === false
+  ) {
+    return Promise.resolve(hlsWarmPromise);
+  }
+
+  // Do not fetch both formats when HLS is ready. If Cloudinary returns 423 or
+  // another prewarm error, prepare the original MP4 on the same next-card element.
+  return Promise.resolve(hlsWarmPromise).then((prepared) => {
+    if (prepared === true) return true;
+    console.warn(
+      "[Spotli playback] HLS prewarm unavailable; preparing original MP4 fallback",
+      { source: getDirectSpotliMp4Url(value) },
+    );
+    if (options.videoElement) {
+      return preloadFeedVideoElement(value, options.videoElement, {
+        aggressive: true,
+      });
+    }
+    return preloadDirectSpotliMp4(value, { aggressive: true });
+  });
 }
 
 // Return the same lightweight Cloudinary first-frame thumbnail used by the
@@ -166,37 +769,16 @@ function getExplicitPostThumbnail(post) {
 }
 
 function getCloudinaryHlsUrl(value) {
-  if (
-    typeof value !== "string" ||
-    !/^https?:\/\/res\.cloudinary\.com\//i.test(value)
-  ) {
-    return "";
-  }
+  const parts = getSpotliCloudinaryAssetParts(value);
+  if (!parts || !parts.assetPathWithoutExtension) return "";
 
-  const marker = "/video/upload/";
-  const markerIndex = value.indexOf(marker);
-  if (markerIndex < 0) return "";
-
-  const pathStart = markerIndex + marker.length;
-  let assetPath = value.slice(pathStart).split(/[?#]/, 1)[0];
-  const firstSegment = assetPath.split("/")[0];
-
-  // Match the eagerly generated HLS stream prepared while the post is
-  // published. This avoids asking Cloudinary to build sp_auto renditions on
-  // the viewer's first request, which caused the first-open delay.
-  if (firstSegment.includes(",")) {
-    assetPath = assetPath.slice(firstSegment.length).replace(/^\/+/, "");
-  }
-
-  assetPath = assetPath.replace(/\.(mp4|mov|m4v|webm|avi|mkv)$/i, "");
-  if (!assetPath || !assetPath.includes("/")) return "";
-
-  return `${value.slice(0, pathStart)}sp_full_hd/${assetPath}.m3u8`;
+  // Match the Full HD streaming profile eagerly generated by the backend. Never
+  // append a profile to a URL that already contains a transformation segment.
+  return `${parts.base}sp_full_hd/${parts.assetPathWithoutExtension}.m3u8`;
 }
 
-// Choose a network-aware first rendition for Auto playback. The player can
-// improve quality after the first fragment is buffered; manually selected quality
-// remains respected and is not silently downgraded.
+// Detect connection characteristics for startup rendition and buffering
+// policy. Auto favors the best rendition the connection can sustain, then adapts.
 function getNetworkPlaybackProfile() {
   const connection =
     typeof navigator !== "undefined"
@@ -208,6 +790,20 @@ function getNetworkPlaybackProfile() {
   const downlink = Number(connection?.downlink);
   const hasDownlink = Number.isFinite(downlink) && downlink > 0;
   const saveData = connection?.saveData === true;
+  const savedDataSaverPreference = getSavedPlaybackPreference(
+    "dataSaver",
+    null,
+  );
+  const dataSaverUserChoice =
+    getSavedPlaybackPreference("dataSaverUserChoice", false) === true;
+  const inferredDataSaver =
+    saveData ||
+    ["slow-2g", "2g", "3g"].includes(effectiveType) ||
+    (hasDownlink && downlink < 1.2);
+  const dataSaver =
+    dataSaverUserChoice && typeof savedDataSaverPreference === "boolean"
+      ? savedDataSaverPreference
+      : inferredDataSaver;
   const touchDevice =
     typeof navigator !== "undefined" &&
     ((Number(navigator.maxTouchPoints) || 0) > 0 ||
@@ -216,6 +812,7 @@ function getNetworkPlaybackProfile() {
         window.matchMedia("(pointer: coarse)").matches));
 
   const verySlow =
+    dataSaver ||
     saveData ||
     effectiveType === "slow-2g" ||
     effectiveType === "2g" ||
@@ -226,17 +823,29 @@ function getNetworkPlaybackProfile() {
     (effectiveType === "3g" && knownWeakLink) ||
     (hasDownlink && downlink < 1.8);
 
-  // Start Auto at the clearest rendition that fits a conservative share of
-  // the reported connection. Even very slow links may be able to sustain an
-  // efficient 360p rendition; limiting every weak connection to 240p made the
-  // feed look needlessly blurry. Auto ABR can still step down if real throughput
-  // proves insufficient, and a manual quality choice remains locked.
-  const unknownMobileLink = touchDevice && !hasDownlink;
-  const startupHeight = slow || unknownMobileLink ? 360 : 480;
+  // Low-data mobile starts with a deliberately conservative bandwidth estimate.
+  // Network Information's downlink is only an estimate, so use about 30% of it
+  // for the first-fragment estimate rather than treating the full value as safe.
+  // Data Saver stays within Cloudinary's 360p full_hd rendition. That profile
+  // does not contain a true 480p 16:9 variant; 360p is the next reliable tier.
+  const startupHeight = dataSaver
+    ? 360
+    : touchDevice
+      ? 720
+      : MIN_AUTOMATIC_QUALITY_HEIGHT;
+  let defaultBandwidthEstimate = dataSaver
+    ? 180_000
+    : touchDevice
+      ? 300_000
+      : 550_000;
 
-  let defaultBandwidthEstimate = touchDevice ? 350_000 : 550_000;
   if (verySlow) {
     defaultBandwidthEstimate = 180_000;
+  } else if (touchDevice && hasDownlink) {
+    defaultBandwidthEstimate = Math.max(
+      180_000,
+      Math.min(500_000, downlink * 300_000),
+    );
   } else if (knownWeakLink) {
     defaultBandwidthEstimate = Math.max(
       200_000,
@@ -249,20 +858,78 @@ function getNetworkPlaybackProfile() {
     );
   }
 
-  // Network Information's downlink is an estimate, not a guarantee. Use most
-  // of it for the opening fragment so we don't default to the smallest variant;
-  // HLS.js starts adapting from measured fragment throughput immediately after.
-  const startupBandwidthBudget = hasDownlink
-    ? Math.max(180_000, Math.min(3_500_000, downlink * 1_000_000 * 0.85))
-    : defaultBandwidthEstimate * (slow ? 1.45 : 1.55);
+  // On touch devices, keep the opening rendition within a low-data budget.
+  // HLS.js then adapts using measured fragment throughput, but Auto is capped
+  // at 720p; the user's manual 1030p option remains available and uncapped.
+  const startupBandwidthBudget = dataSaver
+    ? hasDownlink
+      ? Math.max(140_000, Math.min(320_000, downlink * 180_000))
+      : Math.max(140_000, defaultBandwidthEstimate * 1.1)
+    : touchDevice
+      ? hasDownlink
+        ? Math.max(200_000, Math.min(800_000, downlink * 450_000))
+        : Math.max(200_000, defaultBandwidthEstimate * 1.25)
+      : hasDownlink
+        ? Math.max(180_000, Math.min(3_500_000, downlink * 1_000_000 * 0.85))
+        : defaultBandwidthEstimate * (slow ? 1.45 : 1.55);
+
+  // Next-video media preloading is disabled on touch devices in the low-data
+  // profile. Desktop keeps its existing just-in-time next-item warm-up.
+  const allowSpeculativeNextSegmentPreload =
+    !touchDevice &&
+    !dataSaver &&
+    !saveData &&
+    effectiveType !== "slow-2g" &&
+    effectiveType !== "2g" &&
+    (!hasDownlink || downlink >= 1.0);
 
   return {
     touchDevice,
+    dataSaver,
     startupHeight,
     startupBandwidthBudget,
     constrained: slow,
+    saveData,
+    allowSpeculativeNextSegmentPreload,
     defaultBandwidthEstimate,
+    effectiveType,
+    downlinkMbps: hasDownlink ? downlink : null,
   };
+}
+
+// Pick the highest-resolution rendition whose advertised bitrate fits a
+// conservative share of the current connection budget. The active HLS player
+// uses the same rule for its first fragment, then returns to ABR Auto.
+function selectSpotliAutoStartupVariant(
+  variants,
+  networkProfile = getNetworkPlaybackProfile(),
+) {
+  const usable = (Array.isArray(variants) ? variants : []).filter(
+    (variant) => Number(variant?.height) > 0,
+  );
+  if (!usable.length) return null;
+
+  const autoHeightEligible =
+    networkProfile.dataSaver || networkProfile.touchDevice
+      ? usable.filter(
+          (variant) => Number(variant?.height) <= networkProfile.startupHeight,
+        )
+      : usable;
+  // If no rendition fits the active cap, use the best available source level
+  // rather than rejecting the stream. The same rule is used by the active player.
+  const selectable = autoHeightEligible.length ? autoHeightEligible : usable;
+  // Keep Auto at the best rendition permitted by the existing playback cap.
+  // Do not choose a lower starting rendition from a conservative bandwidth
+  // estimate: that estimate is volatile and can make a clear video look soft.
+  // The exact same selection is used by the active player below, so first-segment
+  // prewarming and playback target the same Cloudinary rendition.
+  return (
+    [...selectable].sort(
+      (a, b) =>
+        (Number(b.height) || 0) - (Number(a.height) || 0) ||
+        (Number(b.bandwidth) || 0) - (Number(a.bandwidth) || 0),
+    )[0] || null
+  );
 }
 
 // Warm only the master playlist and lightweight rendition playlist before a video
@@ -281,7 +948,7 @@ const hlsWarmResourceCache = new Map();
 const hlsWarmResourcePromises = new Map();
 let hlsWarmResourceCacheBytes = 0;
 // Keep the one preloaded next-video segment available long enough for HLS.js
-// to reuse it when that post becomes active. Some 720p/1080p startup fragments
+// to reuse it when that post becomes active. Some high-resolution startup fragments
 // exceed 2 MB, so the old cap silently discarded them after downloading.
 const HLS_WARM_CACHE_MAX_BYTES = 12 * 1024 * 1024;
 const HLS_WARM_CACHE_MAX_ENTRY_BYTES = 8 * 1024 * 1024;
@@ -389,6 +1056,24 @@ const HLS_PREFETCH_CACHE_LIMIT = 4;
 // When a video opens, stop unfinished background preloads so they do not
 // compete with the active stream. Keep completed resources for the active video;
 // the browser may reuse them from HTTP cache when caching is enabled.
+function cancelCloudinaryVideoPreload(value, preferredQuality = "auto") {
+  const hlsUrl = getCloudinaryHlsUrl(value);
+  if (!hlsUrl) return;
+  const qualityKey =
+    preferredQuality === "auto" || preferredQuality == null
+      ? "auto"
+      : String(preferredQuality);
+  const prefix = `${hlsUrl}::${qualityKey}::`;
+  for (const [key, controller] of hlsManifestPreloadControllers) {
+    if (!key.startsWith(prefix)) continue;
+    controller.abort();
+    hlsManifestPreloadControllers.delete(key);
+    hlsManifestPreloads.delete(key);
+    hlsManifestPreloadCompleted.delete(key);
+    hlsManifestPreloadStartedAt.delete(key);
+  }
+}
+
 function cancelCloudinaryVideoPreloadsExcept(activeHlsUrl) {
   const keepPrefix = `${activeHlsUrl}::`;
 
@@ -495,6 +1180,8 @@ function createWarmCacheLoader(Hls) {
     constructor(config) {
       super(config);
       this.warmRequestAborted = false;
+      this.warmCallbackSettled = false;
+      this.warmTimeoutId = null;
     }
 
     load(context, config, callbacks) {
@@ -516,21 +1203,80 @@ function createWarmCacheLoader(Hls) {
       // Whole-resource bytes are never treated as if they were a ranged body.
       const cachedData = getWarmResource(url, type, rangeStart, rangeEnd);
       const inFlight = hlsWarmResourcePromises.get(warmKey);
-      const sharedPromise =
-        cachedData != null
-          ? Promise.resolve(cachedData)
-          : inFlight?.type === type
-            ? inFlight.promise
-            : null;
+      const memoryCacheHit = cachedData != null;
+      const inFlightCacheHit = !memoryCacheHit && inFlight?.type === type;
+      const sharedPromise = memoryCacheHit
+        ? Promise.resolve(cachedData)
+        : inFlightCacheHit
+          ? inFlight.promise
+          : null;
 
       if (!sharedPromise) return super.load(context, config, callbacks);
 
+      console.info(
+        "[Spotli playback] Active HLS loader reused prewarmed resource",
+        {
+          resourceType: type,
+          cacheSource: memoryCacheHit ? "memory" : "in-flight",
+          bytes: memoryCacheHit
+            ? type === "text"
+              ? cachedData.length * 2
+              : cachedData?.byteLength || 0
+            : null,
+          byteRange: hasRange ? `${rangeStart}-${rangeEnd - 1}` : null,
+          url,
+        },
+      );
+
       this.warmRequestAborted = false;
+      this.warmCallbackSettled = false;
       const startedAt =
         typeof performance !== "undefined" ? performance.now() : Date.now();
+      const configuredTimeout = Number(config?.timeout);
+      const timeoutMs =
+        Number.isFinite(configuredTimeout) && configuredTimeout > 0
+          ? configuredTimeout
+          : 4_000;
+      const clearWarmTimeout = () => {
+        if (this.warmTimeoutId != null) {
+          clearTimeout(this.warmTimeoutId);
+          this.warmTimeoutId = null;
+        }
+      };
+      const makeEmptyStats = (finishedAt) => ({
+        aborted: false,
+        loaded: 0,
+        total: 0,
+        retry: 0,
+        chunkCount: 0,
+        bwEstimate: 0,
+        loading: { start: startedAt, first: 0, end: finishedAt },
+        parsing: { start: 0, end: 0 },
+        buffering: { start: 0, first: 0, end: 0 },
+      });
+
+      // A shared fetch bypasses Hls.js's default loader, so we must enforce the
+      // request timeout ourselves. This prevents a stalled Cloudinary prewarm
+      // from leaving the player at HAVE_NOTHING indefinitely.
+      this.warmTimeoutId = setTimeout(() => {
+        if (this.warmRequestAborted || this.warmCallbackSettled) return;
+        this.warmCallbackSettled = true;
+        this.warmRequestAborted = true;
+        const finishedAt =
+          typeof performance !== "undefined" ? performance.now() : Date.now();
+        console.warn("[Spotli playback] Shared HLS request timed out", {
+          url,
+          type,
+          timeoutMs,
+        });
+        callbacks.onTimeout(makeEmptyStats(finishedAt), context, null);
+      }, timeoutMs);
+
       sharedPromise
         .then((data) => {
-          if (this.warmRequestAborted) return;
+          if (this.warmRequestAborted || this.warmCallbackSettled) return;
+          this.warmCallbackSettled = true;
+          clearWarmTimeout();
 
           const finishedAt =
             typeof performance !== "undefined" ? performance.now() : Date.now();
@@ -571,18 +1317,48 @@ function createWarmCacheLoader(Hls) {
             null,
           );
         })
-        .catch(() => {
-          if (!this.warmRequestAborted) super.load(context, config, callbacks);
+        .catch((error) => {
+          if (this.warmRequestAborted || this.warmCallbackSettled) return;
+          this.warmCallbackSettled = true;
+          clearWarmTimeout();
+          const finishedAt =
+            typeof performance !== "undefined" ? performance.now() : Date.now();
+          const statusMatch = String(error?.message || "").match(/\((\d{3})\)/);
+          const statusCode = statusMatch ? Number(statusMatch[1]) : 0;
+          console.warn("[Spotli playback] Shared HLS prewarm failed", {
+            url,
+            statusCode: statusCode || null,
+            reason: error?.message || String(error || "unknown error"),
+          });
+          // Report the real failure to Hls.js instead of retrying the same 423
+          // request through its default loader and delaying MP4 fallback.
+          callbacks.onError(
+            {
+              code: statusCode,
+              text: error?.message || "Shared HLS prewarm failed",
+            },
+            context,
+            null,
+            makeEmptyStats(finishedAt),
+          );
         });
     }
 
     abort() {
       this.warmRequestAborted = true;
+      if (this.warmTimeoutId != null) {
+        clearTimeout(this.warmTimeoutId);
+        this.warmTimeoutId = null;
+      }
       super.abort();
     }
 
     destroy() {
       this.warmRequestAborted = true;
+      if (this.warmTimeoutId != null) {
+        clearTimeout(this.warmTimeoutId);
+        this.warmTimeoutId = null;
+      }
       super.destroy();
     }
   };
@@ -615,10 +1391,16 @@ function parseHlsVariants(playlistText, playlistUrl) {
 
     const resolution = line.match(/RESOLUTION=(\d+)x(\d+)/i);
     const bandwidth = line.match(/(?:AVERAGE-BANDWIDTH|BANDWIDTH)=(\d+)/i);
+    const width = resolution ? Number(resolution[1]) : 0;
+    const rawHeight = resolution ? Number(resolution[2]) : 0;
     variants.push({
       url: resolvePlaylistUri(lines[uriIndex], playlistUrl),
-      width: resolution ? Number(resolution[1]) : 0,
-      height: resolution ? Number(resolution[2]) : 0,
+      width,
+      // Store the normalized quality tier, not always the portrait height.
+      // Example: 1030x1832 portrait is the same tier as 1832x1030 landscape.
+      height:
+        width > 0 && rawHeight > 0 ? Math.min(width, rawHeight) : rawHeight,
+      rawHeight,
       bandwidth: bandwidth ? Number(bandwidth[1]) : 0,
     });
   }
@@ -636,6 +1418,7 @@ function parseFirstMediaResources(playlistText, playlistUrl) {
     const rangeMatch = mapLine.match(/BYTERANGE="(\d+)(?:@(\d+))?"/i);
     if (uriMatch) {
       const resource = {
+        kind: "init-map",
         url: resolvePlaylistUri(uriMatch[1], playlistUrl),
       };
       if (rangeMatch) {
@@ -669,7 +1452,7 @@ function parseFirstMediaResources(playlistText, playlistUrl) {
     if (expectingSegment && line && !line.startsWith("#")) {
       const url = resolvePlaylistUri(line, playlistUrl);
       if (url) {
-        firstSegment = { url };
+        firstSegment = { kind: "first-media-segment", url };
         if (pendingByteRange != null) {
           const rangeMatch = pendingByteRange.match(/^(\d+)(?:@(\d+))?$/);
           if (rangeMatch) {
@@ -749,6 +1532,8 @@ export function preloadCloudinaryVideoStream(
   // on 3G and compete with the active stream; the active HLS player owns segments.
   const includeFirstSegment = options?.includeFirstSegment === true;
   const cacheKey = `${hlsUrl}::${qualityKey}::${includeFirstSegment ? "segment" : "playlist"}`;
+  const prewarmAssetKey =
+    getSpotliCloudinaryAssetParts(value)?.assetPathWithoutExtension || hlsUrl;
 
   if (hlsManifestPreloads.has(cacheKey)) {
     // Refresh insertion order on reuse so active/next-video preparations are
@@ -765,8 +1550,45 @@ export function preloadCloudinaryVideoStream(
   hlsManifestPreloadStartedAt.set(cacheKey, Date.now());
   const signal = controller?.signal;
 
+  const logWarmResource = (
+    stage,
+    resourceUrl,
+    type,
+    startedAt,
+    details = {},
+  ) => {
+    const { rangeStart = null, rangeEnd = null, ...loggedDetails } = details;
+    const cacheKeyForResource = getWarmResourceKey(
+      resourceUrl,
+      type,
+      rangeStart,
+      rangeEnd,
+    );
+    const cacheEntry = hlsWarmResourceCache.get(cacheKeyForResource);
+    const dataSize =
+      loggedDetails.retainedBytes ??
+      cacheEntry?.size ??
+      (type === "text" ? Number(loggedDetails.textLength || 0) * 2 : null);
+    console.info("[Spotli playback] HLS prewarm stage", {
+      stage,
+      asset: prewarmAssetKey,
+      elapsedMs: Math.round(getSpotliHighResolutionNow() - startedAt),
+      retainedBytes: dataSize,
+      retainedNetworkDurationMs: cacheEntry?.durationMs ?? null,
+      memoryCacheHit: loggedDetails.memoryCacheHit ?? Boolean(cacheEntry),
+      resourceTiming: getSpotliResourceTiming(resourceUrl),
+      ...loggedDetails,
+    });
+  };
+
   const request = (async () => {
+    const masterStartedAt = getSpotliHighResolutionNow();
+    const masterWasCached = getWarmResource(hlsUrl, "text") != null;
     const masterText = await fetchCachedText(hlsUrl, signal);
+    logWarmResource("master-playlist", hlsUrl, "text", masterStartedAt, {
+      textLength: masterText.length,
+      cacheState: masterWasCached ? "memory-cache" : "fetch-or-shared-fetch",
+    });
     const variants = parseHlsVariants(masterText, hlsUrl);
 
     let startupVariant;
@@ -792,32 +1614,12 @@ export function preloadCloudinaryVideoStream(
         )[0];
       startupVariant = exact || lower || any;
     } else {
-      // Match the player's network-aware startup selection: prefer a 360p/480p
-      // variant within the startup bandwidth budget, rather than always warming
-      // the lowest-bitrate stream (which left Auto playback visibly blurry).
-      const profile = getNetworkPlaybackProfile();
-      const usableVariants = variants.filter((variant) => variant.height > 0);
-      const withinHeight = usableVariants.filter(
-        (variant) => variant.height <= profile.startupHeight,
+      // Match the active player's network-aware Auto startup choice. This keeps
+      // the warmed first segment aligned with the rendition actually requested.
+      startupVariant = selectSpotliAutoStartupVariant(
+        variants,
+        getNetworkPlaybackProfile(),
       );
-      const pool = withinHeight.length ? withinHeight : usableVariants;
-      const withinBudget = pool.filter(
-        (variant) =>
-          !variant.bandwidth ||
-          variant.bandwidth <= profile.startupBandwidthBudget,
-      );
-      startupVariant =
-        [...withinBudget].sort(
-          (a, b) => b.height - a.height || b.bandwidth - a.bandwidth,
-        )[0] ||
-        [...pool].sort(
-          (a, b) =>
-            (a.bandwidth || Number.POSITIVE_INFINITY) -
-              (b.bandwidth || Number.POSITIVE_INFINITY) || a.height - b.height,
-        )[0] ||
-        [...variants].sort(
-          (a, b) => a.height - b.height || a.bandwidth - b.bandwidth,
-        )[0];
     }
 
     if (!startupVariant) {
@@ -829,7 +1631,36 @@ export function preloadCloudinaryVideoStream(
           throw new Error("No initial HLS media resource was found");
         }
         const results = await Promise.allSettled(
-          resources.map((url) => warmCachedResource(url, signal)),
+          resources.map(async (resource) => {
+            const resourceStartedAt = getSpotliHighResolutionNow();
+            const wasCached =
+              getWarmResource(
+                resource.url,
+                "arraybuffer",
+                resource.rangeStart ?? null,
+                resource.rangeEnd ?? null,
+              ) != null;
+            const data = await warmCachedResource(resource, signal);
+            logWarmResource(
+              resource.kind || "first-media-resource",
+              resource.url,
+              "arraybuffer",
+              resourceStartedAt,
+              {
+                loadedBytes: data?.byteLength || 0,
+                memoryCacheHit: wasCached,
+                rangeStart: resource.rangeStart ?? null,
+                rangeEnd: resource.rangeEnd ?? null,
+                cacheState: wasCached
+                  ? "memory-cache"
+                  : "fetch-or-shared-fetch",
+                byteRange: Number.isInteger(resource.rangeStart)
+                  ? `${resource.rangeStart}-${resource.rangeEnd - 1}`
+                  : null,
+              },
+            );
+            return data;
+          }),
         );
         if (results.some((result) => result.status === "rejected")) {
           throw new Error("Could not warm the initial HLS media resource");
@@ -839,7 +1670,27 @@ export function preloadCloudinaryVideoStream(
       return true;
     }
 
+    const variantPlaylistStartedAt = getSpotliHighResolutionNow();
+    const variantPlaylistWasCached =
+      getWarmResource(startupVariant.url, "text") != null;
     const mediaPlaylistText = await fetchCachedText(startupVariant.url, signal);
+    logWarmResource(
+      "selected-rendition-playlist",
+      startupVariant.url,
+      "text",
+      variantPlaylistStartedAt,
+      {
+        selectedResolution: `${startupVariant.width || "?"}x${startupVariant.rawHeight || startupVariant.height || "?"}`,
+        qualityTierHeight: startupVariant.height || null,
+        advertisedBandwidthKbps: startupVariant.bandwidth
+          ? Math.round(startupVariant.bandwidth / 1000)
+          : null,
+        textLength: mediaPlaylistText.length,
+        cacheState: variantPlaylistWasCached
+          ? "memory-cache"
+          : "fetch-or-shared-fetch",
+      },
+    );
     if (includeFirstSegment) {
       const resources = parseFirstMediaResources(
         mediaPlaylistText,
@@ -849,7 +1700,39 @@ export function preloadCloudinaryVideoStream(
         throw new Error("No initial HLS media resource was found");
       }
       const results = await Promise.allSettled(
-        resources.map((url) => warmCachedResource(url, signal)),
+        resources.map(async (resource) => {
+          const resourceStartedAt = getSpotliHighResolutionNow();
+          const wasCached =
+            getWarmResource(
+              resource.url,
+              "arraybuffer",
+              resource.rangeStart ?? null,
+              resource.rangeEnd ?? null,
+            ) != null;
+          const data = await warmCachedResource(resource, signal);
+          logWarmResource(
+            resource.kind || "first-media-resource",
+            resource.url,
+            "arraybuffer",
+            resourceStartedAt,
+            {
+              loadedBytes: data?.byteLength || 0,
+              memoryCacheHit: wasCached,
+              rangeStart: resource.rangeStart ?? null,
+              rangeEnd: resource.rangeEnd ?? null,
+              cacheState: wasCached ? "memory-cache" : "fetch-or-shared-fetch",
+              selectedResolution: `${startupVariant.width || "?"}x${startupVariant.rawHeight || startupVariant.height || "?"}`,
+              qualityTierHeight: startupVariant.height || null,
+              advertisedBandwidthKbps: startupVariant.bandwidth
+                ? Math.round(startupVariant.bandwidth / 1000)
+                : null,
+              byteRange: Number.isInteger(resource.rangeStart)
+                ? `${resource.rangeStart}-${resource.rangeEnd - 1}`
+                : null,
+            },
+          );
+          return data;
+        }),
       );
       if (results.some((result) => result.status === "rejected")) {
         throw new Error("Could not warm the initial HLS media resource");
@@ -859,8 +1742,14 @@ export function preloadCloudinaryVideoStream(
     hlsManifestPreloadCompleted.add(cacheKey);
     return true;
   })()
-    .catch(() => {
-      // Prefetch must never block playback; the active player retries normally.
+    .catch((error) => {
+      if (!signal?.aborted) {
+        console.warn("[Spotli playback] Cloudinary HLS prewarm failed", {
+          source: hlsUrl,
+          reason: error?.message || String(error || "unknown error"),
+        });
+      }
+      // Prefetch must never block playback; the active player uses MP4 fallback.
       // Do not let an older aborted task delete a newer request for the same URL.
       hlsManifestPreloadCompleted.delete(cacheKey);
       if (
@@ -894,6 +1783,28 @@ export function preloadCloudinaryVideoStream(
   }
 
   return request;
+}
+
+// Treat both completed and in-flight HLS prewarms as reusable. The custom
+// hls.js loader below shares the exact playlist/segment promises.
+function hasPrewarmedCloudinaryHls(value) {
+  const hlsUrl = getCloudinaryHlsUrl(value);
+  if (!hlsUrl) return false;
+  return (
+    hlsManifestPreloadCompleted.has(`${hlsUrl}::auto::playlist`) ||
+    hlsManifestPreloadCompleted.has(`${hlsUrl}::auto::segment`) ||
+    hlsManifestPreloads.has(`${hlsUrl}::auto::playlist`) ||
+    hlsManifestPreloads.has(`${hlsUrl}::auto::segment`)
+  );
+}
+
+function getPrewarmedHlsFirstSegmentState(value) {
+  const hlsUrl = getCloudinaryHlsUrl(value);
+  if (!hlsUrl) return "unavailable";
+  const key = `${hlsUrl}::auto::segment`;
+  if (hlsManifestPreloadCompleted.has(key)) return "ready";
+  if (hlsManifestPreloads.has(key)) return "loading";
+  return "not-started";
 }
 
 let hlsLibraryPromise = null;
@@ -958,11 +1869,53 @@ function attachCloudinaryAdaptiveStream(
   initialQuality = "auto",
   resumeTime = 0,
   onRememberPosition = null,
+  onQualityNotice = null,
 ) {
   if (!video || !originalUrl || !fallbackUrl) return () => {};
 
   const hlsUrl = getCloudinaryHlsUrl(originalUrl);
   if (!hlsUrl) return () => {};
+
+  const directMp4Url = getDirectSpotliMp4Url(originalUrl);
+  const playbackAttachStartedAt = Date.now();
+  const playbackAttachPerformanceStartedAt = getSpotliHighResolutionNow();
+  const playbackDiagnosticId = `spotli-${++nextSpotliPlaybackDiagnosticId}`;
+  const getPlaybackElapsedMs = () =>
+    Math.round(
+      getSpotliHighResolutionNow() - playbackAttachPerformanceStartedAt,
+    );
+  const sourceParts = getSpotliCloudinaryAssetParts(originalUrl);
+  const hasLocalUploadCopy =
+    typeof fallbackUrl === "string" && fallbackUrl.startsWith("blob:");
+  if (directMp4Url && !hasLocalUploadCopy) {
+    // Request the current asset's first HLS segment before attaching the player.
+    // hls.js will share the in-flight master/playlist/segment via its warm loader.
+    preloadCloudinaryVideoStream(originalUrl, "auto", {
+      includeFirstSegment: true,
+    });
+  }
+  const hasWarmHlsStartup =
+    !hasLocalUploadCopy && hasPrewarmedCloudinaryHls(originalUrl);
+  const usePrewarmedHlsAtStartup = Boolean(hasWarmHlsStartup);
+  console.info("[Spotli playback] Active source selected", {
+    playbackId: playbackDiagnosticId,
+    // Include the full versioned Cloudinary asset path so this can be compared
+    // directly with the Home-grid HLS prewarm stage. Public IDs alone are not
+    // enough: two versioned URLs for the same public ID are different assets.
+    sourceAsset: sourceParts?.assetPath || null,
+    hlsUrl,
+    sourceFormat: sourceParts?.sourceFormat || "unknown",
+    strategy: directMp4Url
+      ? hasLocalUploadCopy
+        ? "local-mp4"
+        : usePrewarmedHlsAtStartup
+          ? "prewarmed-hls"
+          : "direct-mp4-fallback"
+      : "hls-with-progressive-fallback",
+    hasLocalUploadCopy,
+    hasWarmHlsStartup: usePrewarmedHlsAtStartup,
+    warmHlsFirstSegmentState: getPrewarmedHlsFirstSegmentState(originalUrl),
+  });
 
   const initialQualityKey =
     initialQuality === "auto" || initialQuality == null
@@ -970,25 +1923,63 @@ function attachCloudinaryAdaptiveStream(
       : String(
           Number.parseInt(String(initialQuality).replace(/[^0-9]/g, ""), 10),
         );
-  // Stop unfinished background work immediately on open. Waiting for an
-  // in-flight preloader made the viewer wait for the whole first segment (which
-  // took 17.8 seconds in the user's Network screenshot). Completed cacheable
-  // resources are kept; the active HLS player starts its own load right away.
-  cancelCloudinaryVideoPreloadsExcept(hlsUrl);
+  // Preserve the active video's in-flight HLS manifest/segment warm request;
+  // cancel only speculative work for other posts so they cannot compete.
+  cancelCloudinaryVideoPreloadsExcept(
+    usePrewarmedHlsAtStartup || !directMp4Url ? hlsUrl : "",
+  );
 
   let cancelled = false;
   let hls = null;
+  let firstMainFragmentKey = "";
+  let firstMainFragmentRequestedAt = 0;
+  let firstMainFragmentLoadedAt = 0;
+  let firstMainFragmentBuffered = false;
+  const getHlsLevelDiagnostics = (levelIndex = hls?.currentLevel) => {
+    const index = Number.isInteger(levelIndex)
+      ? levelIndex
+      : Number(levelIndex);
+    const level =
+      Number.isInteger(index) && index >= 0 ? hls?.levels?.[index] : null;
+    if (!level) return null;
+    const width = Number(level.width) || 0;
+    const height = Number(level.height) || 0;
+    const bitrate = Number(level.bitrate) || 0;
+    return {
+      levelIndex: index,
+      resolution: width && height ? `${width}x${height}` : null,
+      qualityTierHeight:
+        width && height ? Math.min(width, height) : height || null,
+      bitrateKbps: bitrate ? Math.round(bitrate / 1000) : null,
+      maxBitrateKbps: Number(level.maxBitrate)
+        ? Math.round(Number(level.maxBitrate) / 1000)
+        : null,
+      codec: level.videoCodec || level.codecSet || null,
+    };
+  };
+  const getFragmentDiagnostics = (frag) => ({
+    type: frag?.type || null,
+    levelIndex: Number.isInteger(frag?.level) ? frag.level : null,
+    sequence: Number.isFinite(Number(frag?.sn))
+      ? Number(frag.sn)
+      : String(frag?.sn || ""),
+    durationSeconds: Number.isFinite(Number(frag?.duration))
+      ? Math.round(Number(frag.duration) * 1000) / 1000
+      : null,
+    url: frag?.url || null,
+  });
   let networkRetries = 0;
   let mediaRetries = 0;
+  let directMp4Failed = false;
+  let directMp4ErrorHandler = null;
+  const startupRetryTimers = new Set();
   let manualRecoveryAttempts = 0;
   let selectedStreamQuality =
     initialQualityKey === "NaN" ? "auto" : initialQualityKey;
   let streamHasPlayed = false;
   let streamLoadStarted = false;
-  // Start Auto at a network-aware low level, then re-enable adaptation once the
-  // first fragment is buffered. Auto can move up or down according to real
-  // throughput; manual quality selection remains fixed by selectedStreamQuality.
-  let autoStartupLevelPending = false;
+  // Auto and manual quality both remain fixed to their selected rendition for
+  // this clip; the active profile only determines the allowed maximum height.
   const savedResumeTime = Number.isFinite(Number(resumeTime))
     ? Math.max(0, Number(resumeTime))
     : 0;
@@ -1024,10 +2015,56 @@ function attachCloudinaryAdaptiveStream(
   };
 
   const onVideoPlaying = () => {
+    if (directMp4ErrorHandler) {
+      video.removeEventListener("error", directMp4ErrorHandler);
+      directMp4ErrorHandler = null;
+    }
+    if (!streamHasPlayed) {
+      const currentSrc = String(video.currentSrc || video.src || "");
+      // hls.js attaches a MediaSource through a blob: URL. That is not the
+      // recently uploaded local File/Blob cache; identify it as HLS explicitly.
+      const source = hls
+        ? "cloudinary-hls-mse"
+        : hasLocalUploadCopy
+          ? "local-upload-cache"
+          : currentSrc.startsWith("blob:")
+            ? "blob-backed-media"
+            : directMp4Failed
+              ? "hls-fallback"
+              : "cloudinary-mp4";
+      console.info("[Spotli playback] First frame playing", {
+        playbackId: playbackDiagnosticId,
+        elapsedMs: getPlaybackElapsedMs(),
+        legacyElapsedMs: Date.now() - playbackAttachStartedAt,
+        source,
+        selectedQuality: selectedStreamQuality,
+        activeRendition: getHlsLevelDiagnostics(),
+        bufferedAheadSeconds:
+          Math.round(getSpotliBufferedAheadSeconds(video) * 100) / 100,
+        readyState: video.readyState,
+        networkState: video.networkState,
+      });
+    }
     streamHasPlayed = true;
     rememberPosition();
   };
+  const onVideoWaiting = () => {
+    console.warn("[Spotli playback] Video waiting for media data", {
+      playbackId: playbackDiagnosticId,
+      elapsedMs: getPlaybackElapsedMs(),
+      afterFirstFrame: streamHasPlayed,
+      currentTimeSeconds:
+        Math.round((Number(video.currentTime) || 0) * 100) / 100,
+      bufferedAheadSeconds:
+        Math.round(getSpotliBufferedAheadSeconds(video) * 100) / 100,
+      readyState: video.readyState,
+      networkState: video.networkState,
+      activeRendition: getHlsLevelDiagnostics(),
+      sourceMode: hls ? "hls" : "progressive-mp4",
+    });
+  };
   video.addEventListener("playing", onVideoPlaying);
+  video.addEventListener("waiting", onVideoWaiting);
   video.addEventListener("timeupdate", rememberPosition);
   video.addEventListener("loadedmetadata", restoreResumePosition);
   video.addEventListener("durationchange", restoreResumePosition);
@@ -1069,25 +2106,125 @@ function attachCloudinaryAdaptiveStream(
   video.addEventListener("loadeddata", onMediaReady);
   video.addEventListener("canplay", onMediaReady);
 
+  const installDirectMp4FallbackHandler = () => {
+    if (!directMp4Url || directMp4ErrorHandler) return;
+    directMp4ErrorHandler = () => {
+      if (cancelled || directMp4Failed) return;
+      directMp4Failed = true;
+      if (directMp4ErrorHandler) {
+        video.removeEventListener("error", directMp4ErrorHandler);
+        directMp4ErrorHandler = null;
+      }
+      console.warn(
+        "[Spotli playback] Optimized MP4 fallback failed; switching to Cloudinary HLS",
+        { mediaErrorCode: video.error?.code || null },
+      );
+      start(true).catch((error) => {
+        if (cancelled) return;
+        console.error(
+          "[Spotli playback] HLS fallback initialization failed",
+          error,
+        );
+        onQualityNotice?.(
+          "This video is temporarily unavailable. Please try again shortly.",
+        );
+      });
+    };
+    video.addEventListener("error", directMp4ErrorHandler);
+  };
+
   const useProgressiveFallback = () => {
     if (cancelled) return;
+    if (directMp4Failed) {
+      // Never cycle back to an MP4 URL the browser has already reported as
+      // unavailable. Keep/restore HLS instead of repeatedly restarting a 404.
+      return;
+    }
     if (hls) {
       hls.destroy();
       hls = null;
     }
+    cancelCloudinaryVideoPreload(originalUrl, "auto");
+    installDirectMp4FallbackHandler();
     onQualityControllerChange?.(null);
     onQualityOptionsChange?.([]);
-    video.src = fallbackUrl;
-    video.load();
+
+    let targetUrl = String(fallbackUrl || "");
+    let currentSrc = String(video.currentSrc || video.src || "");
+    try {
+      if (targetUrl) targetUrl = new URL(targetUrl, document.baseURI).href;
+      if (currentSrc) currentSrc = new URL(currentSrc, document.baseURI).href;
+    } catch {
+      // Keep the original strings when URL normalization is unavailable.
+    }
+    if (
+      currentSrc !== targetUrl ||
+      video.error ||
+      (video.readyState === 0 && video.networkState !== 2)
+    ) {
+      video.src = fallbackUrl;
+      video.load();
+    } else if (video.readyState > 0 || video.networkState === 2) {
+      console.info("[Spotli playback] Reusing preloaded active video element", {
+        readyState: video.readyState,
+        networkState: video.networkState,
+      });
+    }
     playIfRequested();
   };
 
-  const onNativeHlsError = () => useProgressiveFallback();
+  const onNativeHlsError = () => {
+    if (!directMp4Failed) {
+      useProgressiveFallback();
+      return;
+    }
+    if (networkRetries < 2) {
+      networkRetries += 1;
+      const timerId = setTimeout(() => {
+        startupRetryTimers.delete(timerId);
+        if (!cancelled) startNativeHls();
+      }, 350 * networkRetries);
+      startupRetryTimers.add(timerId);
+      return;
+    }
+    console.error("[Spotli playback] MP4 and native HLS both failed", {
+      source: hlsUrl,
+      mediaErrorCode: video.error?.code || null,
+    });
+    onQualityNotice?.(
+      "This video is temporarily unavailable. Please try again shortly.",
+    );
+  };
 
   const startNativeHls = () => {
     if (cancelled) return;
     onQualityControllerChange?.(null);
     onQualityOptionsChange?.([]);
+
+    // Native HLS players (notably iOS Safari) don't expose a reliable way for
+    // this app to cap the rendition. In Data Saver, use the pre-generated
+    // 360px MP4 derivative instead of allowing native ABR to select 720p/1080p.
+    if (getNetworkPlaybackProfile().dataSaver && !hasLocalUploadCopy) {
+      if (directMp4Failed) {
+        onQualityNotice?.(
+          "The low-data version of this video isn't ready yet. Please try again shortly.",
+        );
+        return;
+      }
+      installDirectMp4FallbackHandler();
+      video.preload = "auto";
+      video.src = fallbackUrl;
+      video.load();
+      playIfRequested();
+      console.info(
+        "[Spotli playback] Native Data Saver playback uses optimized 360p MP4",
+        {
+          playbackId: playbackDiagnosticId,
+        },
+      );
+      return;
+    }
+
     video.preload = "auto";
     video.addEventListener("error", onNativeHlsError, { once: true });
     video.src = hlsUrl;
@@ -1095,10 +2232,42 @@ function attachCloudinaryAdaptiveStream(
     playIfRequested();
   };
 
-  const start = async () => {
+  const start = async (forceHls = false) => {
     const nativeHlsSupported = Boolean(
       video.canPlayType("application/vnd.apple.mpegurl"),
     );
+
+    // A just-uploaded local Blob remains the fastest possible source. For
+    // Cloudinary MP4s, prefer the eagerly generated HLS stream when its prewarm
+    // has started; the warm loader shares in-flight requests and the first
+    // segment can begin without waiting for a separate MP4 range response.
+    // If HLS is locked/unavailable, fall back to the original MP4 immediately.
+    if (directMp4Url && !forceHls && !usePrewarmedHlsAtStartup) {
+      if (hasLocalUploadCopy) {
+        console.info(
+          "[Spotli playback] Starting the just-uploaded local MP4; no CDN wait",
+        );
+      } else {
+        console.info(
+          "[Spotli playback] HLS prewarm unavailable; using optimized Cloudinary MP4 fallback",
+          { hlsUrl },
+        );
+      }
+      if (video.error) {
+        installDirectMp4FallbackHandler();
+        directMp4ErrorHandler?.();
+      } else {
+        useProgressiveFallback();
+      }
+      return;
+    }
+
+    if (directMp4Url && usePrewarmedHlsAtStartup && !forceHls) {
+      console.info(
+        "[Spotli playback] Starting prewarmed Cloudinary HLS; sharing prepared playlist/segment requests",
+        { playbackId: playbackDiagnosticId },
+      );
+    }
 
     // iPhone/iPad Safari without MSE already has a native HLS decoder. Attach
     // its source immediately instead of waiting for hls.js to download and then
@@ -1114,7 +2283,17 @@ function attachCloudinaryAdaptiveStream(
 
     // hls.js is requested from the app's own split bundle early during Home
     // startup, so this should usually already be resolved when the user taps.
+    const hlsLibraryStartedAt = getSpotliHighResolutionNow();
     const Hls = await loadHlsLibrary();
+    console.info("[Spotli playback] HLS engine ready", {
+      playbackId: playbackDiagnosticId,
+      elapsedMs: getPlaybackElapsedMs(),
+      libraryWaitMs: Math.round(
+        getSpotliHighResolutionNow() - hlsLibraryStartedAt,
+      ),
+      version: Hls?.version || null,
+      supported: Boolean(Hls?.isSupported?.()),
+    });
     if (cancelled) return;
 
     if (!Hls || !Hls.isSupported()) {
@@ -1130,6 +2309,24 @@ function attachCloudinaryAdaptiveStream(
     }
 
     const networkProfile = getNetworkPlaybackProfile();
+    const connectionInformation =
+      typeof navigator !== "undefined" ? navigator.connection : null;
+    console.info("[Spotli playback] HLS startup network profile", {
+      playbackId: playbackDiagnosticId,
+      constrained: networkProfile.constrained,
+      touchDevice: networkProfile.touchDevice,
+      dataSaver: networkProfile.dataSaver,
+      autoHeightCap: networkProfile.startupHeight,
+      defaultBandwidthKbps: Math.round(
+        networkProfile.defaultBandwidthEstimate / 1000,
+      ),
+      startupBandwidthBudgetKbps: Math.round(
+        networkProfile.startupBandwidthBudget / 1000,
+      ),
+      effectiveType: connectionInformation?.effectiveType || null,
+      downlinkMbps: Number(connectionInformation?.downlink) || null,
+      rttMs: Number(connectionInformation?.rtt) || null,
+    });
     hls = new Hls({
       loader: createWarmCacheLoader(Hls),
       enableWorker: true,
@@ -1140,40 +2337,93 @@ function attachCloudinaryAdaptiveStream(
       // estimate and a 550 kbps minimum made HLS choose 480p even on a ~0.59 Mbps
       // connection, producing a 1.4 MB segment that took 17.8 seconds to download.
       abrEwmaDefaultEstimate: networkProfile.defaultBandwidthEstimate,
-      abrBandWidthFactor: networkProfile.constrained ? 0.88 : 0.92,
-      abrBandWidthUpFactor: networkProfile.constrained ? 0.84 : 0.9,
-      maxStarvationDelay: networkProfile.constrained ? 2 : 3,
-      maxLoadingDelay: networkProfile.constrained ? 3 : 4,
+      abrBandWidthFactor: networkProfile.dataSaver
+        ? 0.72
+        : networkProfile.touchDevice
+          ? 0.78
+          : networkProfile.constrained
+            ? 0.88
+            : 0.92,
+      abrBandWidthUpFactor: networkProfile.dataSaver
+        ? 0.6
+        : networkProfile.touchDevice
+          ? 0.68
+          : networkProfile.constrained
+            ? 0.84
+            : 0.9,
+      maxStarvationDelay: networkProfile.dataSaver
+        ? 1.5
+        : networkProfile.touchDevice
+          ? 1.5
+          : networkProfile.constrained
+            ? 2
+            : 3,
+      maxLoadingDelay: networkProfile.dataSaver
+        ? 2
+        : networkProfile.touchDevice
+          ? 2
+          : networkProfile.constrained
+            ? 3
+            : 4,
+      // The first segment is warmed/shared by Spotli's cache loader. Keep
+      // hls.js start-fragment prefetch enabled so the initial media request is
+      // issued as soon as the startup rendition is known.
       startFragPrefetch: true,
       // Wait until the manifest is parsed so the first level can be selected
       // deliberately. Auto starts from the same small rendition warmed by the
       // Home-card preloader, rather than guessing a high level on the click path.
       autoStartLoad: false,
-      // Cloudinary can supply renditions up to 1080p when the source supports
-      // it. Do not cap to the rendered element size, which can override a
+      // Cloudinary serves the custom 1030p rendition when the source supports it.
+      // Do not cap to the rendered element size, which can override a
       // viewer's explicit manual quality choice on smaller screens.
       capLevelToPlayerSize: false,
-      maxBufferLength: networkProfile.touchDevice
-        ? 6
-        : networkProfile.constrained
-          ? 8
-          : 14,
-      maxMaxBufferLength: networkProfile.touchDevice
-        ? 12
-        : networkProfile.constrained
-          ? 14
-          : 24,
-      backBufferLength: networkProfile.touchDevice ? 3 : 6,
-      manifestLoadingMaxRetry: 2,
-      levelLoadingMaxRetry: 2,
-      fragLoadingMaxRetry: 3,
+      // Keep the forward buffer deliberately small on mobile. This reduces
+      // bytes downloaded for clips the viewer quickly scrolls past.
+      maxBufferLength: networkProfile.dataSaver
+        ? 2
+        : networkProfile.touchDevice
+          ? networkProfile.constrained
+            ? 2.5
+            : 3
+          : networkProfile.constrained
+            ? 6
+            : 10,
+      maxMaxBufferLength: networkProfile.dataSaver
+        ? 2.5
+        : networkProfile.touchDevice
+          ? networkProfile.constrained
+            ? 3.5
+            : 4.5
+          : networkProfile.constrained
+            ? 12
+            : 18,
+      maxBufferSize: networkProfile.dataSaver
+        ? 4 * 1024 * 1024
+        : networkProfile.touchDevice
+          ? (networkProfile.constrained ? 6 : 8) * 1024 * 1024
+          : (networkProfile.constrained ? 24 : 40) * 1024 * 1024,
+      backBufferLength:
+        networkProfile.dataSaver || networkProfile.touchDevice ? 0 : 4,
+      // Give transient playlist CDN errors one short retry in normal mode.
+      // Keep Data Saver at zero retries and do not retry large media fragments:
+      // a failed fragment can fall back to the optimized progressive MP4 quickly.
+      manifestLoadingTimeOut: 2_000,
+      manifestLoadingMaxRetry: networkProfile.dataSaver ? 0 : 1,
+      manifestLoadingRetryDelay: 250,
+      manifestLoadingMaxRetryTimeout: 500,
+      levelLoadingTimeOut: 2_500,
+      levelLoadingMaxRetry: networkProfile.dataSaver ? 0 : 1,
+      levelLoadingRetryDelay: 250,
+      levelLoadingMaxRetryTimeout: 500,
+      fragLoadingTimeOut: 7_000,
+      fragLoadingMaxRetry: 0,
     });
 
     const publishQualityOptions = () => {
       if (cancelled || !hls) return;
       const bestLevelByHeight = new Map();
       hls.levels.forEach((level, index) => {
-        const height = Number(level.height) || 0;
+        const height = getQualityTierHeight(level);
         const bitrate = Number(level.bitrate) || 0;
         if (!height) return;
         const existing = bestLevelByHeight.get(height);
@@ -1189,7 +2439,10 @@ function attachCloudinaryAdaptiveStream(
       const options = [...bestLevelByHeight.values()].sort(
         (a, b) => a.height - b.height,
       );
-      onQualityOptionsChange?.(options);
+      const atOrAboveFloor = options.filter(
+        (option) => option.height >= MIN_AUTOMATIC_QUALITY_HEIGHT,
+      );
+      onQualityOptionsChange?.(atOrAboveFloor);
     };
 
     const getLevelForRequestedQuality = (requestedQuality) => {
@@ -1198,7 +2451,7 @@ function attachCloudinaryAdaptiveStream(
       const available = hls.levels
         .map((level, index) => ({
           index,
-          height: Number(level.height) || 0,
+          height: getQualityTierHeight(level),
           bitrate: Number(level.bitrate) || 0,
         }))
         .filter((level) => level.height > 0);
@@ -1206,29 +2459,22 @@ function attachCloudinaryAdaptiveStream(
       if (!available.length) return null;
 
       if (requestedQuality === "auto" || requestedQuality == null) {
-        // Choose the clearest available rendition within the network-aware
-        // startup budget. The same rule is used by preloadCloudinaryVideoStream
-        // so the cached first fragment matches the active player request.
-        const withinHeight = available.filter(
-          (level) => level.height <= networkProfile.startupHeight,
-        );
-        const pool = withinHeight.length ? withinHeight : available;
-        const withinBudget = pool.filter(
-          (level) =>
-            !level.bitrate ||
-            level.bitrate <= networkProfile.startupBandwidthBudget,
-        );
-        return (
-          [...withinBudget].sort(
-            (a, b) => b.height - a.height || b.bitrate - a.bitrate,
-          )[0] ||
-          [...pool].sort(
-            (a, b) =>
-              (a.bitrate || Number.POSITIVE_INFINITY) -
-                (b.bitrate || Number.POSITIVE_INFINITY) || a.height - b.height,
-          )[0] ||
-          [...available].sort((a, b) => a.bitrate - b.bitrate)[0]
-        );
+        // Auto respects the current low-data cap. Data Saver uses the 360p
+        // rendition; normal touch playback stays capped at 720p. Manual quality
+        // selections remain available and are not restricted by this Auto cap.
+        const hasAutoHeightCap =
+          networkProfile.dataSaver || networkProfile.touchDevice;
+        const autoEligible = hasAutoHeightCap
+          ? available.filter(
+              (level) => level.height <= networkProfile.startupHeight,
+            )
+          : available;
+        const selectable = autoEligible.length ? autoEligible : available;
+        // Auto keeps the best quality allowed by the active profile. The
+        // startup bandwidth estimate is not used to force a lower resolution.
+        return [...selectable].sort(
+          (a, b) => b.height - a.height || b.bitrate - a.bitrate,
+        )[0];
       }
 
       const requestedHeight = Number(requestedQuality);
@@ -1247,7 +2493,62 @@ function attachCloudinaryAdaptiveStream(
       );
     };
 
+    const getLowDataAutoLevelCapIndex = () => {
+      const hasAutoHeightCap =
+        networkProfile.dataSaver || networkProfile.touchDevice;
+      if (!hls?.levels?.length || !hasAutoHeightCap) return -1;
+      const eligible = hls.levels
+        .map((level, index) => ({
+          index,
+          height: getQualityTierHeight(level),
+          bitrate: Number(level.bitrate) || 0,
+        }))
+        .filter(
+          (level) =>
+            level.height > 0 && level.height <= networkProfile.startupHeight,
+        );
+
+      if (eligible.length) {
+        // hls.js level arrays are bitrate ordered; cap Auto at the last level
+        // whose orientation-neutral height fits the active Data Saver/mobile cap.
+        return Math.max(...eligible.map((level) => level.index));
+      }
+
+      const lowest = hls.levels
+        .map((level, index) => ({ index, bitrate: Number(level.bitrate) || 0 }))
+        .sort(
+          (a, b) =>
+            (a.bitrate || Number.MAX_SAFE_INTEGER) -
+            (b.bitrate || Number.MAX_SAFE_INTEGER),
+        )[0];
+      return Number.isInteger(lowest?.index) ? lowest.index : -1;
+    };
+
+    const applyLowDataAutoLevelCap = () => {
+      if (!hls) return;
+      const hasAutoHeightCap =
+        networkProfile.dataSaver || networkProfile.touchDevice;
+      if (selectedStreamQuality !== "auto" || !hasAutoHeightCap) {
+        hls.autoLevelCapping = -1;
+        return;
+      }
+      hls.autoLevelCapping = getLowDataAutoLevelCapIndex();
+    };
+
     onQualityControllerChange?.({
+      isPoorNetworkForQuality: (requestedQuality) => {
+        if (networkProfile.constrained) return true;
+        const requestedHeight = Number(requestedQuality);
+        const targetLevel = hls?.levels?.find(
+          (level) => getQualityTierHeight(level) === requestedHeight,
+        );
+        const measuredBandwidth = Number(hls?.bandwidthEstimate) || 0;
+        return Boolean(
+          targetLevel &&
+          measuredBandwidth > 0 &&
+          Number(targetLevel.bitrate) > measuredBandwidth * 0.85,
+        );
+      },
       selectQuality: (requestedQuality) => {
         // Store the user's choice even before the manifest arrives. MANIFEST_PARSED
         // uses it to choose the initial rendition before any segment is requested.
@@ -1258,30 +2559,40 @@ function attachCloudinaryAdaptiveStream(
 
         if (!hls) return;
         hls.capLevelToPlayerSize = false;
-        hls.autoLevelCapping = -1;
+        applyLowDataAutoLevelCap();
 
         const target = getLevelForRequestedQuality(selectedStreamQuality);
         if (!target) return;
 
+        if (selectedStreamQuality === "auto") {
+          // Auto means the best rendition allowed by the existing profile, not
+          // automatic quality reduction when a short bandwidth sample changes.
+          // Keep the selected level fixed for this video to preserve picture quality.
+          hls.startLevel = target.index;
+          hls.loadLevel = target.index;
+          if (streamLoadStarted) {
+            if (video.paused) {
+              if (hls.currentLevel !== target.index) {
+                hls.currentLevel = target.index;
+              }
+            } else if (hls.nextLevel !== target.index) {
+              hls.nextLevel = target.index;
+            }
+          }
+          return;
+        }
+
         if (!streamLoadStarted) {
           hls.startLevel = target.index;
-          // Setting loadLevel locks hls.js to the user's selected rendition;
-          // Auto mode alone is allowed to adapt down when bandwidth falls.
-          hls.loadLevel = selectedStreamQuality === "auto" ? -1 : target.index;
+          hls.loadLevel = target.index;
           return;
         }
 
-        if (selectedStreamQuality === "auto") {
-          autoStartupLevelPending = false;
-          hls.currentLevel = -1;
-          return;
-        }
+        // A manual quality choice is a lock. Switch at the earliest safe
+        // fragment boundary without flushing the already-buffered video.
+        hls.startLevel = target.index;
+        hls.loadLevel = target.index;
 
-        autoStartupLevelPending = false;
-
-        // Do not let player dimensions or a previous auto cap downgrade a
-        // viewer's explicit quality selection. While playing, nextLevel switches
-        // at the earliest safe boundary without flushing the current buffer.
         if (video.paused) {
           if (hls.currentLevel !== target.index)
             hls.currentLevel = target.index;
@@ -1298,26 +2609,205 @@ function attachCloudinaryAdaptiveStream(
       if (!cancelled && hls) hls.loadSource(hlsUrl);
     });
 
-    hls.on(Hls.Events.MANIFEST_PARSED, () => {
+    hls.on(Hls.Events.MANIFEST_LOADING, (_event, data) => {
+      console.info("[Spotli playback] HLS master playlist requested", {
+        playbackId: playbackDiagnosticId,
+        elapsedMs: getPlaybackElapsedMs(),
+        url: data?.url || hlsUrl,
+      });
+    });
+
+    hls.on(Hls.Events.MANIFEST_LOADED, (_event, data) => {
+      const stats = data?.stats || {};
+      const loading = stats.loading || {};
+      console.info("[Spotli playback] HLS master playlist loaded", {
+        playbackId: playbackDiagnosticId,
+        elapsedMs: getPlaybackElapsedMs(),
+        requestMs:
+          Number(loading.end) > 0 && Number(loading.start) > 0
+            ? Math.round(loading.end - loading.start)
+            : null,
+        firstByteMs:
+          Number(loading.first) > 0 && Number(loading.start) > 0
+            ? Math.round(loading.first - loading.start)
+            : null,
+        levelCount: Array.isArray(data?.levels) ? data.levels.length : 0,
+        resourceTiming: getSpotliResourceTiming(data?.url || hlsUrl),
+      });
+    });
+
+    hls.on(Hls.Events.LEVEL_LOADING, (_event, data) => {
+      console.info("[Spotli playback] HLS rendition playlist requested", {
+        playbackId: playbackDiagnosticId,
+        elapsedMs: getPlaybackElapsedMs(),
+        levelIndex: data?.level ?? null,
+        requestedRendition: getHlsLevelDiagnostics(data?.level),
+        url: data?.url || null,
+      });
+    });
+
+    hls.on(Hls.Events.LEVEL_LOADED, (_event, data) => {
+      const stats = data?.stats || {};
+      const loading = stats.loading || {};
+      const details = data?.details || {};
+      console.info("[Spotli playback] HLS rendition playlist loaded", {
+        playbackId: playbackDiagnosticId,
+        elapsedMs: getPlaybackElapsedMs(),
+        levelIndex: data?.level ?? null,
+        rendition: getHlsLevelDiagnostics(data?.level),
+        requestMs:
+          Number(loading.end) > 0 && Number(loading.start) > 0
+            ? Math.round(loading.end - loading.start)
+            : null,
+        firstByteMs:
+          Number(loading.first) > 0 && Number(loading.start) > 0
+            ? Math.round(loading.first - loading.start)
+            : null,
+        firstSegmentDurationSeconds:
+          Number(details.fragments?.[0]?.duration) || null,
+        totalPlaylistDurationSeconds: Number(details.totalduration) || null,
+        fragmentCount: Array.isArray(details.fragments)
+          ? details.fragments.length
+          : null,
+        resourceTiming: getSpotliResourceTiming(data?.url || ""),
+      });
+    });
+
+    hls.on(Hls.Events.FRAG_LOADING, (_event, data) => {
+      const frag = data?.frag;
+      if (
+        !firstMainFragmentRequestedAt &&
+        frag &&
+        (!frag.type || frag.type === "main") &&
+        Number.isFinite(Number(frag.sn))
+      ) {
+        firstMainFragmentKey = `${frag.level}:${frag.sn}:${frag.url || ""}`;
+        firstMainFragmentRequestedAt = getSpotliHighResolutionNow();
+        console.info("[Spotli playback] First HLS media segment requested", {
+          playbackId: playbackDiagnosticId,
+          elapsedMs: getPlaybackElapsedMs(),
+          fragment: getFragmentDiagnostics(frag),
+          rendition: getHlsLevelDiagnostics(frag.level),
+        });
+      }
+    });
+
+    hls.on(Hls.Events.FRAG_LOADED, (_event, data) => {
+      const frag = data?.frag;
+      if (!frag || !firstMainFragmentKey) return;
+      const fragmentKey = `${frag.level}:${frag.sn}:${frag.url || ""}`;
+      if (fragmentKey !== firstMainFragmentKey || firstMainFragmentLoadedAt)
+        return;
+
+      firstMainFragmentLoadedAt = getSpotliHighResolutionNow();
+      const stats = data?.stats || frag.stats || {};
+      const loading = stats.loading || {};
+      const requestMs =
+        Number(loading.end) > 0 && Number(loading.start) > 0
+          ? Math.round(loading.end - loading.start)
+          : null;
+      const firstByteMs =
+        Number(loading.first) > 0 && Number(loading.start) > 0
+          ? Math.round(loading.first - loading.start)
+          : null;
+      const downloadMs =
+        Number(loading.end) > 0 && Number(loading.first) > 0
+          ? Math.round(loading.end - loading.first)
+          : null;
+      const loadedBytes =
+        Number(stats.loaded) || data?.payload?.byteLength || 0;
+      console.info("[Spotli playback] First HLS media segment downloaded", {
+        playbackId: playbackDiagnosticId,
+        elapsedMs: getPlaybackElapsedMs(),
+        fragment: getFragmentDiagnostics(frag),
+        rendition: getHlsLevelDiagnostics(frag.level),
+        loadedBytes,
+        requestMs,
+        firstByteMs,
+        downloadMs,
+        measuredMbps:
+          downloadMs > 0 && loadedBytes > 0
+            ? Math.round(
+                ((loadedBytes * 8) / (downloadMs / 1000) / 1_000_000) * 100,
+              ) / 100
+            : null,
+        resourceTiming: getSpotliResourceTiming(frag.url || ""),
+      });
+    });
+
+    hls.on(Hls.Events.FRAG_BUFFERED, (_event, data) => {
+      const frag = data?.frag;
+      if (
+        firstMainFragmentBuffered ||
+        !frag ||
+        !firstMainFragmentKey ||
+        `${frag.level}:${frag.sn}:${frag.url || ""}` !== firstMainFragmentKey
+      ) {
+        return;
+      }
+      firstMainFragmentBuffered = true;
+      console.info("[Spotli playback] First HLS media segment buffered", {
+        playbackId: playbackDiagnosticId,
+        elapsedMs: getPlaybackElapsedMs(),
+        timeFromRequestMs: firstMainFragmentRequestedAt
+          ? Math.round(
+              getSpotliHighResolutionNow() - firstMainFragmentRequestedAt,
+            )
+          : null,
+        timeFromDownloadMs: firstMainFragmentLoadedAt
+          ? Math.round(getSpotliHighResolutionNow() - firstMainFragmentLoadedAt)
+          : null,
+        fragment: getFragmentDiagnostics(frag),
+        rendition: getHlsLevelDiagnostics(frag.level),
+        bufferedAheadSeconds:
+          Math.round(getSpotliBufferedAheadSeconds(video) * 100) / 100,
+        readyState: video.readyState,
+      });
+    });
+
+    hls.on(Hls.Events.MANIFEST_PARSED, (_event, data) => {
       publishQualityOptions();
       if (cancelled || !hls) return;
 
-      // Do not set a 480p minimum in Auto mode. A hard quality floor can force
-      // multi-megabyte first fragments on a weak mobile connection and delay the
-      // first frame. Auto starts conservatively and may improve after buffering;
-      // an explicit user-selected quality remains locked as requested.
+      const availableLevels = hls.levels
+        .map((level, index) => ({
+          index,
+          height: getQualityTierHeight(level),
+          bitrate: Number(level.bitrate) || 0,
+          maxBitrate: Number(level.maxBitrate) || 0,
+        }))
+        .filter((level) => level.height > 0);
+      applyLowDataAutoLevelCap();
       const startupLevel = getLevelForRequestedQuality(selectedStreamQuality);
       if (startupLevel) {
+        console.info(
+          selectedStreamQuality === "auto"
+            ? "[Spotli playback] Auto startup rendition selected"
+            : "[Spotli playback] Manual startup rendition locked",
+          {
+            playbackId: playbackDiagnosticId,
+            elapsedMs: getPlaybackElapsedMs(),
+            selectedQuality: selectedStreamQuality,
+            autoMaxHeight: networkProfile.touchDevice ? 720 : null,
+            autoLevelCapping: hls.autoLevelCapping,
+            autoQualityLocked: selectedStreamQuality === "auto",
+            rendition: getHlsLevelDiagnostics(startupLevel.index),
+            availableRenditions: availableLevels.map((level) => ({
+              index: level.index,
+              height: level.height,
+              bitrateKbps: Math.round(level.bitrate / 1000),
+            })),
+          },
+        );
         hls.startLevel = startupLevel.index;
-        // In Auto mode, use this small first fragment to get playback started;
-        // ABR is re-enabled after it is buffered below and may improve quality.
-        // An explicit user quality is honored from the very first fragment.
+
         if (selectedStreamQuality === "auto") {
+          // Keep Auto on the highest rendition allowed by this profile for the
+          // whole clip. This avoids quality drops after the first fragment and
+          // matches the exact rendition prepared by the feed prewarmer.
           hls.loadLevel = startupLevel.index;
-          autoStartupLevelPending = true;
         } else {
           hls.loadLevel = startupLevel.index;
-          autoStartupLevelPending = false;
         }
       }
       // Do not wait for any speculative preload here. On slow mobile links,
@@ -1338,21 +2828,74 @@ function attachCloudinaryAdaptiveStream(
       networkRetries = 0;
       mediaRetries = 0;
       manualRecoveryAttempts = 0;
-
-      // Switch Auto mode back to ABR after the first low-bitrate fragment is
-      // safely buffered. This is intentionally one-shot, not a quality lock.
-      if (autoStartupLevelPending && selectedStreamQuality === "auto" && hls) {
-        autoStartupLevelPending = false;
-        // Release both the explicit startup level and load-level override. This
-        // lets HLS.js use measured fragment throughput to move up to 480p/720p
-        // where sustainable, instead of lingering at the startup rendition.
-        hls.startLevel = -1;
-        hls.loadLevel = -1;
-      }
     });
 
     hls.on(Hls.Events.ERROR, (_event, data) => {
-      if (cancelled || !data?.fatal) return;
+      if (cancelled || !data) return;
+
+      const errorDetails = String(data.details || "").toLowerCase();
+      const startupHlsNetworkFailure =
+        !streamHasPlayed &&
+        data.type === Hls.ErrorTypes.NETWORK_ERROR &&
+        ["manifestload", "levelload", "fragload"].some((part) =>
+          errorDetails.includes(part),
+        );
+
+      if (startupHlsNetworkFailure) {
+        console.warn("[Spotli playback] HLS startup request error", {
+          playbackId: playbackDiagnosticId,
+          elapsedMs: getPlaybackElapsedMs(),
+          fatal: Boolean(data.fatal),
+          details: data.details || null,
+          responseCode: data.response?.code || data.response?.status || null,
+          url: data.url || data.response?.url || null,
+          playlistRetries: networkProfile.dataSaver ? 0 : 1,
+          fragmentRetries: 0,
+        });
+      }
+
+      // hls.js emits non-fatal request errors while its configured playlist
+      // retry is running. Do not switch to MP4 until that retry is exhausted.
+      if (startupHlsNetworkFailure && data.fatal) {
+        if (directMp4Failed) {
+          if (networkRetries < 3 && hls) {
+            networkRetries += 1;
+            const timerId = setTimeout(() => {
+              startupRetryTimers.delete(timerId);
+              if (!cancelled && hls) hls.startLoad();
+            }, 350 * networkRetries);
+            startupRetryTimers.add(timerId);
+            console.warn(
+              "[Spotli playback] Retrying HLS after MP4 delivery failed",
+              {
+                attempt: networkRetries,
+                reason: data.details || data.type,
+              },
+            );
+            return;
+          }
+          console.error(
+            "[Spotli playback] Direct MP4 and HLS startup both unavailable",
+            {
+              reason: data.details || data.type,
+            },
+          );
+          onQualityNotice?.(
+            "This video is still preparing for playback. Try again shortly.",
+          );
+          return;
+        }
+        console.info(
+          "[Spotli playback] HLS playlist retry exhausted; using MP4 fallback",
+          {
+            reason: data.details || data.type,
+          },
+        );
+        useProgressiveFallback();
+        return;
+      }
+
+      if (!data.fatal) return;
 
       if (data.type === Hls.ErrorTypes.NETWORK_ERROR && networkRetries < 2) {
         networkRetries += 1;
@@ -1395,11 +2938,20 @@ function attachCloudinaryAdaptiveStream(
     hls.attachMedia(video);
   };
 
-  start().catch(() => {
-    // Don't silently downgrade a fixed quality if initialization fails.
-    // Native HLS may still honor the stream on Safari; otherwise report the
-    // limitation and leave the selected stream intact for a retry.
+  start().catch((error) => {
+    // Don't cycle back to a direct MP4 request that has already failed. Keep
+    // the failure visible and preserve the HLS fallback path for a retry.
     if (cancelled) return;
+    if (directMp4Failed) {
+      console.error(
+        "[Spotli playback] HLS fallback initialization failed",
+        error,
+      );
+      onQualityNotice?.(
+        "This video is temporarily unavailable. Please try again shortly.",
+      );
+      return;
+    }
     if (selectedStreamQuality !== "auto") {
       const nativeHlsSupported = Boolean(
         video.canPlayType("application/vnd.apple.mpegurl"),
@@ -1419,10 +2971,17 @@ function attachCloudinaryAdaptiveStream(
   return () => {
     cancelled = true;
     rememberPosition();
+    if (directMp4ErrorHandler) {
+      video.removeEventListener("error", directMp4ErrorHandler);
+      directMp4ErrorHandler = null;
+    }
+    for (const timerId of startupRetryTimers) clearTimeout(timerId);
+    startupRetryTimers.clear();
     video.removeEventListener("error", onNativeHlsError);
     video.removeEventListener("loadeddata", onMediaReady);
     video.removeEventListener("canplay", onMediaReady);
     video.removeEventListener("playing", onVideoPlaying);
+    video.removeEventListener("waiting", onVideoWaiting);
     video.removeEventListener("timeupdate", rememberPosition);
     video.removeEventListener("loadedmetadata", restoreResumePosition);
     video.removeEventListener("durationchange", restoreResumePosition);
@@ -1463,6 +3022,7 @@ function createTabletViewerImplementation() {
   const Settings = tablet_Settings;
   const Captions = tablet_Captions;
   const Bookmark = tablet_Bookmark;
+  const Trash2 = tablet_Trash2;
 
   const API_ORIGIN = (
     import.meta.env.VITE_API_URL || "http://localhost:5000/api"
@@ -1766,6 +3326,8 @@ function createTabletViewerImplementation() {
     initialPostIndex = null,
 
     onBack,
+    currentUserId = "",
+    onDeletePost,
   }) {
     // Profile viewers preserve the supplied grid order. Other entry points keep
     // their existing selected-first shuffled behavior.
@@ -1846,6 +3408,7 @@ function createTabletViewerImplementation() {
 
     const scrollFrameRef = useRef(null);
     const lastFeedScrollTopRef = useRef(0);
+    const scrollIntentPrewarmedPostIdsRef = useRef(new Set());
 
     const initialScrollDoneRef = useRef(false);
     const [initialPlacementReady, setInitialPlacementReady] = useState(false);
@@ -1863,6 +3426,7 @@ function createTabletViewerImplementation() {
     });
 
     const [likedPosts, setLikedPosts] = useState({});
+    const [openPostOptionsId, setOpenPostOptionsId] = useState(null);
 
     const [bookmarkedPosts, setBookmarkedPosts] = useState({});
     const bookmarkRequestsRef = useRef(new Set());
@@ -1906,11 +3470,62 @@ function createTabletViewerImplementation() {
     const [duration, setDuration] = useState(0);
     const [, setProgress] = useState({});
     const [settingsOpen, setSettingsOpen] = useState(false);
-    const [qualityOptions, setQualityOptions] = useState([]);
-    const [selectedQuality, setSelectedQuality] = useState("auto");
-    const qualityControllerRef = useRef(null);
-    const selectedQualityRef = useRef("auto");
-    selectedQualityRef.current = selectedQuality;
+    const [networkQualityNotice, setNetworkQualityNotice] = useState("");
+    const [dataSaverEnabled, setDataSaverEnabled] = useState(
+      () => getNetworkPlaybackProfile().dataSaver,
+    );
+    const qualityNoticeTimerRef = useRef(null);
+    function showNetworkQualityNotice(message) {
+      setNetworkQualityNotice(message);
+      if (qualityNoticeTimerRef.current) {
+        window.clearTimeout(qualityNoticeTimerRef.current);
+      }
+      qualityNoticeTimerRef.current = window.setTimeout(() => {
+        setNetworkQualityNotice("");
+        qualityNoticeTimerRef.current = null;
+      }, 4800);
+    }
+    useEffect(
+      () => () => {
+        if (qualityNoticeTimerRef.current) {
+          window.clearTimeout(qualityNoticeTimerRef.current);
+        }
+      },
+      [],
+    );
+    useEffect(() => {
+      const handlePlaybackSettingsUpdate = (event) => {
+        const hasManualChoice =
+          event?.detail?.dataSaverUserChoice === true &&
+          typeof event?.detail?.dataSaver === "boolean";
+        setDataSaverEnabled(
+          hasManualChoice
+            ? event.detail.dataSaver
+            : getNetworkPlaybackProfile().dataSaver,
+        );
+      };
+      const connection =
+        typeof navigator !== "undefined"
+          ? navigator.connection ||
+            navigator.mozConnection ||
+            navigator.webkitConnection
+          : null;
+      window.addEventListener(
+        "spotli:settings-updated",
+        handlePlaybackSettingsUpdate,
+      );
+      connection?.addEventListener?.("change", handlePlaybackSettingsUpdate);
+      return () => {
+        window.removeEventListener(
+          "spotli:settings-updated",
+          handlePlaybackSettingsUpdate,
+        );
+        connection?.removeEventListener?.(
+          "change",
+          handlePlaybackSettingsUpdate,
+        );
+      };
+    }, []);
     const [captionsEnabled, setCaptionsEnabled] = useState(false);
     const [playbackRate, setPlaybackRate] = useState(
       () => Number(getSavedPlaybackPreference("playbackRate", "1")) || 1,
@@ -1931,6 +3546,10 @@ function createTabletViewerImplementation() {
 
     const activePost = posts[activeIndex];
     const activePostId = getPostId(activePost);
+
+    // Cloudinary sources remain attached in the React tree while preload=none
+    // prevents inactive cards from downloading until the HLS/MP4 prewarmer selects them.
+
     useEffect(() => {
       // Every newly selected post should show its poster until its own video
       // emits `playing`; don't reuse the previous video's ready state.
@@ -1944,9 +3563,6 @@ function createTabletViewerImplementation() {
     // Prefer adaptive HLS delivery for the active Cloudinary video. The helper
     // falls back to a small progressive MP4 if HLS is unavailable or fails.
     useEffect(() => {
-      qualityControllerRef.current = null;
-      setQualityOptions([]);
-
       if (!activePostId || activePostIsPhoto || !activeOriginalVideoUrl) {
         return undefined;
       }
@@ -1962,37 +3578,32 @@ function createTabletViewerImplementation() {
         getOptimizedPlaybackUrl(activeOriginalVideoUrl),
         () => shouldPlayActiveVideoRef.current,
         () => setMuted(true),
-        (levels) => {
-          setQualityOptions(levels);
-          if (selectedQualityRef.current !== "auto") {
-            qualityControllerRef.current?.selectQuality(
-              selectedQualityRef.current,
-            );
-          }
-        },
-        (controller) => {
-          qualityControllerRef.current = controller;
-          if (controller) {
-            controller.selectQuality(selectedQualityRef.current);
-          }
-        },
-        selectedQualityRef.current,
+        undefined,
+        undefined,
+        "auto",
         playbackPositionsRef.current.get(String(activePostId)) || 0,
         (time) => {
           if (Number.isFinite(time) && time >= 0) {
             playbackPositionsRef.current.set(String(activePostId), time);
           }
         },
+        showNetworkQualityNotice,
       );
-    }, [activePostId, activeOriginalVideoUrl, activePostIsPhoto]);
+    }, [
+      activePostId,
+      activeOriginalVideoUrl,
+      activePostIsPhoto,
+      dataSaverEnabled,
+    ]);
 
-    // While the current video plays, warm only the next feed item's HLS playlists.
-    // Downloading its media segment can compete with the active video on slow links. Rebuild this observer when the
-    // active index changes: otherwise a farther card can enter the expanded
-    // root first, be skipped as "not next", and never fire again while it stays
-    // intersecting. Keep only one next stream warm to avoid competing with the
-    // active video on mobile data.
+    // While the current video plays, prime only the immediate next video.
+    // Reuse the same card element and HLS warm-resource cache on activation.
+    // The observer is close to the viewport so unviewed feed items don't consume
+    // data far ahead of the viewer's scroll position.
     useEffect(() => {
+      const playbackProfile = getNetworkPlaybackProfile();
+      if (playbackProfile.touchDevice || playbackProfile.dataSaver)
+        return undefined;
       const feed = feedRef.current;
       if (!feed || typeof IntersectionObserver === "undefined") {
         return undefined;
@@ -2022,27 +3633,55 @@ function createTabletViewerImplementation() {
               continue;
             }
 
-            // Only prewarm the immediate next post. More than one media stream
-            // can compete with the video currently playing on mobile data.
+            // Only prewarm the immediate next post, and only when it is close
+            // to the viewport and the active video has a small safety buffer.
+            // The network profile permits one segment on normal mobile links,
+            // but honours explicit Save Data and very slow-link settings.
             if (candidate.index !== currentIndex + 1) continue;
+            const currentPost = posts[currentIndex];
+            const currentVideo = currentPost
+              ? videoRefs.current[getPostId(currentPost)]
+              : null;
+            if (!currentVideo || currentVideo.readyState < 2) continue;
+            const currentBufferedAhead =
+              getSpotliBufferedAheadSeconds(currentVideo);
+            const minimumAheadForEarlySegment = getNetworkPlaybackProfile()
+              .constrained
+              ? 1.0
+              : 0.5;
+            if (currentBufferedAhead < minimumAheadForEarlySegment) continue;
 
             observer.unobserve(entry.target);
             if (isPhotoPost(candidate.post)) continue;
 
             const nextUrl = getOriginalVideoUrl(candidate.post);
             if (getCloudinaryHlsUrl(nextUrl)) {
-              preloadCloudinaryVideoStream(
-                nextUrl,
-                selectedQualityRef.current,
-                { includeFirstSegment: false },
+              const nextVideoElement =
+                videoRefs.current[getPostId(candidate.post)];
+              console.info(
+                "[Spotli playback] Early next HLS segment prewarm started",
+                {
+                  source: "home-viewport-observer",
+                  bufferedAheadSeconds:
+                    Math.round(currentBufferedAhead * 100) / 100,
+                  nextAsset:
+                    getSpotliCloudinaryAssetParts(nextUrl)
+                      ?.assetPathWithoutExtension || null,
+                },
               );
+              preloadNextVideoPlayback(nextUrl, {
+                videoElement: nextVideoElement,
+                includeFirstSegment: true,
+                fallbackMp4OnWarmFailure: false,
+                aggressive: false,
+              });
             }
           }
         },
         {
           root: feed,
           // Start warming the next snap page before it enters the visible area.
-          rootMargin: "0px 0px 130% 0px",
+          rootMargin: "0px 0px 60% 0px",
           threshold: 0.01,
         },
       );
@@ -2058,6 +3697,7 @@ function createTabletViewerImplementation() {
     // the current video's startup fragment is still establishing playback. On
     // slow links, simultaneous first fragments compete and delay the active video.
     useEffect(() => {
+      const playbackProfile = getNetworkPlaybackProfile();
       if (
         !activePostId ||
         String(playingVideoPostId) !== String(activePostId)
@@ -2069,19 +3709,40 @@ function createTabletViewerImplementation() {
       if (!activeVideo) return undefined;
 
       let nextUrl = "";
+      let nextVideoElement = null;
       for (let index = activeIndex + 1; index < posts.length; index += 1) {
         const candidate = posts[index];
         if (isPhotoPost(candidate)) continue;
         const candidateUrl = getOriginalVideoUrl(candidate);
         if (getCloudinaryHlsUrl(candidateUrl)) {
           nextUrl = candidateUrl;
+          nextVideoElement = videoRefs.current[getPostId(candidate)] || null;
           break;
         }
       }
       if (!nextUrl) return undefined;
 
-      preloadCloudinaryVideoStream(nextUrl, "auto", {
-        includeFirstSegment: false,
+      if (playbackProfile.touchDevice || playbackProfile.dataSaver) {
+        // Touch devices warm only the tiny playlists while the current video
+        // plays. The first media segment is fetched only after scroll intent,
+        // so this removes playlist latency without competing with playback.
+        console.info(
+          "[Spotli playback] Preparing next HLS playlists on touch device",
+          {
+            nextAsset:
+              getSpotliCloudinaryAssetParts(nextUrl)
+                ?.assetPathWithoutExtension || null,
+            dataSaver: playbackProfile.dataSaver,
+            startupHeight: playbackProfile.startupHeight,
+          },
+        );
+        preloadCloudinaryVideoStream(nextUrl, "auto");
+        return undefined;
+      }
+
+      preloadNextVideoPlayback(nextUrl, {
+        videoElement: nextVideoElement,
+        aggressive: false,
       });
 
       let segmentPreloaded = false;
@@ -2119,18 +3780,21 @@ function createTabletViewerImplementation() {
           }
         }
 
-        // Prepare early, but keep a small safety buffer for the active video.
-        // Weak connections still get a little more headroom before competing.
+        // Promote the next MP4 once the active video has a modest safety buffer.
+        // The v7 2s/3s threshold could leave the next item metadata-only until a
+        // fast swipe, even though the source request had already started.
         const minimumBufferedAhead = getNetworkPlaybackProfile().constrained
           ? 1.0
-          : 0.45;
+          : 0.5;
         if (bufferedAhead < minimumBufferedAhead) return;
 
         segmentPreloadInProgress = true;
         lastSegmentPreloadAttemptAt = now;
         Promise.resolve(
-          preloadCloudinaryVideoStream(nextUrl, selectedQualityRef.current, {
+          preloadNextVideoPlayback(nextUrl, {
             includeFirstSegment: true,
+            videoElement: nextVideoElement,
+            aggressive: true,
           }),
         )
           .then((prepared) => {
@@ -2151,13 +3815,6 @@ function createTabletViewerImplementation() {
 
       return cleanupListeners;
     }, [feedPreloadPostIdsKey, activeIndex, activePostId, playingVideoPostId]);
-
-    function changeVideoQuality(quality) {
-      const value = quality === "auto" ? "auto" : String(quality);
-      selectedQualityRef.current = value;
-      setSelectedQuality(value);
-      qualityControllerRef.current?.selectQuality(value);
-    }
 
     useEffect(() => {
       let cancelled = false;
@@ -2644,6 +4301,86 @@ function createTabletViewerImplementation() {
           }
         });
 
+        const scrollDelta =
+          currentFeed.scrollTop - lastFeedScrollTopRef.current;
+        const scrollDirection = scrollDelta > 1 ? 1 : scrollDelta < -1 ? -1 : 0;
+
+        // On mobile/tablet, keep media-segment downloads tied to real scroll
+        // intent. Start warming the identified adjacent video immediately when
+        // the feed begins moving, before that card becomes visibly prominent.
+        // Auto selection still observes the existing 360p Data Saver / 720p
+        // mobile caps.
+        if (scrollDirection !== 0) {
+          let intentIndex = activeIndexRef.current + scrollDirection;
+          let intentPost = posts[intentIndex];
+          let intentPostId = intentPost ? String(getPostId(intentPost)) : "";
+          let intentElement = intentPostId
+            ? postRefs.current[intentPostId]
+            : null;
+          let visibleRatio = 0;
+
+          const getVisibleRatio = (element) => {
+            if (!element) return 0;
+            const rect = element.getBoundingClientRect();
+            const visibleHeight =
+              Math.min(rect.bottom, feedRect.bottom) -
+              Math.max(rect.top, feedRect.top);
+            return Math.max(0, visibleHeight) / Math.max(1, rect.height);
+          };
+
+          visibleRatio = getVisibleRatio(intentElement);
+          // If a fast swipe skips past the immediately adjacent card, warm the
+          // post that is actually closest to the viewer instead of an unseen
+          // intermediate item.
+          if (visibleRatio < 0.08 && nextIndex !== activeIndexRef.current) {
+            intentIndex = nextIndex;
+            intentPost = posts[intentIndex];
+            intentPostId = intentPost ? String(getPostId(intentPost)) : "";
+            intentElement = intentPostId
+              ? postRefs.current[intentPostId]
+              : null;
+            visibleRatio = getVisibleRatio(intentElement);
+          }
+
+          if (
+            intentPost &&
+            intentElement &&
+            intentIndex !== activeIndexRef.current &&
+            !isPhotoPost(intentPost) &&
+            !scrollIntentPrewarmedPostIdsRef.current.has(intentPostId)
+          ) {
+            const intentUrl = getOriginalVideoUrl(intentPost);
+            if (getCloudinaryHlsUrl(intentUrl)) {
+              scrollIntentPrewarmedPostIdsRef.current.add(intentPostId);
+              console.info(
+                "[Spotli playback] Swipe-intent HLS warmup started",
+                {
+                  source: "tablet-scroll-intent",
+                  postId: intentPostId,
+                  visiblePercent: Math.round(visibleRatio * 100),
+                  scrollDeltaPx: Math.round(scrollDelta),
+                  dataSaver: getNetworkPlaybackProfile().dataSaver,
+                },
+              );
+              Promise.resolve(
+                preloadCloudinaryVideoStream(intentUrl, "auto", {
+                  includeFirstSegment: true,
+                }),
+              )
+                .then((prepared) => {
+                  if (prepared !== true) {
+                    scrollIntentPrewarmedPostIdsRef.current.delete(
+                      intentPostId,
+                    );
+                  }
+                })
+                .catch(() => {
+                  scrollIntentPrewarmedPostIdsRef.current.delete(intentPostId);
+                });
+            }
+          }
+        }
+
         lastFeedScrollTopRef.current = currentFeed.scrollTop;
 
         if (nextIndex !== activeIndexRef.current) {
@@ -3007,17 +4744,57 @@ function createTabletViewerImplementation() {
     }
 
     function openPostMenu(post) {
-      window.dispatchEvent(
-        new CustomEvent("spotli:open-post-menu", {
-          detail: { post },
-        }),
+      const postId = String(getPostId(post) || "");
+      if (!postId) return;
+      setOpenPostOptionsId((current) => (current === postId ? null : postId));
+    }
+
+    async function deletePostFromViewer(post) {
+      if (
+        !isPostOwnedBy(post, currentUserId) ||
+        typeof onDeletePost !== "function"
+      )
+        return;
+      const postId = String(getPostId(post) || "");
+      if (!postId) return;
+      setOpenPostOptionsId(null);
+      const confirmed = window.confirm(
+        "Delete this post permanently? Its likes, comments, and saved copies will also be removed.",
       );
+      if (!confirmed) return;
+      try {
+        await onDeletePost(post);
+      } catch (error) {
+        window.alert(error?.message || "Unable to delete this post.");
+      }
     }
 
     if (!posts.length || !activePost) return null;
 
     return (
       <div className="fixed inset-0 z-100 block overflow-hidden bg-[#080808] text-white lg:hidden">
+        {dataSaverEnabled && (
+          <div
+            role="status"
+            aria-live="polite"
+            className="pointer-events-none fixed left-1/2 top-4 z-[129] -translate-x-1/2 rounded-full border border-white/15 bg-[#171717]/90 px-3 py-2 text-xs font-medium text-white shadow-lg backdrop-blur-md"
+          >
+            Data Saver ON - You are saving data
+          </div>
+        )}
+        {networkQualityNotice && (
+          <div
+            role="status"
+            aria-live="polite"
+            className={`pointer-events-none fixed left-1/2 ${dataSaverEnabled ? "top-16" : "top-4"} z-[130] flex w-max max-w-[min(92vw,440px)] -translate-x-1/2 items-start gap-2 rounded-xl border border-amber-300/30 bg-[#171717]/95 px-4 py-3 text-sm text-white shadow-2xl backdrop-blur-md`}
+          >
+            <span aria-hidden="true" className="mt-0.5 text-amber-300">
+              ⚠
+            </span>
+            <span>{networkQualityNotice}</span>
+          </div>
+        )}
+
         <main
           ref={feedRef}
           onScroll={handleFeedScroll}
@@ -3049,7 +4826,12 @@ function createTabletViewerImplementation() {
             const currentImage = images[photoIndex] || "";
 
             const videoUrl = getVideoUrl(post);
+            const originalVideoUrl = getOriginalVideoUrl(post);
+            const directMp4SourceUrl = getDirectSpotliMp4Url(originalVideoUrl);
 
+            // Let the stream controller attach the active Cloudinary source
+            // after it chooses HLS or the original MP4 fallback. Inactive cards
+            // keep a stable MP4 src only for fallback preloading/reuse.
             // Until real video dimensions are available, contain the frame so
             // landscape content is never cropped while HLS initializes.
             const orientation = videoOrientations[postId] || "unknown";
@@ -3097,7 +4879,7 @@ function createTabletViewerImplementation() {
                 <div
                   className={`absolute overflow-hidden bg-black shadow-2xl ${
                     isLandscape && !photoPost
-                      ? "left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2"
+                      ? "left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 rounded-3xl"
                       : "inset-0 h-full w-full"
                   }`}
                   style={
@@ -3199,17 +4981,30 @@ function createTabletViewerImplementation() {
                           videoRefs.current[postId] = node;
                         }}
                         src={
-                          getCloudinaryHlsUrl(getOriginalVideoUrl(post))
-                            ? undefined
-                            : videoUrl || DEMO_VIDEO
+                          directMp4SourceUrl
+                            ? getOptimizedPlaybackUrl(originalVideoUrl) ||
+                              directMp4SourceUrl
+                            : getCloudinaryHlsUrl(originalVideoUrl)
+                              ? undefined
+                              : videoUrl || DEMO_VIDEO
                         }
                         poster={thumbnail || undefined}
-                        autoPlay={isActive && !paused}
+                        autoPlay={
+                          isActive &&
+                          !paused &&
+                          !getCloudinaryHlsUrl(originalVideoUrl)
+                        }
                         controls={false}
                         muted
                         loop
                         playsInline
-                        preload={isActive ? "auto" : "none"}
+                        preload={
+                          getCloudinaryHlsUrl(originalVideoUrl)
+                            ? "none"
+                            : isActive
+                              ? "auto"
+                              : "none"
+                        }
                         onLoadedMetadata={(event) => {
                           handleVideoMetadata(postId, event);
                           if (isActive) {
@@ -3253,6 +5048,10 @@ function createTabletViewerImplementation() {
                             ? "object-contain"
                             : "object-cover"
                         }`}
+                        style={{
+                          filter:
+                            "saturate(1.08) contrast(1.035) brightness(1.01)",
+                        }}
                       />
                       {thumbnail &&
                         !isActive &&
@@ -3375,44 +5174,6 @@ function createTabletViewerImplementation() {
                                 {rate === 1 ? "Normal" : `${rate}x`}
                               </button>
                             ))}
-                            <div className="my-1 border-t border-white/15 pt-1">
-                              <p className="px-3 pb-1 pt-1 text-[10px] font-semibold uppercase tracking-wide text-white/55">
-                                Video quality
-                              </p>
-                              <button
-                                type="button"
-                                aria-pressed={selectedQuality === "auto"}
-                                onClick={() => changeVideoQuality("auto")}
-                                className={`block w-full rounded px-3 py-2 text-left text-xs ${selectedQuality === "auto" ? "text-[#FF2D4A]" : "text-white"}`}
-                              >
-                                Auto {selectedQuality === "auto" ? "✓" : ""}
-                              </button>
-                              {qualityOptions.length > 0 ? (
-                                [...qualityOptions].reverse().map((quality) => (
-                                  <button
-                                    key={quality.height}
-                                    type="button"
-                                    aria-pressed={
-                                      selectedQuality === String(quality.height)
-                                    }
-                                    onClick={() =>
-                                      changeVideoQuality(quality.height)
-                                    }
-                                    className={`block w-full rounded px-3 py-2 text-left text-xs ${selectedQuality === String(quality.height) ? "text-[#FF2D4A]" : "text-white"}`}
-                                  >
-                                    {quality.label}{" "}
-                                    {selectedQuality === String(quality.height)
-                                      ? "✓"
-                                      : ""}
-                                  </button>
-                                ))
-                              ) : (
-                                <p className="px-3 py-2 text-[11px] leading-snug text-white/55">
-                                  Manual quality is unavailable for this
-                                  video/browser.
-                                </p>
-                              )}
-                            </div>
                           </div>
                         )}
                       </div>
@@ -3475,12 +5236,12 @@ function createTabletViewerImplementation() {
                     className="flex min-h-11 min-w-11 flex-col items-center gap-0.5"
                   >
                     <span
-                      className={`grid h-9 w-9 place-items-center rounded-full bg-black/35 backdrop-blur-sm ${
+                      className={`grid h-10 w-10 place-items-center rounded-full bg-black/35 backdrop-blur-sm ${
                         likedPosts[postId] ? "text-[#FF2D4A]" : "text-white"
                       }`}
                     >
                       <Heart
-                        size={24}
+                        size={27}
                         fill={likedPosts[postId] ? "currentColor" : "none"}
                       />
                     </span>
@@ -3504,8 +5265,8 @@ function createTabletViewerImplementation() {
                     aria-label="Comments"
                     className="flex min-h-11 min-w-11 flex-col items-center gap-0.5"
                   >
-                    <span className="grid h-9 w-9 place-items-center rounded-full bg-black/35 backdrop-blur-sm">
-                      <MessageCircle size={24} />
+                    <span className="grid h-10 w-10 place-items-center rounded-full bg-black/35 backdrop-blur-sm">
+                      <MessageCircle size={27} />
                     </span>
 
                     <span className="text-[11px] font-semibold">
@@ -3534,16 +5295,36 @@ function createTabletViewerImplementation() {
                     </span>
                   </button>
 
-                  <button
-                    type="button"
-                    onClick={() => openPostMenu(post)}
-                    aria-label="More post options"
-                    className="flex min-h-11 min-w-11 flex-col items-center gap-0.5"
-                  >
-                    <span className="grid h-9 w-9 place-items-center rounded-full bg-black/35 backdrop-blur-sm">
-                      <MoreVertical size={20} />
-                    </span>
-                  </button>
+                  <div className="relative">
+                    <button
+                      type="button"
+                      onClick={() => openPostMenu(post)}
+                      aria-label="More post options"
+                      aria-expanded={openPostOptionsId === String(postId)}
+                      className="flex min-h-11 min-w-11 flex-col items-center gap-0.5"
+                    >
+                      <span className="grid h-9 w-9 place-items-center rounded-full bg-black/35 backdrop-blur-sm">
+                        <MoreVertical size={20} />
+                      </span>
+                    </button>
+                    {openPostOptionsId === String(postId) && (
+                      <div className="absolute right-12 top-0 z-[160] min-w-40 rounded-xl border border-white/10 bg-[#171717] p-1.5 text-white shadow-2xl">
+                        {isPostOwnedBy(post, currentUserId) ? (
+                          <button
+                            type="button"
+                            onClick={() => void deletePostFromViewer(post)}
+                            className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm font-semibold text-red-300 transition hover:bg-white/10"
+                          >
+                            <Trash2 size={15} /> Delete post
+                          </button>
+                        ) : (
+                          <p className="px-3 py-2 text-xs text-white/60">
+                            Only the creator can delete this post.
+                          </p>
+                        )}
+                      </div>
+                    )}
+                  </div>
 
                   <button
                     type="button"
@@ -3695,6 +5476,8 @@ function createDesktopViewerImplementation() {
   const useRef = desktop_useRef;
   const useState = desktop_useState;
   const ArrowLeft = desktop_ArrowLeft;
+  const ArrowUp = desktop_ArrowUp;
+  const ArrowDown = desktop_ArrowDown;
   const Heart = desktop_Heart;
   const MessageCircle = desktop_MessageCircle;
   const Share2 = desktop_Share2;
@@ -3704,10 +5487,10 @@ function createDesktopViewerImplementation() {
   const Volume2 = desktop_Volume2;
   const VolumeX = desktop_VolumeX;
   const Maximize = desktop_Maximize;
-  const Settings = desktop_Settings;
   const Captions = desktop_Captions;
   const CheckCircle2 = desktop_CheckCircle2;
   const Bookmark = desktop_Bookmark;
+  const Trash2 = desktop_Trash2;
   const TopBar = desktop_TopBar;
   const CommentSection = desktop_CommentSection;
   const api = desktop_api;
@@ -3978,58 +5761,6 @@ function createDesktopViewerImplementation() {
     return resolveMediaUrl(image);
   }
 
-  // Show the saved thumbnail when available. If a video has no thumbnail,
-  // render its first decoded frame as the Up next preview instead of a broken image.
-  function UpNextThumbnail({ post, loading = "lazy", fetchPriority = "auto" }) {
-    const [imageFailed, setImageFailed] = useState(false);
-    const [videoFailed, setVideoFailed] = useState(false);
-    const imageUrl = getPostImage(post, 320);
-    const videoUrl = getVideoUrl(post);
-    const showImage = Boolean(imageUrl) && !imageFailed;
-    const showVideo =
-      !showImage &&
-      post?.mediaType !== "photo" &&
-      post?.type !== "photo" &&
-      Boolean(videoUrl) &&
-      !videoFailed;
-
-    return (
-      <>
-        {showImage && (
-          <img
-            src={imageUrl}
-            alt=""
-            loading={loading}
-            decoding="async"
-            fetchPriority={fetchPriority}
-            onError={() => setImageFailed(true)}
-            className="absolute inset-0 h-full w-full object-cover"
-          />
-        )}
-        {showVideo && (
-          <video
-            src={videoUrl}
-            muted
-            playsInline
-            preload="none"
-            crossOrigin="anonymous"
-            onLoadedMetadata={(event) => {
-              // Seek a tiny amount so the browser paints a representative frame.
-              try {
-                if (event.currentTarget.duration > 0.2)
-                  event.currentTarget.currentTime = 0.1;
-              } catch {
-                // Some streaming formats do not allow seeking at this point.
-              }
-            }}
-            onError={() => setVideoFailed(true)}
-            className="absolute inset-0 h-full w-full object-cover"
-          />
-        )}
-      </>
-    );
-  }
-
   function formatTime(seconds) {
     if (!Number.isFinite(seconds)) return "0:00";
 
@@ -4054,25 +5785,6 @@ function createDesktopViewerImplementation() {
     return String(number);
   }
 
-  function formatPostViews(post) {
-    const value = post?.viewsCount ?? post?.views;
-
-    if (value == null || value === "") return "— views";
-
-    if (typeof value === "string") {
-      const trimmed = value.trim();
-      if (!trimmed) return "— views";
-      if (/\bviews?\b/i.test(trimmed)) return trimmed;
-
-      const numericValue = Number(trimmed);
-      return Number.isFinite(numericValue)
-        ? `${formatCount(numericValue)} views`
-        : `${trimmed} views`;
-    }
-
-    return `${formatCount(value)} views`;
-  }
-
   function getPostId(post) {
     return post?._id ?? post?.id;
   }
@@ -4087,7 +5799,36 @@ function createDesktopViewerImplementation() {
     preservePostOrder = false,
     initialPostIndex = null,
     onBack,
+    onNavigateFromViewer,
+    currentUserId = "",
+    onDeletePost,
   }) {
+    function openPostMenu(post) {
+      const postId = String(getPostId(post) || "");
+      if (!postId) return;
+      setOpenPostOptionsId((current) => (current === postId ? null : postId));
+    }
+
+    async function deletePostFromViewer(post) {
+      if (
+        !isPostOwnedBy(post, currentUserId) ||
+        typeof onDeletePost !== "function"
+      )
+        return;
+      const postId = String(getPostId(post) || "");
+      if (!postId) return;
+      setOpenPostOptionsId(null);
+      const confirmed = window.confirm(
+        "Delete this post permanently? Its likes, comments, and saved copies will also be removed.",
+      );
+      if (!confirmed) return;
+      try {
+        await onDeletePost(post);
+      } catch (error) {
+        window.alert(error?.message || "Unable to delete this post.");
+      }
+    }
+
     const availablePosts = useMemo(
       () => posts.filter((post) => getPostId(post) != null),
       [posts],
@@ -4170,6 +5911,7 @@ function createDesktopViewerImplementation() {
     const [initialPlacementReady, setInitialPlacementReady] = useState(false);
 
     const [likedPosts, setLikedPosts] = useState({});
+    const [openPostOptionsId, setOpenPostOptionsId] = useState(null);
 
     const [bookmarkedPosts, setBookmarkedPosts] = useState({});
     const bookmarkRequestsRef = useRef(new Set());
@@ -4183,7 +5925,26 @@ function createDesktopViewerImplementation() {
 
     const [photoIndexes, setPhotoIndexes] = useState({});
 
-    const [, setVideoRatios] = useState({});
+    const [videoRatios, setVideoRatios] = useState({});
+    const [viewerViewport, setViewerViewport] = useState(() => ({
+      width:
+        typeof window !== "undefined"
+          ? Math.max(320, window.innerWidth - 64)
+          : 1280,
+      height: typeof window !== "undefined" ? window.innerHeight : 800,
+    }));
+
+    useEffect(() => {
+      const updateViewerViewport = () =>
+        setViewerViewport({
+          width: Math.max(320, window.innerWidth - 64),
+          height: window.innerHeight,
+        });
+      window.addEventListener("resize", updateViewerViewport, {
+        passive: true,
+      });
+      return () => window.removeEventListener("resize", updateViewerViewport);
+    }, []);
 
     const [muted, setMuted] = useState(() =>
       Boolean(getSavedPlaybackPreference("startMuted", true)),
@@ -4192,14 +5953,64 @@ function createDesktopViewerImplementation() {
     const [paused, setPaused] = useState(false);
     const [playingVideoPostId, setPlayingVideoPostId] = useState(null);
 
-    const [settingsOpen, setSettingsOpen] = useState(false);
     const [captionsEnabled, setCaptionsEnabled] = useState(false);
 
-    const [qualityOptions, setQualityOptions] = useState([]);
-    const [selectedQuality, setSelectedQuality] = useState("auto");
-    const qualityControllerRef = useRef(null);
-    const selectedQualityRef = useRef("auto");
-    selectedQualityRef.current = selectedQuality;
+    const [networkQualityNotice, setNetworkQualityNotice] = useState("");
+    const [dataSaverEnabled, setDataSaverEnabled] = useState(
+      () => getNetworkPlaybackProfile().dataSaver,
+    );
+    const qualityNoticeTimerRef = useRef(null);
+    function showNetworkQualityNotice(message) {
+      setNetworkQualityNotice(message);
+      if (qualityNoticeTimerRef.current) {
+        window.clearTimeout(qualityNoticeTimerRef.current);
+      }
+      qualityNoticeTimerRef.current = window.setTimeout(() => {
+        setNetworkQualityNotice("");
+        qualityNoticeTimerRef.current = null;
+      }, 4800);
+    }
+    useEffect(
+      () => () => {
+        if (qualityNoticeTimerRef.current) {
+          window.clearTimeout(qualityNoticeTimerRef.current);
+        }
+      },
+      [],
+    );
+    useEffect(() => {
+      const handlePlaybackSettingsUpdate = (event) => {
+        const hasManualChoice =
+          event?.detail?.dataSaverUserChoice === true &&
+          typeof event?.detail?.dataSaver === "boolean";
+        setDataSaverEnabled(
+          hasManualChoice
+            ? event.detail.dataSaver
+            : getNetworkPlaybackProfile().dataSaver,
+        );
+      };
+      const connection =
+        typeof navigator !== "undefined"
+          ? navigator.connection ||
+            navigator.mozConnection ||
+            navigator.webkitConnection
+          : null;
+      window.addEventListener(
+        "spotli:settings-updated",
+        handlePlaybackSettingsUpdate,
+      );
+      connection?.addEventListener?.("change", handlePlaybackSettingsUpdate);
+      return () => {
+        window.removeEventListener(
+          "spotli:settings-updated",
+          handlePlaybackSettingsUpdate,
+        );
+        connection?.removeEventListener?.(
+          "change",
+          handlePlaybackSettingsUpdate,
+        );
+      };
+    }, []);
 
     const [playbackFeedback, setPlaybackFeedback] = useState(null);
 
@@ -4211,7 +6022,7 @@ function createDesktopViewerImplementation() {
 
     const [commentsOpen, setCommentsOpen] = useState(false);
 
-    const [showCreatorOverlay, setShowCreatorOverlay] = useState(true);
+    const [, setShowCreatorOverlay] = useState(true);
 
     const creatorOverlayTimerRef = useRef(null);
 
@@ -4243,6 +6054,9 @@ function createDesktopViewerImplementation() {
     );
     const activeIndexRef = useRef(activeIndex);
     activeIndexRef.current = activeIndex;
+    const scrollDirectionRef = useRef(1);
+    const scrollIntentStartedRef = useRef(false);
+    const scrollIntentPrewarmedPostIdsRef = useRef(new Set());
 
     const activePost = viewerPosts[activeIndex];
 
@@ -4257,9 +6071,6 @@ function createDesktopViewerImplementation() {
     shouldPlayActiveVideoRef.current = !paused;
 
     useEffect(() => {
-      qualityControllerRef.current = null;
-      setQualityOptions([]);
-
       if (!activePostId || activePostIsPhoto || !activeOriginalVideoUrl) {
         return undefined;
       }
@@ -4275,35 +6086,32 @@ function createDesktopViewerImplementation() {
         getOptimizedPlaybackUrl(activeOriginalVideoUrl),
         () => shouldPlayActiveVideoRef.current,
         () => setMuted(true),
-        (levels) => {
-          setQualityOptions(levels);
-          if (selectedQualityRef.current !== "auto") {
-            qualityControllerRef.current?.selectQuality(
-              selectedQualityRef.current,
-            );
-          }
-        },
-        (controller) => {
-          qualityControllerRef.current = controller;
-          if (controller) {
-            controller.selectQuality(selectedQualityRef.current);
-          }
-        },
-        selectedQualityRef.current,
+        undefined,
+        undefined,
+        "auto",
         playbackPositionsRef.current.get(String(activePostId)) || 0,
         (time) => {
           if (Number.isFinite(time) && time >= 0) {
             playbackPositionsRef.current.set(String(activePostId), time);
           }
         },
+        showNetworkQualityNotice,
       );
-    }, [activePostId, activeOriginalVideoUrl, activePostIsPhoto]);
+    }, [
+      activePostId,
+      activeOriginalVideoUrl,
+      activePostIsPhoto,
+      dataSaverEnabled,
+    ]);
 
     // Prewarm one upcoming video while the current video is playing. Rebuild
     // the observer after each active-index change so the next card is observed
     // anew even when it already intersects the root margin; without this, the
     // observer can skip it once and never notify again during a fast swipe.
     useEffect(() => {
+      const playbackProfile = getNetworkPlaybackProfile();
+      if (playbackProfile.touchDevice || playbackProfile.dataSaver)
+        return undefined;
       const feed = feedRef.current;
       if (!feed || typeof IntersectionObserver === "undefined") {
         return undefined;
@@ -4333,6 +6141,15 @@ function createDesktopViewerImplementation() {
               continue;
             }
             if (candidate.index !== currentIndex + 1) continue;
+            const currentVideo = videoRef.current;
+            if (!currentVideo || currentVideo.readyState < 2) continue;
+            const currentBufferedAhead =
+              getSpotliBufferedAheadSeconds(currentVideo);
+            const minimumAheadForEarlySegment = getNetworkPlaybackProfile()
+              .constrained
+              ? 1.0
+              : 0.5;
+            if (currentBufferedAhead < minimumAheadForEarlySegment) continue;
 
             observer.unobserve(entry.target);
             const nextPost =
@@ -4350,17 +6167,28 @@ function createDesktopViewerImplementation() {
 
             const nextUrl = getOriginalVideoUrl(nextPost);
             if (getCloudinaryHlsUrl(nextUrl)) {
-              preloadCloudinaryVideoStream(
-                nextUrl,
-                selectedQualityRef.current,
-                { includeFirstSegment: false },
+              console.info(
+                "[Spotli playback] Early next HLS segment prewarm started",
+                {
+                  source: "viewer-viewport-observer",
+                  bufferedAheadSeconds:
+                    Math.round(currentBufferedAhead * 100) / 100,
+                  nextAsset:
+                    getSpotliCloudinaryAssetParts(nextUrl)
+                      ?.assetPathWithoutExtension || null,
+                },
               );
+              preloadNextVideoPlayback(nextUrl, {
+                includeFirstSegment: true,
+                fallbackMp4OnWarmFailure: false,
+                aggressive: false,
+              });
             }
           }
         },
         {
           root: feed,
-          rootMargin: "0px 0px 130% 0px",
+          rootMargin: "0px 0px 60% 0px",
           threshold: 0.01,
         },
       );
@@ -4372,9 +6200,10 @@ function createDesktopViewerImplementation() {
       return () => observer.disconnect();
     }, [viewerPostIdsKey, activeIndex]);
 
-    // Prepare next-video metadata early, but defer its first media segment until
-    // the active stream has a healthy buffer so it cannot slow first playback.
+    // Prepare the next playlist early. Warm its first segment only after the
+    // active stream has enough buffer, and only for the immediate next video.
     useEffect(() => {
+      const playbackProfile = getNetworkPlaybackProfile();
       if (
         !activePostId ||
         String(playingVideoPostId) !== String(activePostId)
@@ -4409,9 +6238,24 @@ function createDesktopViewerImplementation() {
       }
       if (!nextUrl) return undefined;
 
-      preloadCloudinaryVideoStream(nextUrl, "auto", {
-        includeFirstSegment: false,
-      });
+      if (playbackProfile.touchDevice || playbackProfile.dataSaver) {
+        // Prepare the next video's master/rendition playlists during current
+        // playback; actual media bytes remain swipe-triggered on mobile.
+        console.info(
+          "[Spotli playback] Preparing next HLS playlists on touch viewer",
+          {
+            nextAsset:
+              getSpotliCloudinaryAssetParts(nextUrl)
+                ?.assetPathWithoutExtension || null,
+            dataSaver: playbackProfile.dataSaver,
+            startupHeight: playbackProfile.startupHeight,
+          },
+        );
+        preloadCloudinaryVideoStream(nextUrl, "auto");
+        return undefined;
+      }
+
+      preloadNextVideoPlayback(nextUrl, { aggressive: false });
 
       let segmentPreloaded = false;
       let segmentPreloadInProgress = false;
@@ -4452,14 +6296,15 @@ function createDesktopViewerImplementation() {
         // Weak connections still get a little more headroom before competing.
         const minimumBufferedAhead = getNetworkPlaybackProfile().constrained
           ? 1.0
-          : 0.45;
+          : 0.5;
         if (bufferedAhead < minimumBufferedAhead) return;
 
         segmentPreloadInProgress = true;
         lastSegmentPreloadAttemptAt = now;
         Promise.resolve(
-          preloadCloudinaryVideoStream(nextUrl, selectedQualityRef.current, {
+          preloadNextVideoPlayback(nextUrl, {
             includeFirstSegment: true,
+            aggressive: true,
           }),
         )
           .then((prepared) => {
@@ -4480,13 +6325,6 @@ function createDesktopViewerImplementation() {
 
       return cleanupListeners;
     }, [viewerPostIdsKey, activeIndex, activePostId, playingVideoPostId]);
-
-    function changeVideoQuality(quality) {
-      const value = quality === "auto" ? "auto" : String(quality);
-      selectedQualityRef.current = value;
-      setSelectedQuality(value);
-      qualityControllerRef.current?.selectQuality(value);
-    }
 
     const [comments, setComments] = useState([]);
 
@@ -4780,8 +6618,87 @@ function createDesktopViewerImplementation() {
 
       if (!feed || typeof IntersectionObserver === "undefined") return;
 
+      let previousScrollTop = feed.scrollTop;
+      const updateScrollDirection = () => {
+        const nextScrollTop = feed.scrollTop;
+        const delta = nextScrollTop - previousScrollTop;
+        if (Math.abs(delta) > 1) {
+          scrollDirectionRef.current = delta > 0 ? 1 : -1;
+          scrollIntentStartedRef.current = true;
+        }
+        previousScrollTop = nextScrollTop;
+      };
+      feed.addEventListener("scroll", updateScrollDirection, { passive: true });
+
       const observer = new IntersectionObserver(
         (entries) => {
+          // A deliberate scroll is a request for the adjacent video. Warm just
+          // its first adaptive segment before it becomes the active slide.
+          // This is not background preloading: nothing is fetched until the
+          // user scrolls, and Auto still uses the existing Data Saver cap.
+          if (scrollIntentStartedRef.current) {
+            let intendedEntry = null;
+            let intendedCandidateIndex = -1;
+            for (const entry of entries) {
+              if (!entry.isIntersecting || entry.intersectionRatio < 0.01)
+                continue;
+              const targetId = entry.target.dataset.postId;
+              const candidateIndex = viewerPostsRef.current.findIndex(
+                (post) => String(getPostId(post)) === String(targetId),
+              );
+              const isInScrollDirection =
+                scrollDirectionRef.current > 0
+                  ? candidateIndex > activeIndexRef.current
+                  : candidateIndex >= 0 &&
+                    candidateIndex < activeIndexRef.current;
+              if (!isInScrollDirection) continue;
+              if (
+                !intendedEntry ||
+                entry.intersectionRatio > intendedEntry.intersectionRatio
+              ) {
+                intendedEntry = entry;
+                intendedCandidateIndex = candidateIndex;
+              }
+            }
+
+            if (intendedEntry && intendedCandidateIndex >= 0) {
+              const candidate = viewerPostsRef.current[intendedCandidateIndex];
+              const candidateId = String(getPostId(candidate));
+              if (
+                candidate &&
+                !scrollIntentPrewarmedPostIdsRef.current.has(candidateId) &&
+                candidate?.mediaType !== "photo" &&
+                candidate?.mediaType !== "image" &&
+                candidate?.type !== "photo" &&
+                candidate?.type !== "image" &&
+                candidate?.isImagePost !== true &&
+                candidate?.isPhotoPost !== true
+              ) {
+                const candidateUrl = getOriginalVideoUrl(candidate);
+                if (getCloudinaryHlsUrl(candidateUrl)) {
+                  scrollIntentPrewarmedPostIdsRef.current.add(candidateId);
+                  console.info(
+                    "[Spotli playback] Swipe-intent HLS warmup started",
+                    {
+                      source: "desktop-scroll-intent",
+                      postId: candidateId,
+                      visiblePercent: Math.round(
+                        intendedEntry.intersectionRatio * 100,
+                      ),
+                      skippedToIndex:
+                        intendedCandidateIndex !==
+                        activeIndexRef.current + scrollDirectionRef.current,
+                      dataSaver: getNetworkPlaybackProfile().dataSaver,
+                    },
+                  );
+                  preloadCloudinaryVideoStream(candidateUrl, "auto", {
+                    includeFirstSegment: true,
+                  });
+                }
+              }
+            }
+          }
+
           let mostVisibleEntry = null;
 
           for (const entry of entries) {
@@ -4818,7 +6735,7 @@ function createDesktopViewerImplementation() {
         {
           root: feed,
 
-          threshold: [0.35, 0.5, 0.6, 0.75, 0.9],
+          threshold: [0.01, 0.03, 0.08, 0.12, 0.2, 0.35, 0.5, 0.6, 0.75, 0.9],
         },
       );
 
@@ -4826,11 +6743,21 @@ function createDesktopViewerImplementation() {
         if (element) observer.observe(element);
       });
 
-      return () => observer.disconnect();
+      return () => {
+        feed.removeEventListener("scroll", updateScrollDirection);
+        observer.disconnect();
+      };
     }, [viewerPostIdsKey]);
 
     function selectPost(post) {
       if (!post) return;
+
+      const selectedVideoUrl = getOriginalVideoUrl(post);
+      if (getCloudinaryHlsUrl(selectedVideoUrl)) {
+        preloadCloudinaryVideoStream(selectedVideoUrl, "auto", {
+          includeFirstSegment: true,
+        });
+      }
 
       const postId = getPostId(post);
 
@@ -5131,7 +7058,7 @@ function createDesktopViewerImplementation() {
     if (!activePost) return null;
 
     return (
-      <div className="fixed inset-y-0 left-40 right-0 z-100 overflow-hidden bg-white text-black">
+      <div className="fixed inset-y-0 left-16 right-0 z-[100] overflow-hidden bg-black text-white">
         <style>{`
 
         .spotli-double-tap-heart {
@@ -5172,52 +7099,120 @@ function createDesktopViewerImplementation() {
 
         }
 
-        [data-video-stage]:fullscreen {
-
-          position: fixed;
-
-          inset: 0;
-
-          width: 100vw;
-
-          height: 100vh;
-
-          max-width: none;
-
+        .spotli-short-progress {
+          appearance: none;
+          -webkit-appearance: none;
+          border: 0;
+          border-radius: 999px;
+          outline: none;
           overflow: hidden;
+        }
+        .spotli-short-progress::-webkit-slider-runnable-track {
+          height: 4px;
+          background: transparent;
+          border-radius: 999px;
+        }
+        .spotli-short-progress::-webkit-slider-thumb {
+          appearance: none;
+          -webkit-appearance: none;
+          width: 8px;
+          height: 8px;
+          margin-top: -2px;
+          border: 0;
+          border-radius: 50%;
+          background: #FF2D4A;
+        }
+        .spotli-short-progress::-moz-range-track {
+          height: 4px;
+          background: transparent;
+        }
+        .spotli-short-progress::-moz-range-thumb {
+          width: 8px;
+          height: 8px;
+          border: 0;
+          border-radius: 50%;
+          background: #FF2D4A;
+        }
 
+        [data-video-stage]:fullscreen {
+          position: fixed;
+          inset: 0 !important;
+          left: 0 !important;
+          right: 0 !important;
+          top: 0 !important;
+          bottom: 0 !important;
+          width: 100vw !important;
+          height: 100vh !important;
+          max-width: none;
+          overflow: hidden;
           background: #000;
-
+        }
+        [data-video-stage]:fullscreen .spotli-video-details {
+          display: none !important;
+        }
+        [data-video-stage]:fullscreen .spotli-video-action-rail {
+          right: 16px !important;
+          top: 50% !important;
+          transform: translateY(-50%) !important;
+        }
+        [data-video-stage]:fullscreen .spotli-hide-in-fullscreen {
+          display: none !important;
         }
 
         [data-video-stage]:fullscreen video {
-
           position: absolute;
-
-          inset: 0;
-
+          inset: 0 0 36px;
           width: 100%;
-
-          height: 100%;
-
+          height: calc(100% - 36px);
           max-width: none;
-
           transform: none;
-
           object-fit: contain;
-
+        }
+        [data-video-stage]:fullscreen .spotli-short-progress {
+          bottom: 0 !important;
+        }
+        [data-video-stage]:fullscreen + .spotli-video-details {
+          display: none !important;
         }
 
       `}</style>
 
+        {dataSaverEnabled && (
+          <div
+            role="status"
+            aria-live="polite"
+            className="pointer-events-none fixed left-1/2 top-4 z-[129] -translate-x-1/2 rounded-full border border-white/15 bg-[#171717]/90 px-3 py-2 text-xs font-medium text-white shadow-lg backdrop-blur-md"
+          >
+            Data Saver ON - You are saving data
+          </div>
+        )}
+        {networkQualityNotice && (
+          <div
+            role="status"
+            aria-live="polite"
+            className={`pointer-events-none fixed left-1/2 ${dataSaverEnabled ? "top-16" : "top-4"} z-[130] flex w-max max-w-[min(92vw,440px)] -translate-x-1/2 items-start gap-2 rounded-2xl border border-amber-300/30 bg-[#171717]/95 px-4 py-3 text-sm text-white shadow-2xl backdrop-blur-md`}
+          >
+            <span aria-hidden="true" className="mt-0.5 text-amber-300">
+              ⚠
+            </span>
+            <span>{networkQualityNotice}</span>
+          </div>
+        )}
+
         <div className="flex h-full min-h-0 flex-col">
           <div className="px-4 pt-4">
-            <TopBar />
+            <TopBar
+              variant="viewer"
+              onCloseViewer={onBack}
+              onNavigateFromViewer={onNavigateFromViewer}
+            />
           </div>
 
           <div className="h-0 shrink-0" />
 
-          <div className="grid min-h-0 flex-1 grid-cols-[minmax(0,1fr)_minmax(280px,340px)] overflow-hidden">
+          <div
+            className={`grid min-h-0 flex-1 overflow-hidden ${commentsOpen ? "grid-cols-[minmax(0,1fr)_minmax(300px,380px)]" : "grid-cols-1"}`}
+          >
             <section
               ref={feedRef}
               className="relative min-h-0 min-w-0 overflow-x-hidden overflow-y-auto snap-y snap-mandatory overscroll-y-contain bg-[#080808] scrollbar-none [&::-webkit-scrollbar]:hidden"
@@ -5234,9 +7229,11 @@ function createDesktopViewerImplementation() {
                   getExplicitPostThumbnail(post),
                 );
                 const videoUrl = getVideoUrl(post);
-                const generatedVideoThumbnail = getCloudinaryVideoThumbnailUrl(
-                  getOriginalVideoUrl(post),
-                );
+                const originalVideoUrl = getOriginalVideoUrl(post);
+                const directMp4SourceUrl =
+                  getDirectSpotliMp4Url(originalVideoUrl);
+                const generatedVideoThumbnail =
+                  getCloudinaryVideoThumbnailUrl(originalVideoUrl);
                 const existingImageCandidate = getPostImage(post);
                 const postThumbnail =
                   explicitThumbnail ||
@@ -5255,6 +7252,52 @@ function createDesktopViewerImplementation() {
                 const photoIndex = photoIndexes[postId] || 0;
 
                 const isActive = String(postId) === String(activeId);
+                const detectedAspectRatio = Number(videoRatios[String(postId)]);
+                const mediaAspectRatio =
+                  Number.isFinite(detectedAspectRatio) &&
+                  detectedAspectRatio > 0.1
+                    ? Math.min(2.4, Math.max(0.35, detectedAspectRatio))
+                    : postIsImage
+                      ? 4 / 5
+                      : 16 / 9;
+                const viewerContentWidth = Math.max(
+                  320,
+                  viewerViewport.width - (commentsOpen ? 380 : 0),
+                );
+                const detailPanelWidth = Math.min(
+                  280,
+                  Math.max(220, Math.round(viewerContentWidth * 0.18)),
+                );
+                const stageBaseLeft = Math.max(
+                  detailPanelWidth + 50,
+                  Math.min(300, viewerContentWidth * 0.2),
+                );
+                const actionRailReserve = 164; // reserve space for actions and the far-right previous/next controls
+                const availableMediaWidth = Math.max(
+                  240,
+                  viewerContentWidth - stageBaseLeft - actionRailReserve,
+                );
+                const availableMediaHeight = Math.max(
+                  300,
+                  viewerViewport.height - 160,
+                );
+                const mediaFrameWidth = Math.max(
+                  240,
+                  Math.min(
+                    availableMediaWidth,
+                    availableMediaHeight * mediaAspectRatio,
+                  ),
+                );
+                const mediaFrameHeight = mediaFrameWidth / mediaAspectRatio;
+                const stageHeight = mediaFrameHeight + (postIsImage ? 32 : 36);
+                const stageLeft =
+                  stageBaseLeft +
+                  Math.max(0, (availableMediaWidth - mediaFrameWidth) / 2);
+                const articleHeight = Math.max(320, viewerViewport.height - 64);
+                const stageTop = Math.max(
+                  16,
+                  (articleHeight - stageHeight) / 2,
+                );
 
                 const isLiked = Boolean(likedPosts[String(postId)]);
 
@@ -5272,26 +7315,13 @@ function createDesktopViewerImplementation() {
                       }
                     }}
                     data-post-id={String(postId)}
-                    className="relative h-full min-h-full w-full snap-start snap-always overflow-hidden bg-[#080808]"
+                    className="relative h-full min-h-full w-full snap-start snap-always overflow-hidden bg-black"
                     style={{
                       scrollSnapAlign: "start",
 
                       scrollSnapStop: "always",
                     }}
                   >
-                    <div
-                      aria-hidden="true"
-                      className="absolute inset-0 scale-110 bg-cover bg-center blur-3xl"
-                      style={{
-                        backgroundImage:
-                          isActive && postThumbnail
-                            ? `url("${postThumbnail}")`
-                            : "none",
-                      }}
-                    />
-
-                    <div className="absolute inset-0 bg-black/60" />
-
                     <button
                       type="button"
                       onClick={onBack}
@@ -5310,6 +7340,32 @@ function createDesktopViewerImplementation() {
                       <Maximize size={17} />
                     </button>
 
+                    <nav
+                      aria-label="Post navigation"
+                      className="absolute right-5 top-1/2 z-40 flex -translate-y-1/2 flex-col gap-4"
+                    >
+                      <button
+                        type="button"
+                        onClick={() => selectPost(viewerPosts[activeIndex - 1])}
+                        disabled={activeIndex <= 0}
+                        aria-label="Previous post"
+                        title="Previous post"
+                        className="grid h-14 w-14 place-items-center rounded-full border border-white/10 bg-[#242424] text-white shadow-lg transition-colors hover:bg-[#383838] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white disabled:cursor-not-allowed disabled:opacity-35"
+                      >
+                        <ArrowUp size={27} strokeWidth={2.2} />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => selectPost(viewerPosts[activeIndex + 1])}
+                        disabled={activeIndex >= viewerPosts.length - 1}
+                        aria-label="Next post"
+                        title="Next post"
+                        className="grid h-14 w-14 place-items-center rounded-full border border-white/10 bg-[#242424] text-white shadow-lg transition-colors hover:bg-[#383838] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white disabled:cursor-not-allowed disabled:opacity-35"
+                      >
+                        <ArrowDown size={27} strokeWidth={2.2} />
+                      </button>
+                    </nav>
+
                     <div
                       data-video-stage
                       onPointerDown={() => {
@@ -5322,7 +7378,15 @@ function createDesktopViewerImplementation() {
                         handleDoubleTapLike(postId, event)
                       }
                       onPointerUp={(event) => handlePointerUp(postId, event)}
-                      className="absolute inset-0 overflow-hidden bg-black touch-manipulation"
+                      className="absolute overflow-visible rounded-[2.25rem] bg-black touch-manipulation"
+                      style={{
+                        left: `${stageLeft}px`,
+                        top: `${stageTop}px`,
+                        width: `${mediaFrameWidth}px`,
+                        height: `${stageHeight}px`,
+                        right: "auto",
+                        bottom: "auto",
+                      }}
                     >
                       {postIsImage ? (
                         <>
@@ -5331,7 +7395,7 @@ function createDesktopViewerImplementation() {
                             onScroll={(event) =>
                               handlePhotoScroll(postId, event)
                             }
-                            className="absolute inset-0 snap-x snap-mandatory overflow-x-auto overflow-y-hidden scrollbar-none [&::-webkit-scrollbar]:hidden"
+                            className="absolute inset-x-0 top-0 bottom-8 snap-x snap-mandatory overflow-x-auto overflow-y-hidden rounded-[2.25rem] scrollbar-none [&::-webkit-scrollbar]:hidden"
                           >
                             <div className="flex h-full w-full">
                               {photoSet.map((photo, index) => (
@@ -5343,6 +7407,21 @@ function createDesktopViewerImplementation() {
                                     src={getPostImage({ image: photo })}
                                     alt={`${post.caption} — photo ${index + 1}`}
                                     draggable="false"
+                                    onLoad={(event) => {
+                                      const image = event.currentTarget;
+                                      if (
+                                        index !== photoIndex ||
+                                        !image.naturalWidth ||
+                                        !image.naturalHeight
+                                      )
+                                        return;
+                                      setVideoRatios((previous) => ({
+                                        ...previous,
+                                        [postId]:
+                                          image.naturalWidth /
+                                          image.naturalHeight,
+                                      }));
+                                    }}
                                     className="h-full w-full select-none object-contain"
                                   />
                                 </div>
@@ -5356,7 +7435,7 @@ function createDesktopViewerImplementation() {
                                 {photoIndex + 1} / {photoSet.length}
                               </span>
 
-                              <div className="absolute bottom-5 left-1/2 z-30 flex -translate-x-1/2 items-center gap-1.5">
+                              <div className="absolute bottom-1 left-1/2 z-30 flex -translate-x-1/2 items-center gap-1.5">
                                 {photoSet.map((_, index) => (
                                   <button
                                     key={`${postId}-dot-${index}`}
@@ -5383,14 +7462,19 @@ function createDesktopViewerImplementation() {
                             key={postId}
                             ref={videoRef}
                             src={
-                              isActive &&
-                              getCloudinaryHlsUrl(getOriginalVideoUrl(post))
+                              getCloudinaryHlsUrl(originalVideoUrl)
                                 ? undefined
                                 : videoUrl || undefined
                             }
                             poster={postThumbnail || undefined}
-                            autoPlay={!paused}
-                            preload="auto"
+                            autoPlay={
+                              !paused && !getCloudinaryHlsUrl(originalVideoUrl)
+                            }
+                            preload={
+                              getCloudinaryHlsUrl(originalVideoUrl)
+                                ? "none"
+                                : "auto"
+                            }
                             muted={muted}
                             loop
                             playsInline
@@ -5431,7 +7515,14 @@ function createDesktopViewerImplementation() {
                             onPlaying={() =>
                               setPlayingVideoPostId(String(postId))
                             }
-                            className="absolute inset-0 h-full w-full object-contain"
+                            className="absolute inset-x-0 top-0 w-full rounded-t-[2.25rem] object-contain"
+                            style={{
+                              height: "calc(100% - 36px)",
+                              borderTopLeftRadius: "36px",
+                              borderTopRightRadius: "36px",
+                              filter:
+                                "saturate(1.08) contrast(1.035) brightness(1.01)",
+                            }}
                           />
                         </>
                       ) : (
@@ -5443,7 +7534,12 @@ function createDesktopViewerImplementation() {
                               loading={isActive ? "eager" : "lazy"}
                               fetchPriority={isActive ? "high" : "low"}
                               decoding="async"
-                              className="h-full w-full object-contain"
+                              className="absolute inset-x-0 top-0 w-full rounded-t-[2.25rem] object-contain"
+                              style={{
+                                height: "calc(100% - 36px)",
+                                borderTopLeftRadius: "36px",
+                                borderTopRightRadius: "36px",
+                              }}
                             />
                           ) : (
                             <div className="flex flex-col items-center gap-2 text-white/70">
@@ -5458,10 +7554,6 @@ function createDesktopViewerImplementation() {
                           </span>
                         </div>
                       )}
-
-                      <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-24 bg-linear-to-b from-black/15 to-transparent" />
-
-                      <div className="pointer-events-none absolute inset-x-0 bottom-0 z-10 h-64 bg-linear-to-t from-black/75 via-black/35 via-45% to-transparent" />
 
                       {String(animatedLikePostId) === String(postId) && (
                         <div className="pointer-events-none absolute inset-0 z-40 flex items-center justify-center">
@@ -5491,83 +7583,91 @@ function createDesktopViewerImplementation() {
                         </div>
                       )}
 
-                      {(!isActive || postIsImage || showCreatorOverlay) && (
-                        <div className="absolute bottom-14 left-4 right-16 z-20 text-white drop-shadow-[0_2px_5px_rgba(0,0,0,0.95)]">
-                          <div className="mb-1.5 flex items-center gap-1.5">
-                            {getCreatorAvatar(post) ? (
-                              <img
-                                src={getCreatorAvatar(post)}
-                                alt={`${getCreatorName(post)}'s profile`}
-                                loading="lazy"
-                                decoding="async"
-                                onError={(event) => {
-                                  event.currentTarget.onerror = null;
+                      <div
+                        className="spotli-video-details absolute z-20 text-white"
+                        style={{
+                          left: `${stageBaseLeft - detailPanelWidth - 18 - stageLeft}px`,
+                          width: `${detailPanelWidth}px`,
+                          right: "auto",
+                          bottom: "18px",
+                          maxHeight: "52vh",
+                          overflowY: "auto",
+                          overflowWrap: "anywhere",
+                        }}
+                      >
+                        <div className="mb-2 flex min-w-0 items-center gap-2">
+                          {getCreatorAvatar(post) ? (
+                            <img
+                              src={getCreatorAvatar(post)}
+                              alt={`${getCreatorName(post)}'s profile`}
+                              loading="lazy"
+                              decoding="async"
+                              onError={(event) => {
+                                event.currentTarget.onerror = null;
 
-                                  event.currentTarget.style.display = "none";
-                                }}
-                                className="h-7 w-7 shrink-0 rounded-full border-2 border-white object-cover shadow-lg"
-                              />
-                            ) : (
-                              <span
-                                aria-label={`${getCreatorName(post)}'s profile`}
-                                className="grid h-7 w-7 shrink-0 place-items-center rounded-full border-2 border-white bg-[#FF2D4A] text-[10px] font-bold text-white shadow-lg"
-                              >
-                                {getCreatorName(post).charAt(0).toUpperCase()}
-                              </span>
-                            )}
-
-                            <div className="min-w-0">
-                              <p className="flex items-center gap-1 text-xs font-bold text-white">
-                                {getCreatorName(post)}
-
-                                <CheckCircle2
-                                  size={12}
-                                  className="text-sky-400"
-                                />
-                              </p>
-
-                              <p className="text-xs font-medium text-white/90">
-                                {post.time || "Recently"}
-                              </p>
-                            </div>
-
-                            <button
-                              type="button"
-                              onClick={() => toggleFollow(postId)}
-                              className="rounded-full border border-white px-2.5 py-1 text-[10px] font-bold text-white shadow-md backdrop-blur-sm"
+                                event.currentTarget.style.display = "none";
+                              }}
+                              className="h-10 w-10 shrink-0 rounded-full border border-white/50 object-cover shadow-lg"
+                            />
+                          ) : (
+                            <span
+                              aria-label={`${getCreatorName(post)}'s profile`}
+                              className="grid h-10 w-10 shrink-0 place-items-center rounded-full border border-white/50 bg-[#FF2D4A] text-sm font-bold text-white shadow-lg"
                             >
-                              {followedCreators[postId]
-                                ? "Following"
-                                : "Follow"}
-                            </button>
-                          </div>
-
-                          {post.caption && (
-                            <p className="mt-0.5 max-w-[92%] text-xs font-bold leading-snug text-white [text-shadow:0_2px_5px_rgba(0,0,0,0.95)]">
-                              <MentionText
-                                text={post.caption}
-                                mentions={post.mentions}
-                              />
-                            </p>
+                              {getCreatorName(post).charAt(0).toUpperCase()}
+                            </span>
                           )}
 
-                          <p className="mt-1 text-[10px] font-medium text-white/90">
-                            ♫ Original sound · {getCreatorName(post)}
-                          </p>
-                        </div>
-                      )}
+                          <div className="min-w-0">
+                            <p className="flex min-w-0 items-center gap-1 text-sm font-bold text-white">
+                              <span className="min-w-0 truncate whitespace-nowrap">
+                                {getCreatorName(post)}
+                              </span>
+                              <CheckCircle2
+                                size={12}
+                                className="shrink-0 text-sky-400"
+                              />
+                            </p>
 
-                      <aside className="absolute right-2 top-[56%] z-20 flex -translate-y-1/2 flex-col items-center gap-2 text-white">
+                            <p className="text-xs font-medium text-white/70">
+                              {post.time || "Recently"}
+                            </p>
+                          </div>
+
+                          <button
+                            type="button"
+                            onClick={() => toggleFollow(postId)}
+                            className="shrink-0 whitespace-nowrap rounded-full border border-white/80 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-white/10"
+                          >
+                            {followedCreators[postId] ? "Following" : "Follow"}
+                          </button>
+                        </div>
+
+                        {post.caption && (
+                          <p className="mt-3 max-w-full whitespace-pre-wrap break-words text-sm font-medium leading-relaxed text-white/95">
+                            <MentionText
+                              text={post.caption}
+                              mentions={post.mentions}
+                            />
+                          </p>
+                        )}
+
+                        <p className="mt-2 text-xs font-medium text-white/75">
+                          ♫ Original sound · {getCreatorName(post)}
+                        </p>
+                      </div>
+
+                      <aside className="spotli-video-action-rail absolute -right-[52px] top-1/2 z-20 flex -translate-y-1/2 flex-col items-center gap-3 text-white">
                         <button
                           type="button"
                           onClick={() => toggleLike(postId)}
                           aria-label={isLiked ? "Unlike post" : "Like post"}
                           aria-pressed={isLiked}
-                          className="spotli-like-button group flex flex-col items-center gap-1 rounded-full focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
+                          className="spotli-hide-in-fullscreen spotli-like-button group flex flex-col items-center gap-1 rounded-full focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
                         >
-                          <span className="grid h-8 w-8 place-items-center rounded-full border border-white/15 bg-black/65 text-white shadow-lg backdrop-blur-md transition-colors group-hover:bg-black/85">
+                          <span className="grid h-10 w-10 place-items-center rounded-full border border-white/15 bg-black/65 text-white shadow-lg backdrop-blur-md transition-colors group-hover:bg-black/85">
                             <Heart
-                              size={17}
+                              size={22}
                               fill={isLiked ? "#FF2D4A" : "none"}
                               color={isLiked ? "#FF2D4A" : "white"}
                               strokeWidth={2.2}
@@ -5585,10 +7685,10 @@ function createDesktopViewerImplementation() {
                           aria-label="Comments"
                           aria-pressed={commentsOpen}
                           onClick={() => setCommentsOpen((open) => !open)}
-                          className="group flex flex-col items-center gap-1 rounded-full focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
+                          className="spotli-hide-in-fullscreen group flex flex-col items-center gap-1 rounded-full focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
                         >
-                          <span className="grid h-8 w-8 place-items-center rounded-full border border-white/15 bg-black/65 text-white shadow-lg backdrop-blur-md transition-colors group-hover:bg-black/85">
-                            <MessageCircle size={15} />
+                          <span className="grid h-10 w-10 place-items-center rounded-full border border-white/15 bg-black/65 text-white shadow-lg backdrop-blur-md transition-colors group-hover:bg-black/85">
+                            <MessageCircle size={21} />
                           </span>
 
                           <span className="rounded-full bg-black/55 px-2 py-0.5 text-[11px] font-semibold text-white [text-shadow:0_1px_3px_rgba(0,0,0,0.8)]">
@@ -5633,13 +7733,36 @@ function createDesktopViewerImplementation() {
                           </span>
                         </button>
 
-                        <button
-                          type="button"
-                          aria-label="More options"
-                          className="grid h-8 w-8 place-items-center rounded-full border border-white/15 bg-black/65 text-white shadow-lg backdrop-blur-md transition-colors hover:bg-black/85 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
-                        >
-                          <MoreVertical size={14} />
-                        </button>
+                        <div className="relative">
+                          <button
+                            type="button"
+                            aria-label="More options"
+                            aria-expanded={openPostOptionsId === String(postId)}
+                            onClick={() => openPostMenu(post)}
+                            className="grid h-8 w-8 place-items-center rounded-full border border-white/15 bg-black/65 text-white shadow-lg backdrop-blur-md transition-colors hover:bg-black/85 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
+                          >
+                            <MoreVertical size={14} />
+                          </button>
+                          {openPostOptionsId === String(postId) && (
+                            <div className="absolute right-10 top-0 z-[160] min-w-40 rounded-2xl border border-white/10 bg-[#171717] p-1.5 text-white shadow-2xl">
+                              {isPostOwnedBy(post, currentUserId) ? (
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    void deletePostFromViewer(post)
+                                  }
+                                  className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left text-sm font-semibold text-red-300 transition hover:bg-white/10"
+                                >
+                                  <Trash2 size={15} /> Delete post
+                                </button>
+                              ) : (
+                                <p className="px-3 py-2 text-xs text-white/60">
+                                  Only the creator can delete this post.
+                                </p>
+                              )}
+                            </div>
+                          )}
+                        </div>
 
                         <button
                           type="button"
@@ -5676,12 +7799,12 @@ function createDesktopViewerImplementation() {
                       </aside>
 
                       {isActive && !postIsImage && (
-                        <div className="absolute bottom-2 left-3 right-3 z-30 flex items-center gap-2 text-white">
+                        <div className="absolute bottom-0 left-0 right-0 z-30 flex h-9 items-center gap-1 rounded-b-[2.25rem] bg-black/90 px-2 pb-0 pt-0 text-white">
                           <button
                             type="button"
                             onClick={togglePlayback}
                             aria-label={paused ? "Play" : "Pause"}
-                            className="grid h-8 w-8 shrink-0 place-items-center rounded-md transition-colors hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
+                            className="grid h-7 w-7 shrink-0 place-items-center rounded-lg transition-colors hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
                           >
                             {paused ? <Play size={16} /> : <Pause size={16} />}
                           </button>
@@ -5698,9 +7821,18 @@ function createDesktopViewerImplementation() {
                             step="0.1"
                             value={Math.min(currentTime, duration || 1)}
                             onChange={handleSeek}
-                            className="h-1.5 min-w-0 flex-1 cursor-pointer accent-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
+                            className="spotli-short-progress absolute bottom-0 left-0 z-40 h-1 w-full cursor-pointer accent-[#FF2D4A] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#FF2D4A]"
                             style={{
-                              background: `linear-gradient(to right, #FFFFFF ${progress}%, rgba(255,255,255,.4) ${progress}%)`,
+                              position: "absolute",
+                              left: 0,
+                              bottom: 0,
+                              width: "100%",
+                              height: "4px",
+                              margin: 0,
+                              padding: 0,
+                              borderRadius: "999px",
+                              overflow: "hidden",
+                              background: `linear-gradient(to right, #FF2D4A ${progress}%, rgba(255,255,255,.28) ${progress}%)`,
                             }}
                           />
 
@@ -5708,7 +7840,7 @@ function createDesktopViewerImplementation() {
                             type="button"
                             onClick={() => setMuted((value) => !value)}
                             aria-label={muted ? "Unmute" : "Mute"}
-                            className="grid h-8 w-8 shrink-0 place-items-center rounded-md transition-colors hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
+                            className="grid h-7 w-7 shrink-0 place-items-center rounded-lg transition-colors hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
                           >
                             {muted ? (
                               <VolumeX size={16} />
@@ -5727,72 +7859,16 @@ function createDesktopViewerImplementation() {
                             aria-pressed={captionsEnabled}
                             title="Toggle captions when available"
                             onClick={toggleCaptions}
-                            className={`grid h-8 w-8 shrink-0 place-items-center rounded-md transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white ${captionsEnabled ? "bg-[#FF2D4A]/20 text-[#FF2D4A]" : "hover:bg-white/10"}`}
+                            className={`grid h-7 w-7 shrink-0 place-items-center rounded transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white ${captionsEnabled ? "bg-[#FF2D4A]/20 text-[#FF2D4A]" : "hover:bg-white/10"}`}
                           >
                             <Captions size={16} />
                           </button>
-
-                          <div className="relative shrink-0">
-                            <button
-                              type="button"
-                              aria-label="Playback settings"
-                              aria-expanded={settingsOpen}
-                              onClick={() => setSettingsOpen((open) => !open)}
-                              className="grid h-8 w-8 shrink-0 place-items-center rounded-md transition-colors hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
-                            >
-                              <Settings size={16} />
-                            </button>
-                            {settingsOpen && (
-                              <div className="absolute bottom-8 right-0 z-50 max-h-64 min-w-36 overflow-y-auto rounded-lg bg-black/95 p-2 text-white shadow-xl">
-                                <p className="px-3 pb-1 pt-1 text-[10px] font-semibold uppercase tracking-wide text-white/55">
-                                  Video quality
-                                </p>
-                                <button
-                                  type="button"
-                                  aria-pressed={selectedQuality === "auto"}
-                                  onClick={() => changeVideoQuality("auto")}
-                                  className={`block w-full rounded px-3 py-2 text-left text-xs ${selectedQuality === "auto" ? "text-[#FF2D4A]" : "text-white"}`}
-                                >
-                                  Auto {selectedQuality === "auto" ? "✓" : ""}
-                                </button>
-                                {qualityOptions.length > 0 ? (
-                                  [...qualityOptions]
-                                    .reverse()
-                                    .map((quality) => (
-                                      <button
-                                        key={quality.height}
-                                        type="button"
-                                        aria-pressed={
-                                          selectedQuality ===
-                                          String(quality.height)
-                                        }
-                                        onClick={() =>
-                                          changeVideoQuality(quality.height)
-                                        }
-                                        className={`block w-full rounded px-3 py-2 text-left text-xs ${selectedQuality === String(quality.height) ? "text-[#FF2D4A]" : "text-white"}`}
-                                      >
-                                        {quality.label}{" "}
-                                        {selectedQuality ===
-                                        String(quality.height)
-                                          ? "✓"
-                                          : ""}
-                                      </button>
-                                    ))
-                                ) : (
-                                  <p className="px-3 py-2 text-[11px] leading-snug text-white/55">
-                                    Manual quality is unavailable for this
-                                    video/browser.
-                                  </p>
-                                )}
-                              </div>
-                            )}
-                          </div>
 
                           <button
                             type="button"
                             onClick={() => toggleFullscreen(postId)}
                             aria-label="Fullscreen"
-                            className="grid h-8 w-8 shrink-0 place-items-center rounded-md transition-colors hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
+                            className="grid h-7 w-7 shrink-0 place-items-center rounded-lg transition-colors hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
                           >
                             <Maximize size={16} />
                           </button>
@@ -5804,76 +7880,8 @@ function createDesktopViewerImplementation() {
               })}
             </section>
 
-            <aside className="flex min-h-0 min-w-0 flex-col overflow-hidden border-l border-gray-100 bg-white">
-              {!commentsOpen ? (
-                <div className="flex min-h-0 flex-1 flex-col">
-                  <div className="flex items-center justify-between px-3 py-3">
-                    <h2 className="text-sm font-bold">Up next</h2>
-
-                    <label className="flex items-center gap-1.5 text-xs text-gray-500">
-                      Autoplay
-                      <input
-                        type="checkbox"
-                        defaultChecked
-                        className="accent-[#FF2D4A]"
-                      />
-                    </label>
-                  </div>
-
-                  <div className="min-h-0 flex-1 space-y-3 overflow-y-auto px-3 pb-3 scrollbar-none [&::-webkit-scrollbar]:hidden">
-                    {viewerPosts
-
-                      .filter(
-                        (post) =>
-                          String(getPostId(post)) !== String(activePostId),
-                      )
-
-                      .map((post, index) => (
-                        <button
-                          key={getPostId(post)}
-                          type="button"
-                          onClick={() => selectPost(post)}
-                          className="flex w-full gap-2 text-left"
-                        >
-                          <div className="relative h-14.5 w-25 shrink-0 overflow-hidden rounded-md bg-gray-100">
-                            <UpNextThumbnail
-                              post={post}
-                              loading={index < 4 ? "eager" : "lazy"}
-                              fetchPriority={index < 2 ? "high" : "auto"}
-                            />
-
-                            <span className="absolute bottom-1 right-1 rounded bg-black/75 px-1 py-0.5 text-[10px] text-white">
-                              {post.duration || "0:30"}
-                            </span>
-                          </div>
-
-                          <div className="min-w-0 flex-1">
-                            <p className="line-clamp-2 text-xs font-semibold leading-snug">
-                              <MentionText
-                                text={post.caption}
-                                mentions={post.mentions}
-                              />
-                            </p>
-
-                            <p className="mt-1 truncate text-xs text-gray-600">
-                              {getCreatorName(post)}
-                            </p>
-
-                            <p className="mt-1 text-[10px] text-gray-500">
-                              {formatPostViews(post)} ·{" "}
-                              {post.time || "Recently"}
-                            </p>
-                          </div>
-
-                          <MoreVertical
-                            size={14}
-                            className="shrink-0 text-gray-400"
-                          />
-                        </button>
-                      ))}
-                  </div>
-                </div>
-              ) : (
+            {commentsOpen && (
+              <aside className="flex min-h-0 min-w-0 flex-col overflow-hidden border-l border-white/10 bg-[#111111] text-white">
                 <div
                   id="desktop-comments"
                   className="flex min-h-0 flex-1 flex-col"
@@ -5888,8 +7896,8 @@ function createDesktopViewerImplementation() {
                     variant="panel"
                   />
                 </div>
-              )}
-            </aside>
+              </aside>
+            )}
           </div>
         </div>
       </div>
@@ -5911,6 +7919,9 @@ export default function VideoViewer({
   preservePostOrder = false,
   initialPostIndex = null,
   onBack,
+  onNavigateFromViewer,
+  currentUserId = "",
+  onDeletePost,
 }) {
   const getDevice = () => {
     if (typeof window === "undefined") return "mobile";
@@ -5948,6 +7959,9 @@ export default function VideoViewer({
     preservePostOrder,
     initialPostIndex,
     onBack,
+    onNavigateFromViewer,
+    currentUserId,
+    onDeletePost,
   };
   if (device === "desktop")
     return <DesktopViewerImplementation {...viewerProps} />;

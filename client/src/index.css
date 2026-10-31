@@ -62,46 +62,46 @@
    keeping text contrast and the #FF2D4A brand accent readable. */
 html.dark {
   color-scheme: dark;
-  background-color: #07090d;
+  background-color: #0f0f0f;
   color: #f3f5f8;
 }
 
 html.dark body,
 html.dark #root {
-  background-color: #07090d;
+  background-color: #0f0f0f;
   color: #f3f5f8;
 }
 
 html.dark .bg-white {
-  background-color: #090c11 !important;
+  background-color: #0f0f0f !important;
 }
 html.dark .bg-neutral-50,
 html.dark .bg-gray-50 {
-  background-color: #0b0f14 !important;
+  background-color: #121212 !important;
 }
 /* Translucent form surfaces also need to follow the active theme. */
 html.dark .bg-gray-50\/40 {
-  background-color: rgb(11 15 20 / 40%) !important;
+  background-color: rgb(15 15 15 / 40%) !important;
 }
 html.dark .bg-neutral-100,
 html.dark .bg-gray-100,
 html.dark .bg-stone-100 {
-  background-color: #111720 !important;
+  background-color: #181818 !important;
 }
 html.dark .bg-neutral-200,
 html.dark .bg-gray-200 {
-  background-color: #1a222d !important;
+  background-color: #212121 !important;
 }
 html.dark .bg-neutral-300,
 html.dark .bg-gray-300 {
-  background-color: #262f3a !important;
+  background-color: #2f2f2f !important;
 }
 html.dark .bg-neutral-400,
 html.dark .bg-gray-400 {
-  background-color: #414d5b !important;
+  background-color: #444444 !important;
 }
 html.dark .bg-white\/95 {
-  background-color: rgb(9 12 17 / 95%) !important;
+  background-color: rgb(15 15 15 / 95%) !important;
 }
 html.dark .bg-red-50,
 html.dark .bg-rose-50,
@@ -112,7 +112,7 @@ html.dark .bg-rose-50\/50 {
   background-color: rgb(42 17 25 / 50%) !important;
 }
 html.dark [class~="bg-[#F0F0F0]"] {
-  background-color: #171d26 !important;
+  background-color: #181818 !important;
 }
 
 html.dark .text-black,
@@ -157,18 +157,18 @@ html.dark .border-neutral-100,
 html.dark .border-gray-100,
 html.dark .divide-neutral-100 > :not(:last-child),
 html.dark .divide-neutral-200 > :not(:last-child) {
-  border-color: #1a212b !important;
+  border-color: #272727 !important;
 }
 html.dark .border-neutral-200,
 html.dark .border-gray-200,
 html.dark .border-stone-200 {
-  border-color: #232c38 !important;
+  border-color: #303030 !important;
 }
 html.dark .border-neutral-300,
 html.dark .border-gray-300,
 html.dark .border-neutral-400,
 html.dark .border-gray-400 {
-  border-color: #313b48 !important;
+  border-color: #3f3f3f !important;
 }
 html.dark .border-red-200,
 html.dark .border-red-400 {
@@ -177,24 +177,24 @@ html.dark .border-red-400 {
 html.dark [class~="border-black/[0.06]"],
 html.dark [class~="border-black/[0.08]"],
 html.dark [class~="border-black/10"] {
-  border-color: #202834 !important;
+  border-color: #303030 !important;
 }
 
 html.dark .hover\:bg-neutral-50:hover,
 html.dark .hover\:bg-gray-50:hover {
-  background-color: #141b24 !important;
+  background-color: #181818 !important;
 }
 html.dark .hover\:bg-neutral-100:hover,
 html.dark .hover\:bg-gray-100:hover,
 html.dark .hover\:bg-white:hover {
-  background-color: #1b232e !important;
+  background-color: #272727 !important;
 }
 html.dark .hover\:bg-neutral-200:hover {
-  background-color: #26313d !important;
+  background-color: #303030 !important;
 }
 html.dark .hover\:bg-neutral-800:hover,
 html.dark .hover\:bg-gray-800:hover {
-  background-color: #303b49 !important;
+  background-color: #3f3f3f !important;
 }
 html.dark .hover\:bg-red-50:hover,
 html.dark .hover\:bg-rose-50:hover {
@@ -209,8 +209,8 @@ html.dark input:not([type="checkbox"]):not([type="radio"]):not([type="range"]),
 html.dark textarea,
 html.dark select {
   color: #f3f5f8;
-  background-color: #0a0e13;
-  border-color: #27313e;
+  background-color: #121212;
+  border-color: #303030;
 }
 html.dark input::placeholder,
 html.dark textarea::placeholder {
@@ -218,7 +218,7 @@ html.dark textarea::placeholder {
 }
 html.dark option {
   color: #f3f5f8;
-  background-color: #0a0e13;
+  background-color: #121212;
 }
 
 /* Switch thumbs stay white in dark mode, matching the reference toggle. */
@@ -334,5 +334,62 @@ html.dark .spotli-profile-primary-action:hover {
 }
 
 html.dark .spotli-profile-notification-dot {
-  --tw-ring-color: #090c11;
+  --tw-ring-color: #0f0f0f;
+}
+
+/* Desktop video-viewing surface follows the Shorts-style charcoal palette even
+   when the rest of Spotli is set to Light Mode. This keeps the viewer and its
+   optional comments panel visually consistent without changing other pages. */
+.spotli-video-viewer {
+  background-color: #0f0f0f;
+  color: #f1f1f1;
+}
+.spotli-video-viewer .bg-white {
+  background-color: #0f0f0f !important;
+}
+.spotli-video-viewer .bg-neutral-50,
+.spotli-video-viewer .bg-gray-50 {
+  background-color: #121212 !important;
+}
+.spotli-video-viewer .bg-neutral-100,
+.spotli-video-viewer .bg-gray-100,
+.spotli-video-viewer .bg-stone-100 {
+  background-color: #181818 !important;
+}
+.spotli-video-viewer .bg-neutral-200,
+.spotli-video-viewer .bg-gray-200 {
+  background-color: #272727 !important;
+}
+.spotli-video-viewer .text-black,
+.spotli-video-viewer .text-neutral-900,
+.spotli-video-viewer .text-gray-900,
+.spotli-video-viewer .text-gray-950 {
+  color: #f1f1f1 !important;
+}
+.spotli-video-viewer .text-gray-800,
+.spotli-video-viewer .text-gray-700,
+.spotli-video-viewer .text-gray-600,
+.spotli-video-viewer .text-gray-500,
+.spotli-video-viewer .text-neutral-700,
+.spotli-video-viewer .text-neutral-600,
+.spotli-video-viewer .text-neutral-500 {
+  color: #aaaaaa !important;
+}
+.spotli-video-viewer .border-gray-100,
+.spotli-video-viewer .border-gray-200,
+.spotli-video-viewer .border-neutral-100,
+.spotli-video-viewer .border-neutral-200 {
+  border-color: #303030 !important;
+}
+.spotli-video-viewer
+  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]),
+.spotli-video-viewer textarea,
+.spotli-video-viewer select {
+  color: #f1f1f1;
+  background-color: #181818;
+  border-color: #303030;
+}
+.spotli-video-viewer input::placeholder,
+.spotli-video-viewer textarea::placeholder {
+  color: #aaaaaa;
 }

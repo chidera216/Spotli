@@ -368,6 +368,22 @@ export default function PublicProfile({ userId, onOpenVideo, onOpenPhoto }) {
 
   const [creator, setCreator] = useState(null);
   const [posts, setPosts] = useState([]);
+
+  useEffect(() => {
+    function handlePostDeleted(event) {
+      const postId = String(event.detail?.postId || "");
+      if (!postId) return;
+      setPosts((current) =>
+        current.filter(
+          (post) =>
+            String(post?._id || post?.id || post?.postId || "") !== postId,
+        ),
+      );
+    }
+    window.addEventListener("spotli:post-deleted", handlePostDeleted);
+    return () =>
+      window.removeEventListener("spotli:post-deleted", handlePostDeleted);
+  }, []);
   const [hasMorePosts, setHasMorePosts] = useState(false);
   const [isLoadingMorePosts, setIsLoadingMorePosts] = useState(false);
   const pageRef = useRef(1);

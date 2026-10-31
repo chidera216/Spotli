@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 
 import api from "../services/api";
+import { rememberRecentVideoPlayback } from "../utils/recentVideoPlaybackCache";
 
 import MentionField from "../components/MentionField";
 
@@ -25,9 +26,30 @@ import {
 
 const MAX_CAPTION_LENGTH = 2000;
 
-const MAX_FILE_SIZE = 500 * 1024 * 1024;
-
+const MAX_IMAGE_SIZE = Number(import.meta.env.VITE_MAX_IMAGE_UPLOAD_BYTES) > 0
+  ? Number(import.meta.env.VITE_MAX_IMAGE_UPLOAD_BYTES)
+  : 10 * 1024 * 1024;
+const MAX_VIDEO_SIZE = Number(import.meta.env.VITE_MAX_VIDEO_UPLOAD_BYTES) > 0
+  ? Number(import.meta.env.VITE_MAX_VIDEO_UPLOAD_BYTES)
+  : 100 * 1024 * 1024;
+// Source videos may exceed Cloudinary's limit because Spotli can optimize them
+// locally before requesting a Cloudinary signature. This cap protects browsers
+// from attempting very large in-memory encodes on phones with limited RAM.
+const MAX_RAW_VIDEO_SIZE = Number(import.meta.env.VITE_MAX_SOURCE_VIDEO_BYTES) > 0
+  ? Number(import.meta.env.VITE_MAX_SOURCE_VIDEO_BYTES)
+  : 300 * 1024 * 1024;
+const VIDEO_COMPRESSION_THRESHOLD = 5 * 1024 * 1024;
+const SMALL_VIDEO_COMPRESSION_THRESHOLD = 15 * 1024 * 1024;
+const SMALL_VIDEO_TARGET_RATIO = 0.55;
+const STANDARD_VIDEO_TARGET_RATIO = 0.40;
+// Speed-first profile for large videos: reduce upload bytes enough to matter on
+// mobile connections, while the worker prefers a 720p encode when the source is
+// at least 50 MiB. This is a target, not a promise about exact output size.
+const SPEED_OPTIMIZED_DOWNSCALE_THRESHOLD = 50 * 1024 * 1024;
+const VIDEO_COMPRESSION_TARGET_MAX = 20 * 1024 * 1024;
 const MAX_THUMBNAIL_SIZE = 10 * 1024 * 1024;
+const ACTIVE_UPLOAD_NOTICE_PATTERN =
+  /(?:Optimizing video|Preparing direct Cloudinary upload|Preparing Cloudinary optimization|Uploading (?:original )?video|Uploading video to Cloudinary|Uploading video through Spotli|Forwarding video to Cloudinary|Sending video (?:to|through) Spotli|Uploading video from Spotli server to Cloudinary|Uploading photo|Uploading photos|Uploading media|Uploading thumbnail)/i;
 
 const MAX_VIDEO_DURATION = 10 * 60;
 
@@ -45,6 +67,8 @@ const TOPICS = [
   "Lifestyle",
 
   "Music",
+
+  "Fitness",
 ];
 
 function formatDuration(seconds) {
@@ -55,6 +79,34 @@ function formatDuration(seconds) {
   const remainingSeconds = Math.floor(seconds % 60);
 
   return `${minutes}:${String(remainingSeconds).padStart(2, "0")}`;
+}
+
+function formatElapsedMilliseconds(milliseconds) {
+  if (!Number.isFinite(milliseconds) || milliseconds < 0) return "—";
+  return `${(milliseconds / 1000).toFixed(1)}s`;
+}
+
+function createVideoPreuploadState(overrides = {}) {
+  return {
+    status: "idle",
+    progress: 0,
+    compressionProgress: 0,
+    error: "",
+    reason: "",
+    speedBytesPerSecond: 0,
+    secondsRemaining: Number.NaN,
+    encodingMs: Number.NaN,
+    uploadMs: Number.NaN,
+    originalSize: 0,
+    uploadSize: 0,
+    compressed: false,
+    savingsPercent: 0,
+    outputWidth: null,
+    outputHeight: null,
+    dimensionsReduced: false,
+    optimizationQueued: false,
+    ...overrides,
+  };
 }
 
 function Create() {
@@ -68,9 +120,16 @@ function Create() {
 
   const replaceIndexRef = useRef(null);
 
-  const processingTimerRef = useRef(null);
 
   const activeUploadRequestsRef = useRef(new Set());
+
+  // Video bytes now travel directly from the browser to Cloudinary. The API
+  // only signs the upload and later verifies the asset before creating a post.
+  const videoPreuploadRef = useRef(null);
+  const isPublishingRef = useRef(false);
+  const [videoPreuploadState, setVideoPreuploadState] = useState(
+    createVideoPreuploadState(),
+  );
 
   const cancelUploadRequestedRef = useRef(false);
 
@@ -100,9 +159,7 @@ function Create() {
 
   const [isPublishing, setIsPublishing] = useState(false);
 
-  const [isProcessingFiles, setIsProcessingFiles] = useState(false);
 
-  const [processingProgress, setProcessingProgress] = useState(0);
 
   const [currentUser, setCurrentUser] = useState(null);
 
@@ -122,7 +179,29 @@ function Create() {
     return () => {
       cancelled = true;
 
-      if (processingTimerRef.current) clearTimeout(processingTimerRef.current);
+      const stagedUpload = videoPreuploadRef.current;
+      if (stagedUpload && !stagedUpload.committed) {
+        stagedUpload.cancelled = true;
+        stagedUpload.cancelCompression?.();
+        stagedUpload.compressionWorker?.terminate();
+        stagedUpload.requests?.forEach((request) => request.abort());
+        if (
+          stagedUpload.cleanup &&
+          !["uploading", "confirming"].includes(stagedUpload.status)
+        ) {
+          void Promise.resolve(stagedUpload.cleanup()).catch(() => {});
+          stagedUpload.cleanup = null;
+        }
+        const cleanupPublicId = stagedUpload.asset?.public_id || stagedUpload.publicId;
+        if (cleanupPublicId) {
+          void api.posts
+            .discardUpload({
+              publicId: cleanupPublicId,
+              resourceType: stagedUpload.asset?.resource_type || "video",
+            })
+            .catch(() => {});
+        }
+      }
 
       objectUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
 
@@ -149,6 +228,7 @@ function Create() {
   }
 
   function clearMedia() {
+    cancelStagedVideoUpload();
     media.forEach((item) => releasePreviewUrl(item.url));
 
     replaceIndexRef.current = null;
@@ -190,28 +270,6 @@ function Create() {
     fileInputRef.current?.click();
   }
 
-  function showProcessingProgress() {
-    if (processingTimerRef.current) clearTimeout(processingTimerRef.current);
-
-    setIsProcessingFiles(true);
-
-    setProcessingProgress(18);
-
-    requestAnimationFrame(() => {
-      setProcessingProgress(68);
-
-      requestAnimationFrame(() => {
-        setProcessingProgress(100);
-
-        processingTimerRef.current = setTimeout(() => {
-          setIsProcessingFiles(false);
-
-          setProcessingProgress(0);
-        }, 350);
-      });
-    });
-  }
-
   function openReplacePicker(index) {
     replaceIndexRef.current = index;
 
@@ -225,6 +283,68 @@ function Create() {
       return `${Math.max(1, Math.round(bytes / 1024))} KB`;
 
     return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  }
+
+  function formatTimeRemaining(seconds) {
+    if (!Number.isFinite(seconds) || seconds < 0) return "estimating time left";
+    if (seconds < 60) return `${Math.ceil(seconds)}s left`;
+    if (seconds < 3600) {
+      return `${Math.floor(seconds / 60)}m ${Math.ceil(seconds % 60)}s left`;
+    }
+    return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m left`;
+  }
+
+  // Upload progress now includes measured throughput and an ETA. This also helps
+  // distinguish transferring bytes from Cloudinary confirming the completed upload.
+  function createUploadProgressReporter(label, file) {
+    const startedAt = performance.now();
+    let lastSampleAt = startedAt;
+    let lastSampleBytes = 0;
+    let smoothedBytesPerSecond = 0;
+    let lastUiUpdateAt = 0;
+
+    return (progress) => {
+      const normalizedProgress = Math.max(
+        0,
+        Math.min(100, Number(progress) || 0),
+      );
+      const now = performance.now();
+      const loadedBytes = file.size * (normalizedProgress / 100);
+      const sampleElapsedSeconds = (now - lastSampleAt) / 1000;
+
+      if (sampleElapsedSeconds >= 0.5) {
+        const sampleSpeed =
+          Math.max(0, loadedBytes - lastSampleBytes) / sampleElapsedSeconds;
+        if (sampleSpeed > 0) {
+          smoothedBytesPerSecond = smoothedBytesPerSecond
+            ? smoothedBytesPerSecond * 0.7 + sampleSpeed * 0.3
+            : sampleSpeed;
+        }
+        lastSampleAt = now;
+        lastSampleBytes = loadedBytes;
+      }
+
+      if (now - lastUiUpdateAt < 250 && normalizedProgress < 100) return;
+      lastUiUpdateAt = now;
+
+      setUploadProgress(Math.round(normalizedProgress));
+      if (normalizedProgress >= 100) {
+        setNotice(`${label}… 100% · waiting for Cloudinary confirmation`);
+        return;
+      }
+
+      const speedLabel =
+        smoothedBytesPerSecond > 0
+          ? `${formatFileSize(smoothedBytesPerSecond)}/s`
+          : "measuring speed";
+      const remainingSeconds =
+        smoothedBytesPerSecond > 0
+          ? (file.size - loadedBytes) / smoothedBytesPerSecond
+          : Number.NaN;
+      setNotice(
+        `${label}… ${Math.round(normalizedProgress)}% · ${speedLabel} · ${formatTimeRemaining(remainingSeconds)}`,
+      );
+    };
   }
 
   function handleFiles(fileList) {
@@ -255,9 +375,13 @@ function Create() {
         continue;
       }
 
-      if (file.size > MAX_FILE_SIZE) {
-        setNotice(`${file.name} exceeds the 500 MB size limit.`);
-
+      const maxSize = postType === "video" ? MAX_RAW_VIDEO_SIZE : MAX_IMAGE_SIZE;
+      if (file.size > maxSize) {
+        setNotice(
+          postType === "video"
+            ? `${file.name} is larger than Spotli's source-video limit (${formatFileSize(maxSize)}). Try a shorter clip.`
+            : `${file.name} exceeds your configured Cloudinary image limit (${formatFileSize(maxSize)}). Check your Cloudinary plan if you need a larger limit.`,
+        );
         continue;
       }
 
@@ -294,6 +418,7 @@ function Create() {
       replaceIndexRef.current = null;
 
       const file = acceptedFiles[0];
+      if (postType === "video") cancelStagedVideoUpload();
 
       const replacement = {
         id: crypto.randomUUID(),
@@ -323,8 +448,8 @@ function Create() {
         return next;
       });
 
-      showProcessingProgress();
-
+      // Selecting a video only updates the local preview. Compression and upload
+      // begin when the creator presses Publish.
       return;
     }
 
@@ -361,8 +486,6 @@ function Create() {
 
     setMedia((current) => [...current, ...newMedia]);
 
-    showProcessingProgress();
-
     if (acceptedFiles.length > filesToAdd.length) {
       setNotice(
         "Some files were not added because the selection limit was reached.",
@@ -384,6 +507,8 @@ function Create() {
 
   function removeMedia(id) {
     const removedItem = media.find((item) => item.id === id);
+
+    if (removedItem?.type === "video") cancelStagedVideoUpload();
 
     if (removedItem) {
       releasePreviewUrl(removedItem.url);
@@ -510,8 +635,13 @@ function Create() {
     );
   }
 
-  async function uploadToCloudinary(file, resourceType, onProgress) {
-    if (cancelUploadRequestedRef.current) {
+  async function uploadToCloudinary(
+    file,
+    resourceType,
+    onProgress,
+    requestScope = null,
+  ) {
+    if (cancelUploadRequestedRef.current || requestScope?.cancelled) {
       throw new Error("UPLOAD_CANCELLED");
     }
 
@@ -521,86 +651,796 @@ function Create() {
       fileSize: file.size,
     });
 
-    // If cancellation happened while the server was signing the upload,
-    // don't start sending the file afterward.
-    if (cancelUploadRequestedRef.current) {
+    if (cancelUploadRequestedRef.current || requestScope?.cancelled) {
       throw new Error("UPLOAD_CANCELLED");
     }
 
-    const uploadForm = new FormData();
-    uploadForm.append("file", file);
-    uploadForm.append("api_key", signature.apiKey);
-    uploadForm.append("timestamp", String(signature.timestamp));
-    uploadForm.append("signature", signature.signature);
-    uploadForm.append("folder", signature.folder);
-    uploadForm.append("public_id", signature.publicId);
-
-    // XMLHttpRequest exposes real upload progress; fetch does not provide
-    // portable upload-progress events in browsers.
-    const uploadedAsset = await new Promise((resolve, reject) => {
-      const request = new XMLHttpRequest();
-      activeUploadRequestsRef.current.add(request);
-      const removeRequest = () =>
-        activeUploadRequestsRef.current.delete(request);
-      request.open(
-        "POST",
-        `https://api.cloudinary.com/v1_1/${signature.cloudName}/${signature.resourceType}/upload`,
-      );
-      request.responseType = "json";
-
-      request.upload.addEventListener("progress", (event) => {
-        if (event.lengthComputable && typeof onProgress === "function") {
-          onProgress(
-            Math.min(100, Math.round((event.loaded / event.total) * 100)),
-          );
-        }
+    if (requestScope) {
+      // Start transfer timing only after the backend signing request has returned.
+      requestScope.transferStartedAt = performance.now();
+      requestScope.lastSampleAt = requestScope.transferStartedAt;
+      requestScope.lastSampleBytes = 0;
+      requestScope.speedBytesPerSecond = 0;
+      // Cloudinary stores this in the configured folder as spotli/posts/<publicId>.
+      requestScope.publicId = `${signature.folder}/${signature.publicId}`;
+      console.info("[Spotli upload] Cloudinary transfer started", {
+        timestamp: new Date().toISOString(),
+        fileName: file.name,
+        originalSizeBytes: requestScope.file?.size ?? file.size,
+        preparedSizeBytes: file.size,
+        compressionMs: requestScope.encodingMs ?? null,
+        compressed: requestScope.compressionResult?.compressed ?? false,
+        durationSeconds:
+          media.find((item) => item.file === requestScope.file)?.duration ?? null,
       });
+    }
 
-      request.addEventListener("load", () => {
-        removeRequest();
-        const result = request.response || {};
-        if (
-          request.status < 200 ||
-          request.status >= 300 ||
-          !result.public_id ||
-          !result.resource_type
-        ) {
-          reject(
-            new Error(
-              result.error?.message ||
-                "Media upload failed. Please check your connection and try again.",
-            ),
-          );
+    const endpoint = `https://api.cloudinary.com/v1_1/${signature.cloudName}/${signature.resourceType}/upload`;
+    // Cloudinary supports a normal upload up to 100 MB. Single-request uploads
+    // are faster below that size; for eligible larger account limits, use 20 MB
+    // chunks (Cloudinary's documented default) to reduce sequential round trips.
+    const chunked = resourceType === "video" && file.size >= 100_000_000;
+    const chunkSize = 20_000_000;
+    const uploadStartedAt = performance.now();
+    const uniqueUploadId = chunked ? crypto.randomUUID() : "";
+
+    const appendSignedFields = (form) => {
+      form.append("api_key", signature.apiKey);
+      form.append("timestamp", String(signature.timestamp));
+      form.append("signature", signature.signature);
+      form.append("folder", signature.folder);
+      form.append("public_id", signature.publicId);
+      form.append("overwrite", "false");
+      if (signature.context) form.append("context", signature.context);
+      if (signature.transformation) {
+        form.append("transformation", signature.transformation);
+      }
+      if (signature.format) form.append("format", signature.format);
+      if (signature.eager) form.append("eager", signature.eager);
+      if (signature.eager_async !== undefined) {
+        form.append("eager_async", String(signature.eager_async));
+      }
+      if (signature.eager_notification_url) {
+        form.append("eager_notification_url", signature.eager_notification_url);
+      }
+    };
+
+    const sendRequest = (start, end, attempt = 0) =>
+      new Promise((resolve, reject) => {
+        if (cancelUploadRequestedRef.current || requestScope?.cancelled) {
+          reject(new Error("UPLOAD_CANCELLED"));
           return;
         }
-        resolve(result);
+
+        const request = new XMLHttpRequest();
+        const removeRequest = () => {
+          activeUploadRequestsRef.current.delete(request);
+          requestScope?.requests?.delete(request);
+        };
+        activeUploadRequestsRef.current.add(request);
+        requestScope?.requests?.add(request);
+        request.open("POST", endpoint);
+        request.responseType = "json";
+
+        if (chunked) {
+          request.setRequestHeader("Content-Range", `bytes ${start}-${end - 1}/${file.size}`);
+          request.setRequestHeader("X-Unique-Upload-Id", uniqueUploadId);
+        }
+
+        request.upload.addEventListener("progress", (event) => {
+          if (!event.lengthComputable || typeof onProgress !== "function") return;
+          const transferred = start + event.loaded;
+          onProgress(Math.min(99.9, (transferred / file.size) * 100));
+        });
+
+        request.addEventListener("load", () => {
+          removeRequest();
+          const result = request.response && typeof request.response === "object"
+            ? request.response
+            : {};
+
+          if (request.status < 200 || request.status >= 300) {
+            const error = new Error(
+              result.error?.message ||
+                `Cloudinary upload failed (${request.status}). Please check the file size and your Cloudinary account upload limit.`,
+            );
+            error.status = request.status;
+            reject(error);
+            return;
+          }
+          resolve(result);
+        });
+
+        request.addEventListener("error", () => {
+          removeRequest();
+          const error = new Error("Network error uploading directly to Cloudinary.");
+          error.status = 0;
+          reject(error);
+        });
+
+        request.addEventListener("abort", () => {
+          removeRequest();
+          reject(new Error("UPLOAD_CANCELLED"));
+        });
+
+        const form = new FormData();
+        const part = chunked ? file.slice(start, end, file.type) : file;
+        form.append("file", part, file.name);
+        appendSignedFields(form);
+
+        request.send(form);
+      }).catch(async (error) => {
+        if (
+          error?.message === "UPLOAD_CANCELLED" ||
+          cancelUploadRequestedRef.current ||
+          requestScope?.cancelled
+        ) {
+          throw new Error("UPLOAD_CANCELLED");
+        }
+
+        const retryable =
+          error?.status === 0 ||
+          error?.status === 408 ||
+          error?.status === 429 ||
+          error?.status >= 500;
+        if (!retryable || attempt >= 2) throw error;
+
+        console.warn("Retrying Cloudinary upload chunk", {
+          start,
+          end,
+          attempt: attempt + 1,
+          error: error?.message || String(error),
+        });
+        await new Promise((resolve) => setTimeout(resolve, attempt === 0 ? 500 : 1500));
+        if (cancelUploadRequestedRef.current || requestScope?.cancelled) {
+          throw new Error("UPLOAD_CANCELLED");
+        }
+        return sendRequest(start, end, attempt + 1);
       });
 
-      request.addEventListener("error", () => {
-        removeRequest();
-        reject(
-          new Error(
-            "Network error while uploading media. Check your connection and try again.",
-          ),
-        );
+    let uploadedAsset;
+    if (chunked) {
+      const totalChunks = Math.ceil(file.size / chunkSize);
+      console.info("Spotli direct Cloudinary chunked upload started", {
+        fileName: file.name,
+        fileSizeBytes: file.size,
+        chunkSizeBytes: chunkSize,
+        totalChunks,
       });
-      request.addEventListener("abort", () => {
-        removeRequest();
-        reject(new Error("UPLOAD_CANCELLED"));
-      });
-      request.send(uploadForm);
+
+      for (let start = 0; start < file.size; start += chunkSize) {
+        const end = Math.min(file.size, start + chunkSize);
+        const result = await sendRequest(start, end);
+        if (end >= file.size) uploadedAsset = result;
+        if (cancelUploadRequestedRef.current || requestScope?.cancelled) {
+          throw new Error("UPLOAD_CANCELLED");
+        }
+      }
+    } else {
+      uploadedAsset = await sendRequest(0, file.size);
+    }
+
+    if (
+      !uploadedAsset?.public_id ||
+      uploadedAsset.resource_type !== resourceType ||
+      !uploadedAsset.secure_url
+    ) {
+      throw new Error(
+        "Cloudinary did not confirm a completed upload. Please retry the upload.",
+      );
+    }
+
+    const uploadElapsedMs = performance.now() - uploadStartedAt;
+    const uploadedBytes = Number(uploadedAsset.bytes) || file.size;
+    console.info("[Spotli upload] Cloudinary transfer complete", {
+      timestamp: new Date().toISOString(),
+      fileName: file.name,
+      publicId: uploadedAsset.public_id,
+      resourceType: uploadedAsset.resource_type,
+      sourceBytes: file.size,
+      cloudinaryBytes: uploadedBytes,
+      chunked,
+      chunkSizeBytes: chunked ? chunkSize : null,
+      elapsedMs: Math.round(uploadElapsedMs),
+      averageUploadMbps:
+        uploadElapsedMs > 0
+          ? Number(((file.size * 8) / (uploadElapsedMs / 1000) / 1_000_000).toFixed(2))
+          : null,
     });
 
     if (typeof onProgress === "function") onProgress(100);
-
     return {
       public_id: uploadedAsset.public_id,
       resource_type: uploadedAsset.resource_type,
     };
   }
 
+  function cancelStagedVideoUpload({ silent = false } = {}) {
+    const staged = videoPreuploadRef.current;
+    if (!staged) {
+      if (!silent) setVideoPreuploadState(createVideoPreuploadState());
+      return;
+    }
+
+    staged.cancelled = true;
+    videoPreuploadRef.current = null;
+    staged.cancelCompression?.();
+    staged.compressionWorker?.terminate();
+    staged.requests?.forEach((request) => request.abort());
+    if (staged.cleanup) {
+      void Promise.resolve(staged.cleanup()).catch(() => {});
+      staged.cleanup = null;
+    }
+
+    const publicId = staged.asset?.public_id || staged.publicId;
+    if (publicId) {
+      void api.posts
+        .discardUpload({
+          publicId,
+          resourceType: staged.asset?.resource_type || "video",
+        })
+        .catch(() => {});
+    }
+
+    if (!silent) setVideoPreuploadState(createVideoPreuploadState());
+  }
+
+  function runVideoCompressionWorker(file, targetBytes, maxOutputBytes, staged, onProgress) {
+    return new Promise((resolve, reject) => {
+      let worker;
+      try {
+        worker = new Worker(
+          new URL("../workers/adaptiveVideoCompression.worker.js", import.meta.url),
+          { type: "module" },
+        );
+      } catch (error) {
+        reject(new Error(error?.message || "Could not start video optimization."));
+        return;
+      }
+
+      let settled = false;
+      const finish = (callback, value) => {
+        if (settled) return;
+        settled = true;
+        worker.terminate();
+        if (staged.compressionWorker === worker) staged.compressionWorker = null;
+        if (staged.cancelCompression === cancelCompression) staged.cancelCompression = null;
+        callback(value);
+      };
+      const cancelCompression = () => {
+        try {
+          worker.postMessage({ type: "cancel" });
+        } catch {
+          // Termination below remains the cancellation fallback.
+        }
+        finish(reject, new Error("UPLOAD_CANCELLED"));
+      };
+
+      // Optional, UI-free A/B switch for the encoder hint:
+      //   ?spotliEncoder=prefer-hardware (force hardware preference)
+      //   ?spotliEncoder=no-preference (browser-selected default)
+      // This is only a diagnostic override; normal users see no UI change.
+      const encoderPreferenceParam = new URLSearchParams(window.location.search).get("spotliEncoder");
+      const hardwareAccelerationPreferenceOverride =
+        encoderPreferenceParam === "prefer-hardware" || encoderPreferenceParam === "no-preference"
+          ? encoderPreferenceParam
+          : null;
+
+      staged.compressionWorker = worker;
+      staged.cancelCompression = cancelCompression;
+      worker.onmessage = (event) => {
+        const message = event.data || {};
+        if (staged.cancelled || videoPreuploadRef.current !== staged) {
+          finish(reject, new Error("UPLOAD_CANCELLED"));
+          return;
+        }
+        if (message.type === "progress") {
+          onProgress?.(Math.max(0, Math.min(99, Number(message.progress) || 0)));
+          return;
+        }
+        if (message.type === "info") {
+          console.info("[Spotli upload] compression target adjusted", {
+            timestamp: new Date().toISOString(),
+            fileName: file.name,
+            ...message,
+          });
+          return;
+        }
+        if (message.type === "error") {
+          finish(reject, new Error(message.message || "Video optimization failed."));
+          return;
+        }
+        if (message.type === "complete" && message.buffer instanceof ArrayBuffer) {
+          try {
+            const optimizedFile = new File([message.buffer], message.fileName || "spotli-video-optimized.mp4", {
+              type: "video/mp4",
+              lastModified: file.lastModified,
+            });
+            console.info("[Spotli upload] compression finished", {
+              timestamp: new Date().toISOString(),
+              fileName: file.name,
+              originalSizeBytes: file.size,
+              compressedSizeBytes: optimizedFile.size,
+              savingsPercent: Number((((file.size - optimizedFile.size) / file.size) * 100).toFixed(1)),
+              compressionMs: Number(message.elapsedMs) || null,
+              metadataMs: Number(message.metadataMs) || 0,
+              frameRateProbeMs: Number(message.frameRateProbeMs) || 0,
+              encodeMs: Number(message.encodeMs) || 0,
+              encodingPasses: Number(message.encodingPasses) || 1,
+              hardwareAccelerationPreference: message.hardwareAccelerationPreference || "no-preference",
+              outputDimensions: message.width && message.height ? `${message.width}x${message.height}` : null,
+              sourceFrameRate: Number.isFinite(Number(message.sourceFrameRate)) ? Number(message.sourceFrameRate) : null,
+              outputFrameRate: Number.isFinite(Number(message.outputFrameRate)) ? Number(message.outputFrameRate) : null,
+              dimensionsReduced: message.dimensionsReduced === true,
+            });
+            finish(resolve, {
+              file: optimizedFile,
+              elapsedMs: Number(message.elapsedMs) || 0,
+              metadataMs: Number(message.metadataMs) || 0,
+              frameRateProbeMs: Number(message.frameRateProbeMs) || 0,
+              encodeMs: Number(message.encodeMs) || 0,
+              encodingPasses: Number(message.encodingPasses) || 1,
+              hardwareAccelerationPreference: message.hardwareAccelerationPreference || "no-preference",
+              targetBytes: Number(message.targetBytes) || targetBytes,
+              outputWidth: Number(message.width) || null,
+              outputHeight: Number(message.height) || null,
+              sourceFrameRate: Number(message.sourceFrameRate) || null,
+              outputFrameRate: Number(message.outputFrameRate) || null,
+              dimensionsReduced: message.dimensionsReduced === true,
+            });
+          } catch (error) {
+            finish(reject, new Error(error?.message || "Could not prepare the optimized video."));
+          }
+        }
+      };
+      worker.onerror = (event) => {
+        finish(reject, new Error(event.message || "Video optimization worker failed."));
+      };
+      try {
+        worker.postMessage({
+          type: "compress",
+          file,
+          targetBytes,
+          maxOutputBytes,
+          // Larger sources may need a proportional downscale to hit a much
+          // smaller upload target. Small clips keep their original resolution.
+          allowDownscale: file.size >= SMALL_VIDEO_COMPRESSION_THRESHOLD,
+          // For large uploads, prioritize 720p when the source is higher than
+          // 720p. This reduces encoder work on high-pixel-count videos.
+          prefer720p: file.size >= SPEED_OPTIMIZED_DOWNSCALE_THRESHOLD,
+          ...(hardwareAccelerationPreferenceOverride
+            ? { hardwareAccelerationPreference: hardwareAccelerationPreferenceOverride }
+            : {}),
+        });
+      } catch (error) {
+        finish(reject, new Error(error?.message || "Could not send the video to the optimization worker."));
+      }
+    });
+  }
+
+  async function prepareVideoForUpload(file, staged) {
+    const mustCompress =
+      file.size >= VIDEO_COMPRESSION_THRESHOLD || file.size > MAX_VIDEO_SIZE;
+    const uploadSafetyMargin = Math.min(5 * 1024 * 1024, Math.floor(MAX_VIDEO_SIZE * 0.05));
+    const maxOutputBytes = Math.max(1, MAX_VIDEO_SIZE - uploadSafetyMargin);
+
+    if (!mustCompress) {
+      staged.uploadFile = file;
+      staged.encodingMs = 0;
+      staged.compressionResult = {
+        file,
+        compressed: false,
+        reason: "Video below the compression threshold: uploading directly to Cloudinary.",
+        originalSize: file.size,
+        compressedSize: file.size,
+        savingsPercent: 0,
+      };
+      setVideoPreuploadState(createVideoPreuploadState({
+        status: "uploading",
+        progress: 0,
+        compressionProgress: 100,
+        originalSize: file.size,
+        uploadSize: file.size,
+        encodingMs: 0,
+        compressed: false,
+        savingsPercent: 0,
+        reason: staged.compressionResult.reason,
+      }));
+      return staged.compressionResult;
+    }
+
+    // Aim for a substantially smaller upload on slow connections. Files below
+    // 15 MiB target 55% of their source size; larger files target 40%, capped at
+    // 20 MiB for large files. Files at/above 50 MiB prefer 720p to reduce the
+    // pixel count; the worker avoids unnecessary repeat encoding when the first result is safe.
+    const targetRatio = file.size < SMALL_VIDEO_COMPRESSION_THRESHOLD
+      ? SMALL_VIDEO_TARGET_RATIO
+      : STANDARD_VIDEO_TARGET_RATIO;
+    const targetBytes = Math.max(
+      1,
+      Math.min(
+        Math.floor(file.size * targetRatio),
+        VIDEO_COMPRESSION_TARGET_MAX,
+        maxOutputBytes,
+      ),
+    );
+    const compressionStartedAt = performance.now();
+    console.info("[Spotli upload] compression started", {
+      timestamp: new Date().toISOString(),
+      fileName: file.name,
+      originalSizeBytes: file.size,
+      targetSizeBytes: targetBytes,
+      targetSizeMiB: Number((targetBytes / (1024 * 1024)).toFixed(1)),
+      targetRatio,
+      targetSizeCapMiB: Number((VIDEO_COMPRESSION_TARGET_MAX / (1024 * 1024)).toFixed(1)),
+      speedProfile: file.size >= SPEED_OPTIMIZED_DOWNSCALE_THRESHOLD ? "prefer-720p" : "preserve-source-when-practical",
+      maxOutputBytes,
+    });
+    staged.status = "compressing";
+    staged.compressionProgress = 0;
+    setVideoPreuploadState(createVideoPreuploadState({
+      status: "compressing",
+      progress: 0,
+      compressionProgress: 0,
+      originalSize: file.size,
+      uploadSize: file.size,
+      encodingMs: 0,
+      compressed: false,
+      reason: "Optimizing this video before upload to reduce mobile data transfer.",
+    }));
+    if (isPublishingRef.current) {
+      setNotice("Optimizing video for faster upload… 0%");
+    }
+
+    try {
+      const result = await runVideoCompressionWorker(
+        file,
+        targetBytes,
+        maxOutputBytes,
+        staged,
+        (progress) => {
+          staged.compressionProgress = progress;
+          setVideoPreuploadState(createVideoPreuploadState({
+            status: "compressing",
+            progress: 0,
+            compressionProgress: progress,
+            originalSize: file.size,
+            uploadSize: file.size,
+            encodingMs: Math.round(performance.now() - compressionStartedAt),
+            compressed: false,
+            reason: "Optimizing this video before upload to reduce mobile data transfer.",
+          }));
+          if (isPublishingRef.current) {
+            setNotice(`Optimizing video for faster upload… ${progress}%`);
+          }
+        },
+      );
+      if (staged.cancelled || videoPreuploadRef.current !== staged) {
+        throw new Error("UPLOAD_CANCELLED");
+      }
+
+      const optimizedFile = result.file;
+      const savingsPercent = Number((((file.size - optimizedFile.size) / file.size) * 100).toFixed(1));
+      if (optimizedFile.size >= file.size * 0.90) {
+        throw new Error("Optimization did not reduce this file enough to justify the extra processing time.");
+      }
+      if (optimizedFile.size > maxOutputBytes) {
+        throw new Error("The optimized video still exceeds the configured Cloudinary upload limit.");
+      }
+
+      staged.uploadFile = optimizedFile;
+      staged.encodingMs = result.elapsedMs || Math.round(performance.now() - compressionStartedAt);
+      staged.compressionResult = {
+        file: optimizedFile,
+        compressed: true,
+        reason: `Optimized before upload: ${formatFileSize(file.size)} → ${formatFileSize(optimizedFile.size)} (${savingsPercent}% smaller)${result.dimensionsReduced ? `; resolution adjusted to ${result.outputWidth}×${result.outputHeight} to fit the upload limit` : "; source resolution preserved"}.`,
+        originalSize: file.size,
+        compressedSize: optimizedFile.size,
+        savingsPercent,
+        outputWidth: result.outputWidth,
+        outputHeight: result.outputHeight,
+        dimensionsReduced: result.dimensionsReduced,
+      };
+      console.info("Spotli adaptive video preparation complete", {
+        originalSizeBytes: file.size,
+        uploadSizeBytes: optimizedFile.size,
+        compressionMs: staged.encodingMs,
+        metadataMs: result.metadataMs,
+        frameRateProbeMs: result.frameRateProbeMs,
+        encodeMs: result.encodeMs,
+        encodingPasses: result.encodingPasses,
+        hardwareAccelerationPreference: result.hardwareAccelerationPreference,
+        savingsPercent,
+        outputDimensions: result.outputWidth && result.outputHeight
+          ? `${result.outputWidth}x${result.outputHeight}`
+          : "source dimensions retained by encoder",
+        sourceFrameRate: result.sourceFrameRate,
+        outputFrameRate: result.outputFrameRate,
+        dimensionsReduced: result.dimensionsReduced,
+      });
+      setVideoPreuploadState(createVideoPreuploadState({
+        status: "uploading",
+        progress: 0,
+        compressionProgress: 100,
+        originalSize: file.size,
+        uploadSize: optimizedFile.size,
+        encodingMs: staged.encodingMs,
+        compressed: true,
+        savingsPercent,
+        reason: staged.compressionResult.reason,
+      }));
+      return staged.compressionResult;
+    } catch (error) {
+      if (staged.cancelled || error?.message === "UPLOAD_CANCELLED") {
+        throw new Error("UPLOAD_CANCELLED");
+      }
+
+      // Keep publishing reliable when the original is within the configured
+      // upload limit INCLUDING the safety margin. Do not retry the original at
+      // the exact limit after compression fails, because provider-side size
+      // accounting can differ and the upload may be rejected.
+      if (file.size <= maxOutputBytes) {
+        console.warn("Spotli adaptive compression skipped; uploading original instead", {
+          fileName: file.name,
+          originalSizeBytes: file.size,
+          reason: error?.message || String(error),
+        });
+        staged.uploadFile = file;
+        staged.encodingMs = Math.round(performance.now() - compressionStartedAt);
+        staged.compressionResult = {
+          file,
+          compressed: false,
+          reason: `Compression was not worthwhile or unavailable; uploading the original ${formatFileSize(file.size)} video.`,
+          originalSize: file.size,
+          compressedSize: file.size,
+          savingsPercent: 0,
+        };
+        setVideoPreuploadState(createVideoPreuploadState({
+          status: "uploading",
+          progress: 0,
+          compressionProgress: 100,
+          originalSize: file.size,
+          uploadSize: file.size,
+          encodingMs: staged.encodingMs,
+          compressed: false,
+          savingsPercent: 0,
+          reason: staged.compressionResult.reason,
+        }));
+        return staged.compressionResult;
+      }
+
+      throw new Error(
+        `${error?.message || "Video optimization failed."} This original exceeds Spotli's safe upload-size limit, so Spotli cannot upload it unchanged. Try MP4 or a shorter clip.`,
+      );
+    }
+  }
+
+  function startVideoPreupload(file) {
+    if (
+      !file ||
+      !(file.type.startsWith("video/") || /\.(mp4|mov|webm)$/i.test(file.name))
+    ) {
+      return Promise.reject(new Error("Choose a valid video file."));
+    }
+
+    const existing = videoPreuploadRef.current;
+    if (existing && existing.file === file && !existing.cancelled) {
+      if (existing.status === "ready" && existing.asset) {
+        return Promise.resolve(existing.asset);
+      }
+      if (["compressing", "uploading", "confirming"].includes(existing.status) && existing.promise) return existing.promise;
+    }
+
+    if (existing) cancelStagedVideoUpload({ silent: true });
+
+    const shouldCompress =
+      file.size >= VIDEO_COMPRESSION_THRESHOLD || file.size > MAX_VIDEO_SIZE;
+    const staged = {
+      file,
+      uploadFile: file,
+      asset: null,
+      publicId: "",
+      promise: null,
+      progress: 0,
+      compressionProgress: shouldCompress ? 0 : 100,
+      status: shouldCompress ? "compressing" : "uploading",
+      cancelled: false,
+      committed: false,
+      requiresCompression: shouldCompress,
+      compressionReady: !shouldCompress,
+      requests: new Set(),
+      compressionWorker: null,
+      cancelCompression: null,
+      lastSampleAt: performance.now(),
+      lastSampleBytes: 0,
+      speedBytesPerSecond: 0,
+      encodingMs: 0,
+      uploadMs: Number.NaN,
+      compressionResult: {
+        file,
+        compressed: false,
+        reason: shouldCompress
+          ? "Optimizing this video before upload to reduce mobile data transfer."
+          : "Video below the compression threshold: uploading directly to Cloudinary.",
+        originalSize: file.size,
+        compressedSize: file.size,
+        savingsPercent: 0,
+      },
+      cleanup: null,
+      optimizationQueued: false,
+      eagerHlsRequested: false,
+    };
+    videoPreuploadRef.current = staged;
+    setVideoPreuploadState(
+      createVideoPreuploadState({
+        status: staged.status,
+        progress: 0,
+        compressionProgress: staged.compressionProgress,
+        originalSize: file.size,
+        uploadSize: file.size,
+        encodingMs: 0,
+        compressed: false,
+        reason: staged.compressionResult.reason,
+      }),
+    );
+
+    const reportProgress = (progress) => {
+      if (staged.cancelled || videoPreuploadRef.current !== staged) return;
+      staged.progress = Math.max(0, Math.min(100, Number(progress) || 0));
+      const now = performance.now();
+      const uploadFile = staged.uploadFile || file;
+      const loadedBytes = uploadFile.size * Math.min(1, staged.progress / 100);
+      const elapsedSeconds = (now - staged.lastSampleAt) / 1000;
+      if (elapsedSeconds >= 0.6) {
+        const sampleSpeed = Math.max(0, loadedBytes - staged.lastSampleBytes) / elapsedSeconds;
+        if (sampleSpeed > 0) {
+          staged.speedBytesPerSecond = staged.speedBytesPerSecond
+            ? staged.speedBytesPerSecond * 0.7 + sampleSpeed * 0.3
+            : sampleSpeed;
+        }
+        staged.lastSampleAt = now;
+        staged.lastSampleBytes = loadedBytes;
+      }
+
+      setVideoPreuploadState(
+        createVideoPreuploadState({
+          status: staged.progress >= 99.9 ? "confirming" : "uploading",
+          progress: Math.min(99, staged.progress),
+          compressionProgress: 100,
+          error: "",
+          reason: staged.compressionResult.reason,
+          speedBytesPerSecond: staged.speedBytesPerSecond,
+          secondsRemaining:
+            staged.speedBytesPerSecond > 0
+              ? Math.max(0, uploadFile.size - loadedBytes) / staged.speedBytesPerSecond
+              : Number.NaN,
+          encodingMs: staged.encodingMs,
+          uploadMs: staged.uploadMs,
+          originalSize: file.size,
+          uploadSize: uploadFile.size,
+          compressed: staged.compressionResult.compressed,
+          savingsPercent: staged.compressionResult.savingsPercent,
+          optimizationQueued: staged.optimizationQueued,
+        }),
+      );
+
+      if (isPublishingRef.current) {
+        setUploadProgress(Math.round(staged.progress));
+        setNotice(
+          staged.progress >= 99.9
+            ? "Cloudinary received the video; confirming upload…"
+            : `Uploading video directly to Cloudinary… ${Math.round(staged.progress)}%`,
+        );
+      }
+    };
+    staged.reportProgress = reportProgress;
+
+    staged.promise = (async () => {
+      const startedAt = performance.now();
+      try {
+        const preparation = await prepareVideoForUpload(file, staged);
+        if (staged.cancelled || videoPreuploadRef.current !== staged) {
+          throw new Error("UPLOAD_CANCELLED");
+        }
+        staged.status = "uploading";
+        const uploadFile = staged.uploadFile || file;
+        // uploadToCloudinary starts transfer timing after the signing request
+        // returns, so signature latency is not counted as Cloudinary transfer.
+        const asset = await uploadToCloudinary(uploadFile, "video", reportProgress, staged);
+        staged.uploadMs = performance.now() - (staged.transferStartedAt || startedAt);
+        staged.transferStartedAt = null;
+
+        if (staged.cancelled || videoPreuploadRef.current !== staged) {
+          if (asset?.public_id) {
+            void api.posts
+              .discardUpload({ publicId: asset.public_id, resourceType: "video" })
+              .catch(() => {});
+          }
+          throw new Error("UPLOAD_CANCELLED");
+        }
+
+        staged.asset = asset;
+        staged.status = "ready";
+        staged.progress = 100;
+        setVideoPreuploadState(
+          createVideoPreuploadState({
+            status: "ready",
+            progress: 100,
+            compressionProgress: 100,
+            reason: `${staged.compressionResult.reason} Cloudinary playback optimization will run in the background after publishing.`,
+            speedBytesPerSecond: staged.speedBytesPerSecond,
+            secondsRemaining: 0,
+            encodingMs: staged.encodingMs,
+            uploadMs: staged.uploadMs,
+            originalSize: file.size,
+            uploadSize: (staged.uploadFile || file).size,
+            compressed: staged.compressionResult.compressed,
+            savingsPercent: staged.compressionResult.savingsPercent,
+            outputWidth: staged.compressionResult.outputWidth || null,
+            outputHeight: staged.compressionResult.outputHeight || null,
+            dimensionsReduced: staged.compressionResult.dimensionsReduced || false,
+            optimizationQueued: false,
+          }),
+        );
+        return asset;
+      } catch (error) {
+        if (staged.transferStartedAt) {
+          staged.uploadMs = performance.now() - staged.transferStartedAt;
+          staged.transferStartedAt = null;
+        }
+        if (staged.cancelled || error?.message === "UPLOAD_CANCELLED") {
+          throw new Error("UPLOAD_CANCELLED");
+        }
+
+        staged.status = "error";
+        if (staged.publicId) {
+          void api.posts
+            .discardUpload({ publicId: staged.publicId, resourceType: "video" })
+            .catch(() => {});
+        }
+        setVideoPreuploadState(
+          createVideoPreuploadState({
+            status: "error",
+            progress: 0,
+            compressionProgress: 100,
+            error: error?.message || error?.error?.message || "Cloudinary upload failed.",
+            reason: "The direct Cloudinary upload did not finish. Your video was not published; retry after checking the error.",
+            speedBytesPerSecond: staged.speedBytesPerSecond,
+            secondsRemaining: Number.NaN,
+            encodingMs: staged.encodingMs,
+            uploadMs: staged.uploadMs,
+            originalSize: file.size,
+            uploadSize: (staged.uploadFile || file).size,
+            compressed: staged.compressionResult.compressed,
+            savingsPercent: staged.compressionResult.savingsPercent,
+            optimizationQueued: false,
+          }),
+        );
+        throw error;
+      }
+    })();
+
+    staged.promise.catch(() => {});
+    return staged.promise;
+  }
+
   async function publishPost() {
-    if (isPublishing) return;
+    if (isPublishingRef.current || isPublishing) {
+      console.warn("[Spotli publish] duplicate Publish click ignored", {
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    const publishStartedAt = performance.now();
+    const publishStartedTimestamp = new Date().toISOString();
+    console.info("[Spotli publish] Publish clicked", {
+      timestamp: publishStartedTimestamp,
+      postType,
+      mediaCount: media.length,
+      originalVideoSizeBytes:
+        postType === "video" ? media[0]?.file?.size ?? null : null,
+    });
 
     if (postType === "text" && !caption.trim()) {
       setNotice("Write something before publishing your text post.");
@@ -629,8 +1469,18 @@ function Create() {
       return;
     }
 
-    if (media.some((item) => item.file.size > MAX_FILE_SIZE)) {
-      setNotice("Each media file must be 500 MB or smaller.");
+    if (
+      postType === "video" &&
+      media.some((item) => item.file.size > MAX_RAW_VIDEO_SIZE)
+    ) {
+      setNotice(`Source videos must be ${formatFileSize(MAX_RAW_VIDEO_SIZE)} or smaller. Try a shorter clip.`);
+      return;
+    }
+    if (
+      postType === "photo" &&
+      media.some((item) => item.file.size > MAX_IMAGE_SIZE)
+    ) {
+      setNotice(`Images must be ${formatFileSize(MAX_IMAGE_SIZE)} or smaller in this configuration.`);
       return;
     }
 
@@ -645,80 +1495,17 @@ function Create() {
     }
 
     setIsPublishing(true);
+    isPublishingRef.current = true;
     cancelUploadRequestedRef.current = false;
     setUploadProgress(0);
     setNotice("");
 
-    let cleanupCompressedVideo = null;
-
     try {
       const resourceType = postType === "photo" ? "image" : "video";
       let mediaAssets = [];
-      let videoFileToUpload = null;
-
-      if (postType === "video") {
-        const originalVideoFile = media[0].file;
-        videoFileToUpload = originalVideoFile;
-
-        // Compress larger videos before sending them to Cloudinary. The helper
-        // falls back to the original when this browser cannot safely transcode.
-        if (originalVideoFile.size >= 12 * 1024 * 1024) {
-          setUploadProgress(0);
-          setNotice("Optimizing video… 0%");
-
-          try {
-            const { compressVideoForUpload } =
-              await import("../utils/videoCompression.js");
-            const compressionResult = await compressVideoForUpload(
-              originalVideoFile,
-              {
-                shouldCancel: () => cancelUploadRequestedRef.current,
-                onProgress: (progress) => {
-                  if (cancelUploadRequestedRef.current) return;
-                  setUploadProgress(progress);
-                  setNotice(`Optimizing video… ${progress}%`);
-                },
-              },
-            );
-
-            if (cancelUploadRequestedRef.current) {
-              await compressionResult.cleanup?.();
-              throw new Error("UPLOAD_CANCELLED");
-            }
-
-            videoFileToUpload = compressionResult.file;
-            cleanupCompressedVideo = compressionResult.cleanup || null;
-
-            if (compressionResult.compressed) {
-              setUploadProgress(0);
-              setNotice(
-                `Video reduced from ${formatFileSize(originalVideoFile.size)} to ${formatFileSize(videoFileToUpload.size)}. Uploading video… 0%`,
-              );
-            } else {
-              setUploadProgress(0);
-              setNotice(
-                `${compressionResult.reason || "Video kept in its original format."} Uploading video… 0%`,
-              );
-            }
-          } catch (compressionError) {
-            if (
-              cancelUploadRequestedRef.current ||
-              compressionError?.message === "UPLOAD_CANCELLED"
-            ) {
-              throw new Error("UPLOAD_CANCELLED");
-            }
-            console.warn(
-              "Spotli video optimization failed; uploading the original video.",
-              compressionError,
-            );
-            videoFileToUpload = originalVideoFile;
-            setUploadProgress(0);
-            setNotice(
-              "Video optimization failed. Uploading the original video… 0%",
-            );
-          }
-        }
-      }
+      // Upload media bytes directly from the browser to Cloudinary. The backend
+      // only signs the upload and verifies the Cloudinary asset before publishing.
+      const videoFileToUpload = postType === "video" ? media[0].file : null;
 
       if (postType === "photo" && media.length > 1) {
         // Upload up to three photos at once to reduce total waiting time
@@ -768,20 +1555,45 @@ function Create() {
           Array.from({ length: Math.min(3, media.length) }, () => worker()),
         );
         mediaAssets = assetsByIndex;
+      } else if (postType === "video" && videoFileToUpload) {
+        setUploadProgress(0);
+        setNotice("Preparing direct Cloudinary upload…");
+        let staged =
+          videoPreuploadRef.current?.file === videoFileToUpload &&
+          videoPreuploadRef.current.status !== "error" &&
+          !videoPreuploadRef.current.cancelled
+            ? videoPreuploadRef.current
+            : null;
+
+        if (!staged) {
+          void startVideoPreupload(videoFileToUpload);
+          staged = videoPreuploadRef.current;
+        }
+        if (!staged?.promise) {
+          throw new Error("Unable to start the direct Cloudinary upload. Please try again.");
+        }
+
+        setNotice(`Uploading video directly to Cloudinary… ${Math.round(staged.progress || 0)}%`);
+        mediaAssets.push(
+          staged.status === "ready" && staged.asset
+            ? staged.asset
+            : await staged.promise,
+        );
       } else {
         for (let index = 0; index < media.length; index += 1) {
           setUploadProgress(0);
-          const uploadLabel =
-            postType === "photo" ? "Uploading photo" : "Uploading video";
-          setNotice(`${uploadLabel}… 0%`);
+          const uploadLabel = "Uploading photo";
+          const fileToUpload = media[index].file;
+          setNotice(`${uploadLabel}… 0% · measuring speed`);
+          const reportUploadProgress = createUploadProgressReporter(
+            uploadLabel,
+            fileToUpload,
+          );
           mediaAssets.push(
             await uploadToCloudinary(
-              postType === "video" ? videoFileToUpload : media[index].file,
+              fileToUpload,
               resourceType,
-              (progress) => {
-                setUploadProgress(progress);
-                setNotice(`${uploadLabel}… ${progress}%`);
-              },
+              reportUploadProgress,
             ),
           );
         }
@@ -790,14 +1602,14 @@ function Create() {
       let thumbnailAsset;
       if (postType === "video" && customThumbnail) {
         setUploadProgress(0);
-        setNotice("Uploading thumbnail… 0%");
+        setNotice("Uploading thumbnail… 0% · measuring speed");
         thumbnailAsset = await uploadToCloudinary(
           customThumbnail.file,
           "image",
-          (progress) => {
-            setUploadProgress(progress);
-            setNotice(`Uploading thumbnail… ${progress}%`);
-          },
+          createUploadProgressReporter(
+            "Uploading thumbnail",
+            customThumbnail.file,
+          ),
         );
       }
 
@@ -805,12 +1617,84 @@ function Create() {
 
       setUploadProgress(0);
       setNotice("Publishing your post…");
-      const result = await api.posts.createWithAssets({
-        type: postType,
-        caption,
-        mediaAssets,
-        ...(thumbnailAsset ? { thumbnailAsset } : {}),
+      const postCreationStartedAt = performance.now();
+      console.info("[Spotli publish] post creation started", {
+        timestamp: new Date().toISOString(),
+        elapsedSincePublishClickMs: Math.round(
+          postCreationStartedAt - publishStartedAt,
+        ),
+        mediaAssetCount: mediaAssets.length,
+        hasCustomThumbnail: Boolean(thumbnailAsset),
       });
+
+      let result;
+      try {
+        result = await api.posts.createWithAssets({
+          type: postType,
+          caption,
+          topics: selectedTopics,
+          mediaAssets,
+          ...(thumbnailAsset ? { thumbnailAsset } : {}),
+        });
+      } catch (error) {
+        console.error("[Spotli publish] post creation failed", {
+          timestamp: new Date().toISOString(),
+          postCreationMs: Math.round(performance.now() - postCreationStartedAt),
+          totalElapsedMs: Math.round(performance.now() - publishStartedAt),
+          error: error?.message || "Post creation request failed.",
+        });
+        throw error;
+      }
+
+      const stagedVideo = videoPreuploadRef.current;
+      const measuredVideoStage =
+        videoFileToUpload && stagedVideo?.file === videoFileToUpload
+          ? stagedVideo
+          : null;
+      console.info("[Spotli publish] post creation completed", {
+        timestamp: new Date().toISOString(),
+        postCreationMs: Math.round(performance.now() - postCreationStartedAt),
+        totalElapsedMs: Math.round(performance.now() - publishStartedAt),
+        compressionMs: measuredVideoStage?.encodingMs ?? null,
+        cloudinaryTransferMs: Number.isFinite(measuredVideoStage?.uploadMs)
+          ? Math.round(measuredVideoStage.uploadMs)
+          : null,
+        originalSizeBytes: measuredVideoStage?.file?.size ?? null,
+        preparedSizeBytes: measuredVideoStage?.uploadFile?.size ?? null,
+        outputDimensions:
+          measuredVideoStage?.compressionResult?.outputWidth &&
+          measuredVideoStage?.compressionResult?.outputHeight
+            ? `${measuredVideoStage.compressionResult.outputWidth}x${measuredVideoStage.compressionResult.outputHeight}`
+            : null,
+      });
+      // Preserve the exact file we just uploaded in memory for the immediate
+      // post-publish playback in Home. This avoids waiting for Cloudinary's
+      // first media request; the server URL remains the fallback after reload.
+      if (
+        postType === "video" &&
+        mediaAssets[0]?.public_id &&
+        measuredVideoStage?.uploadFile
+      ) {
+        rememberRecentVideoPlayback(
+          mediaAssets[0].public_id,
+          measuredVideoStage.uploadFile,
+        );
+      }
+
+      if (stagedVideo && stagedVideo.file === videoFileToUpload) {
+        stagedVideo.committed = true;
+        if (stagedVideo.cleanup) {
+          void Promise.resolve(stagedVideo.cleanup()).catch((cleanupError) => {
+            console.warn(
+              "Unable to clean temporary optimized video:",
+              cleanupError,
+            );
+          });
+          stagedVideo.cleanup = null;
+        }
+        videoPreuploadRef.current = null;
+        setVideoPreuploadState(createVideoPreuploadState());
+      }
 
       setIsDraftSaved(false);
       clearMedia();
@@ -838,31 +1722,23 @@ function Create() {
         setNotice(error.message || "Unable to publish your post.");
       }
     } finally {
-      if (typeof cleanupCompressedVideo === "function") {
-        try {
-          await cleanupCompressedVideo();
-        } catch (cleanupError) {
-          console.warn("Temporary video cleanup failed:", cleanupError);
-        }
-      }
       activeUploadRequestsRef.current.clear();
       cancelUploadRequestedRef.current = false;
+      isPublishingRef.current = false;
       setIsPublishing(false);
     }
   }
 
   function cancelUpload() {
-    if (
-      !isPublishing ||
-      !(
-        /Uploading (video|photo|photos|media|thumbnail)/i.test(notice) ||
-        /Optimizing video/i.test(notice)
-      )
-    ) {
+    if (!isPublishing || !ACTIVE_UPLOAD_NOTICE_PATTERN.test(notice)) {
       return;
     }
 
     cancelUploadRequestedRef.current = true;
+    // Also detach the staged video so a cancelled promise cannot be reused by
+    // a later Publish attempt. The scoped cancellation aborts its own requests
+    // and discards its completed asset if one already exists.
+    cancelStagedVideoUpload();
     activeUploadRequestsRef.current.forEach((request) => request.abort());
     setNotice("Cancelling upload…");
   }
@@ -1120,30 +1996,9 @@ function Create() {
 
                 <p className="mt-3 text-xs text-gray-600">
                   {postType === "video"
-                    ? "MP4, MOV, WebM · Up to 10 minutes · Max 500 MB"
-                    : "JPG, PNG, WebP · Up to 10 images · Max 500 MB per file"}
+                    ? `MP4, MOV, WebM · Up to 10 minutes · Source up to ${formatFileSize(MAX_RAW_VIDEO_SIZE)} · Large videos optimized before upload`
+                    : `JPG, PNG, WebP · Up to 10 images · Max ${formatFileSize(MAX_IMAGE_SIZE)} per file`}
                 </p>
-              </div>
-            )}
-
-            {isProcessingFiles && (
-              <div
-                className="mt-3 rounded-xl border border-gray-200 p-3"
-                role="status"
-                aria-live="polite"
-              >
-                <div className="mb-2 flex items-center justify-between text-xs font-medium text-gray-700">
-                  <span>Preparing file…</span>
-
-                  <span>{processingProgress}%</span>
-                </div>
-
-                <div className="h-1.5 overflow-hidden rounded-full bg-gray-200">
-                  <div
-                    className="h-full rounded-full bg-red-500 transition-all duration-200"
-                    style={{ width: `${processingProgress}%` }}
-                  />
-                </div>
               </div>
             )}
 
@@ -1187,6 +2042,55 @@ function Create() {
                       <p className="mt-0.5 text-xs text-gray-600">
                         {formatFileSize(item.file.size)}
                       </p>
+                      {item.type === "video" &&
+                        videoPreuploadRef.current?.file === item.file &&
+                        videoPreuploadState.status !== "idle" && (
+                          <div className="mt-2 max-w-sm">
+                            <p className="text-xs font-medium text-gray-700">
+                              {videoPreuploadState.status === "ready"
+                                ? `${videoPreuploadState.compressed ? `Optimized ${formatFileSize(videoPreuploadState.originalSize)} → ${formatFileSize(videoPreuploadState.uploadSize)}` : `Uploaded ${formatFileSize(videoPreuploadState.uploadSize)} directly`}${videoPreuploadState.dimensionsReduced && videoPreuploadState.outputWidth && videoPreuploadState.outputHeight ? ` · resolution ${videoPreuploadState.outputWidth}×${videoPreuploadState.outputHeight}` : ""} · encode ${formatElapsedMilliseconds(videoPreuploadState.encodingMs)} · upload ${formatElapsedMilliseconds(videoPreuploadState.uploadMs)} · ready to publish`
+                                : videoPreuploadState.status === "error"
+                                  ? `Cloudinary upload failed: ${videoPreuploadState.error || "Try again"}. Your post has not been published.`
+                                  : videoPreuploadState.status === "compressing"
+                                    ? `Optimizing video for faster upload… ${Math.round(videoPreuploadState.compressionProgress)}%`
+                                    : videoPreuploadState.status === "cloudinary"
+                                      ? `Uploading directly to Cloudinary… ${Math.round(videoPreuploadState.progress)}%${videoPreuploadState.speedBytesPerSecond > 0 ? ` · ${formatFileSize(videoPreuploadState.speedBytesPerSecond)}/s` : ""}`
+                                      : videoPreuploadState.status === "confirming"
+                                        ? "Waiting for Cloudinary upload confirmation…"
+                                        : `Uploading ${videoPreuploadState.compressed ? "optimized" : "original"} video directly to Cloudinary… ${Math.round(videoPreuploadState.progress)}%${videoPreuploadState.speedBytesPerSecond > 0 ? ` · ${formatFileSize(videoPreuploadState.speedBytesPerSecond)}/s` : ""}${Number.isFinite(videoPreuploadState.secondsRemaining) ? ` · ${formatTimeRemaining(videoPreuploadState.secondsRemaining)}` : ""}`}
+                            </p>
+                            {[
+                              "compressing",
+                              "uploading",
+                              "cloudinary",
+                              "confirming",
+                            ].includes(videoPreuploadState.status) && (
+                              <div
+                                className="mt-1.5 h-1.5 w-full overflow-hidden rounded-full bg-gray-200"
+                                role="progressbar"
+                                aria-label={
+                                  videoPreuploadState.status === "compressing"
+                                    ? "Video optimization"
+                                    : "Video upload directly to Cloudinary"
+                                }
+                                aria-valuemin={0}
+                                aria-valuemax={100}
+                                aria-valuenow={Math.round(
+                                  videoPreuploadState.status === "compressing"
+                                    ? videoPreuploadState.compressionProgress
+                                    : videoPreuploadState.progress,
+                                )}
+                              >
+                                <div
+                                  className="h-full rounded-full bg-[#FF2D4A] transition-[width] duration-150"
+                                  style={{
+                                    width: `${videoPreuploadState.status === "compressing" ? videoPreuploadState.compressionProgress : videoPreuploadState.progress}%`,
+                                  }}
+                                />
+                              </div>
+                            )}
+                          </div>
+                        )}
                     </div>
 
                     <button
@@ -1531,25 +2435,21 @@ function Create() {
                 className="mt-5 rounded-xl border border-gray-200 bg-gray-50 p-3 text-sm text-gray-700"
               >
                 {notice}
-                {isPublishing &&
-                  (/Uploading (video|photo|photos|media|thumbnail)/i.test(
-                    notice,
-                  ) ||
-                    /Optimizing video/i.test(notice)) && (
+                {isPublishing && ACTIVE_UPLOAD_NOTICE_PATTERN.test(notice) && (
+                  <div
+                    className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-gray-200"
+                    role="progressbar"
+                    aria-label="Media upload progress"
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                    aria-valuenow={uploadProgress}
+                  >
                     <div
-                      className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-gray-200"
-                      role="progressbar"
-                      aria-label="Media upload progress"
-                      aria-valuemin={0}
-                      aria-valuemax={100}
-                      aria-valuenow={uploadProgress}
-                    >
-                      <div
-                        className="h-full rounded-full bg-[#FF2D4A] transition-[width] duration-150"
-                        style={{ width: `${uploadProgress}%` }}
-                      />
-                    </div>
-                  )}
+                      className="h-full rounded-full bg-[#FF2D4A] transition-[width] duration-150"
+                      style={{ width: `${uploadProgress}%` }}
+                    />
+                  </div>
+                )}
               </div>
             )}
 
@@ -1590,30 +2490,23 @@ function Create() {
                   )}
 
                   {isPublishing
-                    ? /Optimizing video/i.test(notice)
-                      ? "Optimizing video…"
-                      : /Uploading (video|photo|photos|media|thumbnail)/i.test(
-                            notice,
-                          )
-                        ? `Uploading… ${uploadProgress}%`
-                        : notice === "Cancelling upload…"
-                          ? "Cancelling…"
-                          : "Publishing…"
+                    ? ACTIVE_UPLOAD_NOTICE_PATTERN.test(notice)
+                      ? `Uploading… ${uploadProgress}%`
+                      : notice === "Cancelling upload…"
+                        ? "Cancelling…"
+                        : "Publishing…"
                     : "Publish post"}
                 </button>
 
-                {isPublishing &&
-                  /Uploading (video|photo|photos|media|thumbnail)/i.test(
-                    notice,
-                  ) && (
-                    <button
-                      type="button"
-                      onClick={cancelUpload}
-                      className="flex min-h-12 items-center justify-center gap-2 rounded-full border border-red-200 bg-white px-5 py-3 text-sm font-semibold text-red-600 transition hover:bg-red-50"
-                    >
-                      <X size={17} /> Cancel upload
-                    </button>
-                  )}
+                {isPublishing && ACTIVE_UPLOAD_NOTICE_PATTERN.test(notice) && (
+                  <button
+                    type="button"
+                    onClick={cancelUpload}
+                    className="flex min-h-12 items-center justify-center gap-2 rounded-full border border-red-200 bg-white px-5 py-3 text-sm font-semibold text-red-600 transition hover:bg-red-50"
+                  >
+                    <X size={17} /> Cancel upload
+                  </button>
+                )}
 
                 <button
                   type="button"

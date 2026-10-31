@@ -19,6 +19,8 @@ import {
   MapPin,
   Link as LinkIcon,
   Settings,
+  MoreVertical,
+  Trash2,
 } from "lucide-react";
 
 import api from "../services/api";
@@ -259,7 +261,13 @@ function getInitials(name) {
   );
 }
 
-function ProfilePostCard({ post, onOpenPost, onRemoveBookmark, index = 99 }) {
+function ProfilePostCard({
+  post,
+  onOpenPost,
+  onRemoveBookmark,
+  onRequestDelete,
+  index = 99,
+}) {
   const media = getPostMedia(post);
 
   const isPhoto = isPhotoPost(post);
@@ -271,9 +279,10 @@ function ProfilePostCard({ post, onOpenPost, onRemoveBookmark, index = 99 }) {
   const comments = post.commentsCount ?? post.comments ?? 0;
 
   const [thumbnailFailed, setThumbnailFailed] = useState(false);
+  const [postMenuOpen, setPostMenuOpen] = useState(false);
 
   return (
-    <article className="min-w-0">
+    <article className="relative min-w-0">
       <button
         type="button"
         onClick={() => onOpenPost?.(post)}
@@ -324,6 +333,44 @@ function ProfilePostCard({ post, onOpenPost, onRemoveBookmark, index = 99 }) {
           <MessageCircle size={13} /> {formatCount(comments)}
         </span>
       </button>
+
+      {onRequestDelete && (
+        <div className="absolute right-2 top-2 z-20">
+          <button
+            type="button"
+            aria-label="Post options"
+            aria-haspopup="menu"
+            aria-expanded={postMenuOpen}
+            title="Post options"
+            onClick={(event) => {
+              event.stopPropagation();
+              setPostMenuOpen((open) => !open);
+            }}
+            className="grid h-8 w-8 place-items-center rounded-full border border-white/20 bg-black/70 text-white shadow-md backdrop-blur-sm transition hover:bg-black"
+          >
+            <MoreVertical size={17} />
+          </button>
+          {postMenuOpen && (
+            <div
+              role="menu"
+              className="absolute right-0 top-9 min-w-36 overflow-hidden rounded-xl border border-neutral-200 bg-white p-1.5 text-neutral-900 shadow-xl"
+            >
+              <button
+                type="button"
+                role="menuitem"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  setPostMenuOpen(false);
+                  onRequestDelete(post);
+                }}
+                className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm font-semibold text-red-600 transition hover:bg-red-50"
+              >
+                <Trash2 size={15} /> Delete post
+              </button>
+            </div>
+          )}
+        </div>
+      )}
 
       {caption.trim() && (
         <p className="mt-1.5 line-clamp-2 text-sm leading-5 text-neutral-800">
@@ -462,6 +509,12 @@ async function uploadAvatarToCloudinary(file) {
   uploadData.append("signature", signatureData.signature);
   uploadData.append("folder", signatureData.folder);
   uploadData.append("public_id", signatureData.publicId);
+  uploadData.append("overwrite", String(signatureData.overwrite ?? false));
+  if (signatureData.context) uploadData.append("context", signatureData.context);
+  if (signatureData.transformation) {
+    uploadData.append("transformation", signatureData.transformation);
+  }
+  if (signatureData.format) uploadData.append("format", signatureData.format);
 
   const response = await fetch(
     `https://api.cloudinary.com/v1_1/${signatureData.cloudName}/image/upload`,
@@ -484,7 +537,7 @@ async function uploadAvatarToCloudinary(file) {
   return result.secure_url;
 }
 
-export default function Profile({ onOpenVideo, onOpenPhoto }) {
+export default function Profile({ onOpenVideo, onOpenPhoto, onDeletePost }) {
   const { user, setUser } = useAuth();
 
   const [posts, setPosts] = useState([]);
@@ -518,12 +571,31 @@ export default function Profile({ onOpenVideo, onOpenPhoto }) {
   const [errorMessage, setErrorMessage] = useState("");
 
   const [activeTab, setActiveTab] = useState("All Posts");
+  const [postToDelete, setPostToDelete] = useState(null);
+  const [isDeletingPost, setIsDeletingPost] = useState(false);
+  const [deletePostError, setDeletePostError] = useState("");
   const [hasMorePosts, setHasMorePosts] = useState(false);
   const [isLoadingMorePosts, setIsLoadingMorePosts] = useState(false);
   const pageRef = useRef(1);
   const loadingMoreRef = useRef(false);
   const hasMoreRef = useRef(false);
   const sentinelRef = useRef(null);
+
+  useEffect(() => {
+    function handlePostDeleted(event) {
+      const postId = String(event.detail?.postId || "");
+      if (!postId) return;
+      const getId = (post) =>
+        String(post?._id || post?.id || post?.postId || "");
+      setPosts((current) => current.filter((post) => getId(post) !== postId));
+      setSavedPosts((current) =>
+        current.filter((post) => getId(post) !== postId),
+      );
+    }
+    window.addEventListener("spotli:post-deleted", handlePostDeleted);
+    return () =>
+      window.removeEventListener("spotli:post-deleted", handlePostDeleted);
+  }, []);
 
   const [avatarFailed, setAvatarFailed] = useState(false);
 
@@ -857,6 +929,35 @@ export default function Profile({ onOpenVideo, onOpenPhoto }) {
       );
     } catch (error) {
       setBookmarkError(error.message || "Unable to remove this saved post.");
+    }
+  }
+
+  async function confirmDeletePost() {
+    if (!postToDelete || isDeletingPost) return;
+    const postId = String(
+      postToDelete?._id || postToDelete?.id || postToDelete?.postId || "",
+    );
+    if (!postId) {
+      setDeletePostError("This post does not have a valid ID.");
+      return;
+    }
+
+    setIsDeletingPost(true);
+    setDeletePostError("");
+    try {
+      if (onDeletePost) {
+        await onDeletePost(postToDelete);
+      } else {
+        await api.posts.delete(postId);
+        window.dispatchEvent(
+          new CustomEvent("spotli:post-deleted", { detail: { postId } }),
+        );
+      }
+      setPostToDelete(null);
+    } catch (error) {
+      setDeletePostError(error.message || "Unable to delete this post.");
+    } finally {
+      setIsDeletingPost(false);
     }
   }
 
@@ -1205,6 +1306,14 @@ export default function Profile({ onOpenVideo, onOpenPhoto }) {
                     index={index}
                     onRemoveBookmark={
                       activeTab === "Bookmarks" ? removeSavedPost : undefined
+                    }
+                    onRequestDelete={
+                      activeTab !== "Bookmarks"
+                        ? (targetPost) => {
+                            setDeletePostError("");
+                            setPostToDelete(targetPost);
+                          }
+                        : undefined
                     }
                     onOpenPost={() => {
                       const openingPhoto = isPhotoPost(post);
@@ -1568,6 +1677,63 @@ export default function Profile({ onOpenVideo, onOpenPhoto }) {
                 </button>
               </div>
             </form>
+          </section>
+        </div>
+      )}
+
+      {postToDelete && (
+        <div
+          className="fixed inset-0 z-[150] flex items-center justify-center bg-black/55 px-4 py-6"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget && !isDeletingPost)
+              setPostToDelete(null);
+          }}
+        >
+          <section
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="delete-post-title"
+            className="w-full max-w-sm rounded-2xl border border-neutral-200 bg-white p-5 text-neutral-900 shadow-2xl"
+          >
+            <div className="mb-3 flex items-center gap-3">
+              <span className="grid h-10 w-10 place-items-center rounded-full bg-red-50 text-red-600">
+                <Trash2 size={19} />
+              </span>
+              <h2 id="delete-post-title" className="text-lg font-bold">
+                Delete this post?
+              </h2>
+            </div>
+            <p className="text-sm leading-6 text-neutral-600">
+              This will permanently remove the post and its likes, comments, and
+              saved copies. You can't undo this action.
+            </p>
+            {deletePostError && (
+              <p
+                role="alert"
+                className="mt-3 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700"
+              >
+                {deletePostError}
+              </p>
+            )}
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                type="button"
+                disabled={isDeletingPost}
+                onClick={() => setPostToDelete(null)}
+                className="h-10 rounded-full border border-neutral-300 px-4 text-sm font-semibold hover:bg-neutral-50 disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={isDeletingPost}
+                onClick={confirmDeletePost}
+                className="inline-flex h-10 items-center gap-2 rounded-full bg-[#FF2D4A] px-4 text-sm font-semibold text-white hover:bg-[#e92742] disabled:opacity-60"
+              >
+                <Trash2 size={15} />
+                {isDeletingPost ? "Deleting…" : "Delete post"}
+              </button>
+            </div>
           </section>
         </div>
       )}

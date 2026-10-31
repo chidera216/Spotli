@@ -10,10 +10,68 @@ import Notifications from "../pages/Notifications";
 import SearchResults from "../pages/SearchResults";
 import Settings from "../pages/Settings";
 import RightSidebar from "../components/RightSidebar";
-import VideoViewer from "../components/VideoViewer";
+import VideoViewer, { preloadCloudinaryVideoStream } from "../components/VideoViewer";
 import { videoPosts } from "../components/postData";
+import api from "../services/api";
+import { useAuth } from "../context/useAuth";
+
+const API_ORIGIN = (
+  import.meta.env.VITE_API_URL || "http://localhost:5000/api"
+).replace(/\/api\/?$/, "");
+
+function getMediaUrlForPlaybackWarmup(value) {
+  if (typeof value === "string") return value.trim();
+  if (!value || typeof value !== "object") return "";
+  return (
+    value.url ||
+    value.src ||
+    value.videoUrl ||
+    value.secure_url ||
+    value.path ||
+    value.location ||
+    ""
+  );
+}
+
+// Start warming only the video the user explicitly opened. The HLS helper
+// selects the same network-aware rendition used by the active player, so
+// Data Saver continues to use its existing low-resolution/low-bitrate profile.
+function prewarmOpenedPost(post) {
+  const mediaType = String(
+    post?.mediaType || post?.type || post?.postType || post?.kind || "",
+  ).toLowerCase();
+  if (["photo", "image", "photos", "gallery"].includes(mediaType)) return;
+
+  const candidates = [
+    post?.videoUrl,
+    post?.video,
+    post?.videoFile,
+    Array.isArray(post?.videos) ? post.videos[0] : "",
+    post?.mediaUrl,
+    post?.media,
+    Array.isArray(post?.mediaUrls) ? post.mediaUrls[0] : "",
+    post?.url,
+  ];
+
+  for (const candidate of candidates) {
+    const rawUrl = getMediaUrlForPlaybackWarmup(candidate);
+    if (!rawUrl) continue;
+    const resolvedUrl = rawUrl.startsWith("/")
+      ? `${API_ORIGIN}${rawUrl}`
+      : rawUrl;
+    if (!/^https?:\/\//i.test(resolvedUrl)) continue;
+
+    // Do not await this request: opening the viewer must remain synchronous.
+    // The active HLS loader shares this exact playlist/segment warm cache.
+    preloadCloudinaryVideoStream(resolvedUrl, "auto", {
+      includeFirstSegment: true,
+    });
+    return;
+  }
+}
 
 function MainLayout() {
+  const { user } = useAuth();
   const [selectedPost, setSelectedPost] = useState(null);
   const [viewerPosts, setViewerPosts] = useState([]);
   const [viewerPreservePostOrder, setViewerPreservePostOrder] = useState(false);
@@ -64,6 +122,7 @@ function MainLayout() {
     const postFromNotification = location.state?.openPost;
     if (!postFromNotification) return;
 
+    prewarmOpenedPost(postFromNotification);
     setViewerPosts([postFromNotification]);
     setViewerPreservePostOrder(false);
     setViewerInitialPostIndex(null);
@@ -77,6 +136,7 @@ function MainLayout() {
   function handleOpenPost(post, feedPosts = [], options = {}) {
     if (!post) return;
 
+    prewarmOpenedPost(post);
     homeScrollYRef.current = window.scrollY;
     hadViewerOpenRef.current = true;
 
@@ -176,6 +236,44 @@ function MainLayout() {
     setFallbackPage(page);
   }
 
+  // Viewer header navigation should leave the overlay cleanly without restoring
+  // Home's saved scroll position over the destination page.
+  function navigateFromViewer(path) {
+    hadViewerOpenRef.current = false;
+    setSelectedPost(null);
+    setViewerPosts([]);
+    setViewerPreservePostOrder(false);
+    setViewerInitialPostIndex(null);
+    navigate(path);
+  }
+
+  async function handleDeletePost(postOrId) {
+    const postId = String(
+      typeof postOrId === "string" || typeof postOrId === "number"
+        ? postOrId
+        : postOrId?._id || postOrId?.id || postOrId?.postId || "",
+    );
+    if (!postId) throw new Error("This post does not have a valid ID.");
+
+    const result = await api.posts.delete(postId);
+    window.dispatchEvent(
+      new CustomEvent("spotli:post-deleted", { detail: { postId } }),
+    );
+    setViewerPosts((current) =>
+      current.filter(
+        (post) =>
+          String(post?._id || post?.id || post?.postId || "") !== postId,
+      ),
+    );
+    setSelectedPost((current) => {
+      const currentId = String(
+        current?._id || current?.id || current?.postId || "",
+      );
+      return currentId === postId ? null : current;
+    });
+    return result;
+  }
+
   const postsForViewer = viewerPosts.length > 0 ? viewerPosts : videoPosts;
 
   return (
@@ -188,7 +286,12 @@ function MainLayout() {
           className="min-h-screen bg-white text-black md:hidden"
           style={selectedPost ? { display: "none" } : undefined}
         >
-          <Home onOpenVideo={handleOpenPost} onOpenPhoto={handleOpenPost} />
+          <Home
+            onOpenVideo={handleOpenPost}
+            onOpenPhoto={handleOpenPost}
+            onDeletePost={handleDeletePost}
+            currentUserId={String(user?._id || user?.id || "")}
+          />
         </div>
       )}
 
@@ -201,6 +304,7 @@ function MainLayout() {
           <Profile
             onOpenVideo={handleOpenProfilePost}
             onOpenPhoto={handleOpenProfilePost}
+            onDeletePost={handleDeletePost}
           />
         </div>
       )}
@@ -229,7 +333,11 @@ function MainLayout() {
       {/* SIDEBAR */}
       {!isMobileViewport && (
         <div className="hidden md:block">
-          <Sidebar activePage={activePage} onNavigate={navigateTo} />
+          <Sidebar
+            activePage={activePage}
+            onNavigate={navigateTo}
+            collapsed={Boolean(selectedPost && !isMobileViewport)}
+          />
         </div>
       )}
 
@@ -241,7 +349,12 @@ function MainLayout() {
           style={selectedPost ? { display: "none" } : undefined}
         >
           <main className="ml-40 min-h-screen px-4 py-3 lg:mr-62.5 lg:px-5">
-            <Home onOpenVideo={handleOpenPost} onOpenPhoto={handleOpenPost} />
+            <Home
+              onOpenVideo={handleOpenPost}
+              onOpenPhoto={handleOpenPost}
+              onDeletePost={handleDeletePost}
+              currentUserId={String(user?._id || user?.id || "")}
+            />
           </main>
 
           <div className="hidden lg:block">
@@ -259,6 +372,7 @@ function MainLayout() {
           <Profile
             onOpenVideo={handleOpenProfilePost}
             onOpenPhoto={handleOpenProfilePost}
+            onDeletePost={handleDeletePost}
           />
         </div>
       )}
@@ -322,6 +436,9 @@ function MainLayout() {
           preservePostOrder={viewerPreservePostOrder}
           initialPostIndex={viewerInitialPostIndex}
           onBack={closeViewer}
+          onNavigateFromViewer={navigateFromViewer}
+          onDeletePost={handleDeletePost}
+          currentUserId={String(user?._id || user?.id || "")}
         />
       )}
     </>

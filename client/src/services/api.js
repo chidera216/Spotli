@@ -170,16 +170,22 @@ const api = {
     getAll: (page = 1, limit = 20) =>
       request(`/posts?page=${page}&limit=${limit}`),
 
-    // Retained for backward compatibility.
-    create: (formData) =>
-      request("/posts", {
-        method: "POST",
-        body: formData,
-      }),
-
-    // Request a signed authorization for direct Cloudinary uploads.
+    // Signed direct uploads send images and videos from the browser to Cloudinary.
     createUploadSignature: (details) =>
       request("/posts/upload-signature", {
+        method: "POST",
+        body: JSON.stringify(details),
+      }),
+
+    discardUpload: (details) =>
+      request("/posts/discard-upload", {
+        method: "POST",
+        body: JSON.stringify(details),
+      }),
+
+    // Fallback for assets that do not already have an eager HLS job attached.
+    prepareVideoPlayback: (details) =>
+      request("/posts/prepare-video-playback", {
         method: "POST",
         body: JSON.stringify(details),
       }),
@@ -189,6 +195,11 @@ const api = {
       request("/posts", {
         method: "POST",
         body: JSON.stringify(postData),
+      }),
+
+    delete: (postId) =>
+      request(`/posts/${encodeURIComponent(postId)}`, {
+        method: "DELETE",
       }),
 
     like: (postId) =>

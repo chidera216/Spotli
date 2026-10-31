@@ -27,8 +27,17 @@ function getInitials(user) {
   return initials.toUpperCase() || "S";
 }
 
-function TopBar() {
+function TopBar({ variant = "default", onCloseViewer, onNavigateFromViewer }) {
   const navigate = useNavigate();
+  const isViewer = variant === "viewer";
+  const goTo = (path) => {
+    if (isViewer && onNavigateFromViewer) {
+      onNavigateFromViewer(path);
+      return;
+    }
+    if (isViewer) onCloseViewer?.();
+    navigate(path);
+  };
   const [isVisible, setIsVisible] = useState(true);
   const [user, setUser] = useState(null);
   const [imageFailed, setImageFailed] = useState(false);
@@ -93,47 +102,71 @@ function TopBar() {
 
   return (
     <header
-      className={`flex h-11 items-center justify-between gap-3 transition-all duration-300 ease-in-out ${
+      className={`${
+        isViewer
+          ? "flex h-12 w-full items-center justify-end gap-4 bg-transparent px-3 text-white"
+          : "flex h-11 items-center justify-between gap-3"
+      } transition-all duration-300 ease-in-out ${
         isVisible
           ? "translate-y-0 opacity-100"
           : "-translate-y-full opacity-0 pointer-events-none"
       }`}
     >
-      {/* Spotli logo — mobile only */}
-      <h1 className="shrink-0 text-[27px] font-extrabold leading-none tracking-tight text-black md:hidden">
-        Spotli<span style={{ color: BRAND }}>.</span>
-      </h1>
+      {/* Spotli branding remains on normal mobile pages; the focused viewer uses a compact actions-only bar. */}
+      {!isViewer && (
+        <h1 className="shrink-0 text-[27px] font-extrabold leading-none tracking-tight text-black md:hidden">
+          Spotli<span style={{ color: BRAND }}>.</span>
+        </h1>
+      )}
 
-      {/* Search icon and profile */}
-      <div className="ml-auto flex shrink-0 items-center gap-3">
-        {/* Icon-only search on mobile */}
+      {/* Search and account actions */}
+      <div
+        className={`${isViewer ? "flex shrink-0 items-center gap-2" : "ml-auto flex shrink-0 items-center gap-3"}`}
+      >
         <button
           type="button"
           aria-label="Search"
-          onClick={() => navigate("/search")}
-          className="grid h-10 w-10 place-items-center rounded-full text-gray-800 transition-colors hover:bg-gray-100"
+          title="Search"
+          onClick={() => goTo("/search")}
+          className={`grid place-items-center rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#FF2D4A] ${
+            isViewer
+              ? "h-8 w-8 text-white/90 hover:text-white"
+              : "h-10 w-10 text-gray-800 hover:bg-gray-100"
+          }`}
         >
-          <Search size={23} />
+          <Search size={isViewer ? 19 : 23} strokeWidth={2} />
         </button>
 
-        {/* Notifications — tablet and desktop */}
+        {/* Notifications â€” tablet and desktop */}
         <button
           type="button"
           aria-label="Notifications"
-          className="relative hidden text-gray-700 md:block"
+          title="Notifications"
+          onClick={() => goTo("/notifications")}
+          className={`relative grid place-items-center rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#FF2D4A] ${
+            isViewer
+              ? "h-8 w-8 text-white/90 hover:text-white"
+              : "hidden h-10 w-10 text-gray-700 hover:bg-gray-100 md:grid"
+          }`}
         >
-          <Bell size={19} />
-          <span className="absolute -right-0.5 -top-0.5 h-1.5 w-1.5 rounded-full bg-red-500" />
+          <Bell size={isViewer ? 18 : 19} strokeWidth={2} />
+          <span
+            className={`absolute right-[5px] top-[5px] h-2 w-2 rounded-full bg-[#FF2D4A] ${isViewer ? "ring-2 ring-black" : "ring-2 ring-white"}`}
+          />
         </button>
 
         <button
           type="button"
           aria-label="Settings"
           title="Settings"
-          onClick={() => navigate("/settings")}
-          className="grid h-10 w-10 place-items-center rounded-full text-gray-700 transition-colors hover:bg-gray-100"
+          onClick={() => goTo("/settings")}
+          className={`grid place-items-center rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#FF2D4A] ${
+            isViewer
+              ? "h-8 w-8 text-white/90 hover:text-white"
+              : "h-10 w-10 text-gray-700 hover:bg-gray-100"
+          }`}
         >
-          <Settings size={19} />
+          <Settings size={isViewer ? 18 : 19} strokeWidth={2} />
         </button>
 
         {/* Logged-in user's profile */}
@@ -143,22 +176,28 @@ function TopBar() {
             fullName ? `Open ${fullName}'s profile menu` : "Open profile menu"
           }
           title={fullName || "Profile"}
-          className="flex items-center gap-1"
+          onClick={() => goTo("/profile")}
+          className="flex items-center gap-1 rounded-full focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#FF2D4A]"
         >
           {avatarUrl && !imageFailed ? (
             <img
               src={avatarUrl}
               alt={fullName || "Your profile"}
-              className="h-8 w-8 rounded-full object-cover"
+              className={`${isViewer ? "h-9 w-9" : "h-8 w-8"} rounded-full object-cover`}
               onError={() => setImageFailed(true)}
             />
           ) : (
-            <span className="grid h-8 w-8 place-items-center rounded-full bg-[#FF2D4A] text-xs font-semibold text-white">
+            <span
+              className={`${isViewer ? "h-10 w-10 text-xs" : "h-8 w-8 text-xs"} grid place-items-center rounded-full bg-[#FF2D4A] font-semibold text-white`}
+            >
               {getInitials(user)}
             </span>
           )}
 
-          <ChevronDown size={14} className="hidden text-gray-500 md:block" />
+          <ChevronDown
+            size={isViewer ? 10 : 12}
+            className={`hidden md:block ${isViewer ? "text-white/70" : "text-gray-500"}`}
+          />
         </button>
       </div>
     </header>

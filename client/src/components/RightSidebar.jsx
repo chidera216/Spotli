@@ -1,4 +1,5 @@
 import { Flame } from "lucide-react";
+import { useNavigate } from "react-router-dom";
 
 const trending = [
   { title: "ESUT", count: "12.3K posts", color: "bg-blue-500" },
@@ -46,6 +47,12 @@ const topics = [
 ];
 
 function RightSidebar() {
+  const navigate = useNavigate();
+
+  function searchFor(query) {
+    navigate(`/search?q=${encodeURIComponent(query)}`);
+  }
+
   return (
     <aside
       className="fixed inset-y-0 right-0 z-30 hidden w-62.5 overflow-y-auto border-l border-gray-100 bg-white px-3 py-4 scrollbar-none [&::-webkit-scrollbar]:hidden lg:block"
@@ -58,14 +65,24 @@ function RightSidebar() {
             Trending now
           </h2>
 
-          <button type="button" className="text-[11px] text-gray-500">
+          <button
+            type="button"
+            onClick={() => navigate("/search")}
+            className="rounded text-[11px] text-gray-500 transition hover:text-[#FF2D4A] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#FF2D4A]"
+          >
             See all
           </button>
         </div>
 
         <div className="space-y-3">
           {trending.map((item, index) => (
-            <div key={item.title} className="flex items-center gap-2">
+            <button
+              key={item.title}
+              type="button"
+              onClick={() => searchFor(item.title)}
+              className="flex w-full items-center gap-2 rounded-lg py-1 text-left transition hover:bg-gray-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#FF2D4A] dark:hover:bg-gray-900"
+              aria-label={`Search posts about ${item.title}`}
+            >
               <span
                 className={`flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-[11px] font-bold text-white ${item.color}`}
               >
@@ -78,7 +95,7 @@ function RightSidebar() {
                 </p>
                 <p className="text-[11px] text-gray-500">{item.count}</p>
               </div>
-            </div>
+            </button>
           ))}
         </div>
       </section>
@@ -87,7 +104,11 @@ function RightSidebar() {
         <div className="mb-3 flex items-center justify-between">
           <h2 className="text-[14px] font-bold">Suggested creators</h2>
 
-          <button type="button" className="text-[11px] text-gray-500">
+          <button
+            type="button"
+            onClick={() => navigate("/search")}
+            className="rounded text-[11px] text-gray-500 transition hover:text-[#FF2D4A] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#FF2D4A]"
+          >
             See all
           </button>
         </div>
@@ -126,7 +147,11 @@ function RightSidebar() {
         <div className="mb-3 flex items-center justify-between">
           <h2 className="text-[14px] font-bold">Popular topics</h2>
 
-          <button type="button" className="text-[11px] text-gray-500">
+          <button
+            type="button"
+            onClick={() => navigate("/search")}
+            className="rounded text-[11px] text-gray-500 transition hover:text-[#FF2D4A] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#FF2D4A]"
+          >
             See all
           </button>
         </div>
@@ -136,7 +161,9 @@ function RightSidebar() {
             <button
               key={topic.name}
               type="button"
-              className="relative aspect-square overflow-hidden rounded-md"
+              onClick={() => searchFor(topic.name)}
+              aria-label={`Search ${topic.name} posts`}
+              className="relative aspect-square overflow-hidden rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#FF2D4A]"
             >
               <img
                 src={`https://images.unsplash.com/${topic.image}?auto=format&fit=crop&w=160&h=160&q=80`}

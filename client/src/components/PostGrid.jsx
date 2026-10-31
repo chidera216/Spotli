@@ -7,6 +7,8 @@ import {
   Play,
   Image as ImageIcon,
   Bookmark,
+  MoreVertical,
+  Trash2,
 } from "lucide-react";
 
 import api from "../services/api";
@@ -98,31 +100,50 @@ function getPostImages(post) {
 }
 
 function getPostVideoSource(post) {
+  // Keep this priority identical to VideoViewer.getOriginalVideoUrl().
+  // A post can contain both videoUrl and mediaUrl (for example, a legacy
+  // Cloudinary URL plus a newer canonical URL). If the grid prewarms one
+  // version while the player opens the other, the HLS segment cache cannot
+  // be reused and the first frame has to wait for a second download.
   const candidates = [
-    post?.mediaUrl,
     post?.videoUrl,
     post?.video,
-    typeof post?.media === "string" ? post.media : "",
-    post?.media?.url,
-    post?.media?.secure_url,
-    post?.mediaUrls?.[0],
-    post?.videos?.[0]?.url,
+    post?.videoFile,
+    Array.isArray(post?.videos) ? post.videos[0] : "",
+    post?.mediaUrl,
+    post?.media,
+    Array.isArray(post?.mediaUrls) ? post.mediaUrls[0] : "",
     post?.url,
   ];
 
   for (const candidate of candidates) {
     const value =
       typeof candidate === "string"
-        ? candidate
+        ? candidate.trim()
         : candidate && typeof candidate === "object"
-          ? candidate.url ||
-            candidate.src ||
-            candidate.secure_url ||
-            candidate.path ||
-            ""
+          ? String(
+              candidate.url ||
+                candidate.src ||
+                candidate.imageUrl ||
+                candidate.videoUrl ||
+                candidate.secure_url ||
+                candidate.path ||
+                candidate.location ||
+                "",
+            ).trim()
           : "";
-    if (typeof value === "string" && value.trim())
-      return getImageUrl(value.trim());
+
+    if (!value) continue;
+    if (/(?:\.(?:avif|bmp|gif|jpe?g|png|webp)(?:[?#]|$)|\/image\/upload\/|^data:image\/)/i.test(value)) {
+      continue;
+    }
+
+    // Match VideoViewer.resolveMediaUrl(): absolute URLs and root-relative
+    // paths are normalized, while other relative values remain unchanged.
+    if (/^https?:\/\//i.test(value) || value.startsWith("/")) {
+      return getImageUrl(value);
+    }
+    return value;
   }
 
   return "";
@@ -213,9 +234,13 @@ function PostCard({
   onOpenPhoto,
   isBookmarked,
   onToggleBookmark,
+  onDeletePost,
+  currentUserId = "",
   isPriorityVideo = false,
 }) {
   const [activeImageIndex, setActiveImageIndex] = useState(0);
+  const [isPostMenuOpen, setIsPostMenuOpen] = useState(false);
+  const [isDeletingPost, setIsDeletingPost] = useState(false);
   const videoPreloadTimerRef = useRef(null);
   const videoCardRef = useRef(null);
 
@@ -234,6 +259,41 @@ function PostCard({
       Boolean(post.mediaUrl || post.videoUrl || post.video));
 
   const creatorName = getCreatorName(post.creator);
+  const postCreatorId = String(
+    post.creatorId ||
+      post.authorId ||
+      post.userId ||
+      (post.creator && typeof post.creator === "object"
+        ? post.creator._id || post.creator.id
+        : "") ||
+      "",
+  );
+  const canDeletePost = Boolean(
+    onDeletePost &&
+    currentUserId &&
+    postCreatorId &&
+    String(currentUserId) === postCreatorId,
+  );
+
+  async function handleDeleteFromHome(event) {
+    event?.stopPropagation?.();
+    if (!canDeletePost || isDeletingPost) return;
+    const confirmed = window.confirm(
+      "Delete this post permanently? This action cannot be undone.",
+    );
+    if (!confirmed) return;
+    setIsDeletingPost(true);
+    try {
+      await onDeletePost(post);
+      setIsPostMenuOpen(false);
+    } catch (error) {
+      window.alert(
+        error?.message || "Couldn't delete this post. Please try again.",
+      );
+    } finally {
+      setIsDeletingPost(false);
+    }
+  }
 
   const handle =
     typeof post.handle === "string" && post.handle ? post.handle : "@creator";
@@ -243,8 +303,8 @@ function PostCard({
   const activeImage = images[activeImageIndex] || "";
   const videoUrl = getPostVideoSource(post);
 
-  // Prepare only lightweight HLS playlists before a card is opened. The active
-  // video itself downloads its media segment, avoiding duplicate downloads.
+  // Warm only the small HLS playlists as cards enter the grid. Do not download
+  // video segments until the viewer deliberately opens a specific card.
   useEffect(() => {
     if (
       !isVideo ||
@@ -266,15 +326,13 @@ function PostCard({
         if (entries.some((entry) => entry.isIntersecting)) {
           preloaded = true;
           preloadCloudinaryVideoStream(videoUrl, "auto", {
-            includeFirstSegment: true,
+            includeFirstSegment: false,
           });
           observer.disconnect();
         }
       },
       {
-        // Prepare only cards that are on screen or immediately entering it.
-        // Together with the 2-entry preload limit, this avoids downloading a
-        // feed full of videos while still warming a tapped video's first segment.
+        // Playlist metadata only; video bytes are reserved for an opened card.
         rootMargin: "0px 0px 100px 0px",
         threshold: 0.35,
       },
@@ -374,6 +432,43 @@ function PostCard({
             <ImageIcon size={16} />
           </span>
 
+          {canDeletePost && (
+            <div className="absolute right-14 top-3 z-20">
+              <button
+                type="button"
+                aria-label="More post options"
+                aria-expanded={isPostMenuOpen}
+                title="Post options"
+                disabled={isDeletingPost}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  setIsPostMenuOpen((open) => !open);
+                }}
+                className="grid h-9 w-9 place-items-center rounded-full bg-black/65 text-white shadow-lg backdrop-blur-sm transition hover:bg-black/85 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white disabled:opacity-60"
+              >
+                <MoreVertical size={18} />
+              </button>
+              {isPostMenuOpen && (
+                <div
+                  role="menu"
+                  className="absolute right-0 top-11 min-w-40 rounded-xl border border-white/10 bg-[#171717] p-1.5 text-white shadow-2xl"
+                  onClick={(event) => event.stopPropagation()}
+                >
+                  <button
+                    type="button"
+                    role="menuitem"
+                    disabled={isDeletingPost}
+                    onClick={handleDeleteFromHome}
+                    className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm font-semibold text-red-300 transition hover:bg-white/10 disabled:opacity-60"
+                  >
+                    <Trash2 size={15} />
+                    {isDeletingPost ? "Deleting…" : "Delete post"}
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+
           <button
             type="button"
             aria-label={isBookmarked ? "Remove bookmark" : "Bookmark photo"}
@@ -455,9 +550,36 @@ function PostCard({
     getImageUrl(post.image || post.thumbnailUrl || post.poster, 720, 405) ||
     getCloudinaryVideoThumbnailUrl(videoUrl, 720, 405);
 
-  // A short desktop hover is a head start, and pointerdown prewarms the exact
-  // first segment for both mouse and touch. The HLS loader shares that request.
+  function isDataSaverEnabled() {
+    try {
+      const stored = JSON.parse(
+        localStorage.getItem("spotli.settings.preferences") || "{}",
+      );
+      if (
+        stored.dataSaverUserChoice === true &&
+        typeof stored.dataSaver === "boolean"
+      ) {
+        return stored.dataSaver;
+      }
+    } catch {
+      // Fall through to network-based defaults.
+    }
+    const connection =
+      typeof navigator !== "undefined"
+        ? navigator.connection || navigator.mozConnection || navigator.webkitConnection
+        : null;
+    const effectiveType = String(connection?.effectiveType || "").toLowerCase();
+    return Boolean(
+      connection?.saveData === true ||
+        ["slow-2g", "2g", "3g"].includes(effectiveType) ||
+        (Number(connection?.downlink) > 0 && Number(connection?.downlink) < 1.2),
+    );
+  }
+
+  // Hover warms only lightweight playlists. Pointerdown still warms the first
+  // segment for the exact video the user is opening, even in Data Saver mode.
   function scheduleVideoPreload(event) {
+    if (isDataSaverEnabled()) return;
     if (event?.pointerType && event.pointerType !== "mouse") return;
     cancelScheduledVideoPreload();
     // A short hover is a useful head start; fast mouse movement across the feed
@@ -465,7 +587,7 @@ function PostCard({
     videoPreloadTimerRef.current = window.setTimeout(() => {
       videoPreloadTimerRef.current = null;
       preloadCloudinaryVideoStream(videoUrl, "auto", {
-        includeFirstSegment: true,
+        includeFirstSegment: false,
       });
     }, 250);
   }
@@ -480,8 +602,8 @@ function PostCard({
           onPointerEnter={scheduleVideoPreload}
           onPointerLeave={cancelScheduledVideoPreload}
           onPointerDown={() => {
-            // The viewer's HLS loader shares this in-flight request, so the
-            // player can reuse the startup segment instead of downloading it twice.
+            // Explicit user intent: warm only the exact video being opened.
+            // The viewer's HLS loader shares the in-flight bytes.
             preloadCloudinaryVideoStream(videoUrl, "auto", {
               includeFirstSegment: true,
             });
@@ -519,6 +641,43 @@ function PostCard({
             </span>
           )}
         </button>
+
+        {canDeletePost && (
+          <div className="absolute right-14 top-2 z-20">
+            <button
+              type="button"
+              aria-label="More post options"
+              aria-expanded={isPostMenuOpen}
+              title="Post options"
+              disabled={isDeletingPost}
+              onClick={(event) => {
+                event.stopPropagation();
+                setIsPostMenuOpen((open) => !open);
+              }}
+              className="grid h-9 w-9 place-items-center rounded-full bg-black/65 text-white shadow-lg backdrop-blur-sm transition hover:bg-black/85 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white disabled:opacity-60"
+            >
+              <MoreVertical size={18} />
+            </button>
+            {isPostMenuOpen && (
+              <div
+                role="menu"
+                className="absolute right-0 top-11 min-w-40 rounded-xl border border-white/10 bg-[#171717] p-1.5 text-white shadow-2xl"
+                onClick={(event) => event.stopPropagation()}
+              >
+                <button
+                  type="button"
+                  role="menuitem"
+                  disabled={isDeletingPost}
+                  onClick={handleDeleteFromHome}
+                  className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm font-semibold text-red-300 transition hover:bg-white/10 disabled:opacity-60"
+                >
+                  <Trash2 size={15} />
+                  {isDeletingPost ? "Deleting…" : "Delete post"}
+                </button>
+              </div>
+            )}
+          </div>
+        )}
 
         <button
           type="button"
@@ -575,7 +734,13 @@ function PostCard({
   );
 }
 
-function PostGrid({ onOpenVideo, onOpenPhoto, posts: suppliedPosts }) {
+function PostGrid({
+  onOpenVideo,
+  onOpenPhoto,
+  posts: suppliedPosts,
+  onDeletePost,
+  currentUserId = "",
+}) {
   const feedPosts = suppliedPosts ?? samplePosts;
   const firstPriorityVideoUrl =
     feedPosts
@@ -583,9 +748,8 @@ function PostGrid({ onOpenVideo, onOpenPhoto, posts: suppliedPosts }) {
       .map((post) => getPostVideoSource(post))
       .find(Boolean) || "";
 
-  // Warm the first video's HLS playlists as soon as feed data is available.
-  // Keep media-segment downloads under the active player's control so a slow
-  // background request cannot delay the tap-to-play path.
+  // Warm only the first feed video's small playlist on mount. Its media segment
+  // is loaded when that exact video is opened in the viewer.
   const firstVideoPreloadKey = feedPosts
     .filter((post) => !isPhotoPost(post))
     .map((post) => `${post?._id || post?.id || ""}:${getPostVideoSource(post)}`)
@@ -709,6 +873,8 @@ function PostGrid({ onOpenVideo, onOpenPhoto, posts: suppliedPosts }) {
                 bookmarkedIds[String(safePost._id || safePost.id)],
               )}
               onToggleBookmark={toggleBookmark}
+              onDeletePost={onDeletePost}
+              currentUserId={currentUserId}
               isPriorityVideo={isPriorityVideo}
             />
           </div>

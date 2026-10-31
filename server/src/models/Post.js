@@ -18,6 +18,26 @@ const postSchema = new mongoose.Schema(
 
     mentions: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
 
+    // Structured topics power the Home/Discovery category filters.
+    topics: {
+      type: [
+        {
+          type: String,
+          enum: [
+            "ESUT",
+            "Tech",
+            "Study",
+            "Travel",
+            "Food",
+            "Lifestyle",
+            "Music",
+            "Fitness",
+          ],
+        },
+      ],
+      default: [],
+    },
+
     mediaUrl: {
       type: String,
       required: true,

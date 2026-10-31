@@ -32,6 +32,8 @@ const DEFAULT_PREFERENCES = {
   showComments: true,
   showFollows: true,
   showMentions: true,
+  dataSaver: false,
+  dataSaverUserChoice: false,
   startMuted: true,
   playbackRate: "1",
   appearance: "light",
@@ -45,16 +47,39 @@ function normalizeAppearance(value) {
     : "light";
 }
 
+function shouldDefaultDataSaverOn() {
+  if (typeof navigator === "undefined") return false;
+  const connection =
+    navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+  const effectiveType = String(connection?.effectiveType || "").toLowerCase();
+  const downlink = Number(connection?.downlink);
+  return Boolean(
+    connection?.saveData === true ||
+      ["slow-2g", "2g", "3g"].includes(effectiveType) ||
+      (Number.isFinite(downlink) && downlink > 0 && downlink < 1.2),
+  );
+}
+
 function readPreferences() {
   try {
     const stored = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}");
     return {
       ...DEFAULT_PREFERENCES,
       ...stored,
+      dataSaver:
+        stored.dataSaverUserChoice === true &&
+        typeof stored.dataSaver === "boolean"
+          ? stored.dataSaver
+          : shouldDefaultDataSaverOn(),
+      dataSaverUserChoice: stored.dataSaverUserChoice === true,
       appearance: normalizeAppearance(stored.appearance),
     };
   } catch {
-    return { ...DEFAULT_PREFERENCES };
+    return {
+      ...DEFAULT_PREFERENCES,
+      dataSaver: shouldDefaultDataSaverOn(),
+      dataSaverUserChoice: false,
+    };
   }
 }
 
@@ -206,7 +231,11 @@ export default function Settings() {
 
   function updatePreference(key, value) {
     setPreferences((current) => {
-      const next = { ...current, [key]: value };
+      const next = {
+        ...current,
+        [key]: value,
+        ...(key === "dataSaver" ? { dataSaverUserChoice: true } : {}),
+      };
       savePreferences(next);
       return next;
     });
@@ -336,7 +365,21 @@ export default function Settings() {
         </div>
 
         {!section ? (
-          <section className="divide-y divide-neutral-100 rounded-2xl border border-neutral-200 p-1 sm:p-2">
+          <>
+            <section className="mb-4 rounded-2xl border border-neutral-200 px-4 py-1 sm:px-5">
+              <PreferenceSwitch
+                checked={Boolean(preferences.dataSaver)}
+                onChange={(value) => updatePreference("dataSaver", value)}
+                label="Data Saver"
+                description="Reduce mobile data use by limiting automatic video quality and background downloads. Active videos still autoplay."
+              />
+              <p className="pb-3 text-xs text-neutral-500" role="status">
+                {preferences.dataSaver
+                  ? "Data Saver is on. Automatic playback is limited to a lower data profile."
+                  : "Data Saver is off. Spotli will use the normal automatic playback profile."}
+              </p>
+            </section>
+            <section className="divide-y divide-neutral-100 rounded-2xl border border-neutral-200 p-1 sm:p-2">
             {sections.map((item) => (
               <SettingsRow
                 key={item.id}
@@ -378,7 +421,8 @@ export default function Settings() {
             {privacyError && (
               <p className="px-4 py-2 text-sm text-red-600">{privacyError}</p>
             )}
-          </section>
+            </section>
+          </>
         ) : section === "privacy" ? (
           <div className="space-y-5">
             <section className="rounded-2xl border border-neutral-200 p-4 sm:p-5">

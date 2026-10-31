@@ -72,6 +72,7 @@ export async function searchUsers(req, res) {
       creator: { $in: visibleCreatorIds },
       $or: [
         { caption: searchRegex },
+        { topics: searchRegex },
         ...(matchingUserIds.length
           ? [{ creator: { $in: matchingUserIds } }]
           : []),
